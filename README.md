@@ -70,33 +70,23 @@ Therefore:
 
 ## Repo layout
 
+```text
 src/
-config/            # typed config loading, env parsing
-infra/             # logging, retry, time utils, shutdown, metrics
-data/              # SQLite schema + DAO + migrations
-feeds/
-coinbase_ws.py   # Coinbase market data
-kalshi_ws.py     # Kalshi websocket (public + auth)
-kalshi_rest.py   # Kalshi REST (market discovery, positions reconciliation)
-models/
-vol.py           # realized vol estimator
-prob.py          # probability model
-costs.py         # fee/slippage model
-strategy/
-universe.py      # market selection filters
-signals.py       # EV computation + trade intent generation
-risk.py          # exposure limits, kill switch logic
-execution/
-orders.py        # order manager (place/cancel/reprice)
-portfolio.py     # fills -> positions -> PnL
-app/
-collector.py     # data collection only (no trading)
-paper.py         # shadow trading (log would-trades)
-live.py          # demo/prod trading
+  kalshi_bot/      # all application code
+    app/           # entrypoints (collector/paper/live)
+    config/        # typed config loading, env parsing
+    infra/         # logging, retry, time utils, shutdown, metrics
+    data/          # SQLite helpers + migrations
+      migrations/  # ordered SQL migrations (001_*.sql, 002_*.sql)
+    feeds/         # Coinbase/Kalshi connectors
+    models/        # volatility, probability, cost models
+    strategy/      # filters, signals, risk logic
+    execution/     # order/portfolio management
 tests/
 scripts/
 README.md
 pyproject.toml
+```
 
 ---
 
@@ -119,7 +109,7 @@ Recommended deployment approach:
 
 ## Prerequisites
 
-- Python 3.11+ (recommended)
+- Python 3.11.x (required)
 - macOS: Xcode command line tools (only for building some Python deps if needed)
 - Linux: `python3.11`, `python3.11-venv`, `build-essential` (if needed)
 
@@ -146,11 +136,11 @@ pip install -e .
 
 ## Configuration
 
-All config is loaded from environment variables and/or `config.yaml`.
+All config is loaded from environment variables.
 
 ### Required environment variables
 
-Kalshi:
+Kalshi (not used yet; reserved for later phases):
 - `KALSHI_ENV` = `demo` or `prod`
 - `KALSHI_RW_KEY_ID`
 - `KALSHI_RW_PRIVATE_KEY_PATH` (or whatever Kalshi requires in your auth scheme)
@@ -159,6 +149,9 @@ Kalshi:
 
 Coinbase:
 - `COINBASE_WS_URL` = `wss://advanced-trade-ws.coinbase.com` (default)
+- `COINBASE_PRODUCT_ID` = `BTC-USD` (default)
+- `COINBASE_STALE_SECONDS` = `10` (default)
+- `COLLECTOR_SECONDS` = `60` (default)
 - If you use authenticated Coinbase channels later, add those keys (not required for public ticker)
 
 Storage/logging:
@@ -196,14 +189,17 @@ Phase 1A (Coinbase ticker only):
 
 python -m kalshi_bot.app.collector --coinbase --seconds 30
 
+Debug to stdout + file:
+
+python -m kalshi_bot.app.collector --coinbase --seconds 30 --debug
+
 Check rows (example):
 
 sqlite3 ./data/kalshi.sqlite "SELECT COUNT(*) FROM spot_ticks;"
 
 Definition of done:
-- runs 30 minutes without exceptions
-- spot data not stale
-- orderbook snapshots and deltas applied cleanly
+- runs for the configured seconds without exceptions
+- spot ticks are inserted into `spot_ticks`
 
 ---
 
@@ -218,9 +214,7 @@ Run:
 python -m kalshi_bot.app.paper
 
 Definition of done:
-- 2–3 days of logs
-- can compute “would-be pnl” with pessimistic fill assumptions
-- can start calibration analysis on settled markets
+- not implemented yet (placeholder)
 
 ---
 
@@ -238,6 +232,9 @@ Hard safety requirements before enabling:
 - kill switch wired and tested
 - REST reconciliation works
 - write-rate limiting is enforced
+ 
+Status:
+- not implemented yet (placeholder)
 
 ---
 
@@ -323,10 +320,7 @@ This is an experimental trading system.
 ## Quickstart checklist
 
 1) Install deps and create venv
-2) Set env vars (Kalshi demo + Coinbase WS)
-3) Run migrations to create SQLite tables
-4) Run collector for 30 minutes
-5) Run paper mode for 2–3 days
-6) Generate calibration plots + Brier/log-loss tests
-7) Only then enable demo trading
-8) Only after 200+ real fills and stable reconciliation consider expanding scope
+2) Set env vars (DB/LOG paths + Coinbase WS as needed)
+3) Run collector to create SQLite tables (migrations apply automatically)
+4) Run Coinbase collector for ~30 seconds and confirm `spot_ticks` rows exist
+5) Paper/live trading steps are placeholders until Kalshi integration lands

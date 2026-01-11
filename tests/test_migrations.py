@@ -30,7 +30,7 @@ def test_migration_symbol_to_product_id_preserves_data(tmp_path):
                 ts, symbol, price, best_bid, best_ask, raw_json
             ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (1700000000, \"BTC-USD\", 42000.0, 41999.0, 42001.0, \"{}\"),
+            (1700000000, "BTC-USD", 42000.0, 41999.0, 42001.0, "{}"),
         )
         conn.commit()
     finally:
