@@ -190,7 +190,15 @@ Purpose:
 
 Run:
 
-python -m src.app.collector
+python -m kalshi_bot.app.collector
+
+Phase 1A (Coinbase ticker only):
+
+python -m kalshi_bot.app.collector --coinbase --seconds 30
+
+Check rows (example):
+
+sqlite3 ./data/kalshi.sqlite "SELECT COUNT(*) FROM spot_ticks;"
 
 Definition of done:
 - runs 30 minutes without exceptions
@@ -207,7 +215,7 @@ Purpose:
 
 Run:
 
-python -m src.app.paper
+python -m kalshi_bot.app.paper
 
 Definition of done:
 - 2–3 days of logs
@@ -223,7 +231,7 @@ Purpose:
 
 Run:
 
-python -m src.app.live
+python -m kalshi_bot.app.live
 
 Hard safety requirements before enabling:
 - `TRADING_ENABLED=1`

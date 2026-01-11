@@ -26,6 +26,13 @@ class Settings(BaseModel):
     max_daily_loss_pct: float = Field(default=0.03, alias="MAX_DAILY_LOSS_PCT")
     max_position_pct: float = Field(default=0.02, alias="MAX_POSITION_PCT")
 
+    coinbase_ws_url: str = Field(
+        default="wss://advanced-trade-ws.coinbase.com", alias="COINBASE_WS_URL"
+    )
+    coinbase_product_id: str = Field(default="BTC-USD", alias="COINBASE_PRODUCT_ID")
+    coinbase_stale_seconds: int = Field(default=10, alias="COINBASE_STALE_SECONDS")
+    collector_seconds: int = Field(default=60, alias="COLLECTOR_SECONDS")
+
 
 def load_settings(env_file: str | None = None) -> Settings:
     load_dotenv(env_file)
