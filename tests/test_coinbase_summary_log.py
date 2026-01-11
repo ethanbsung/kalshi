@@ -1,5 +1,5 @@
 import asyncio
-import sqlite3
+import json
 
 from kalshi_bot.app import collector
 from kalshi_bot.config import Settings
@@ -9,18 +9,18 @@ async def _message_source():
     yield {
         "channel": "ticker",
         "timestamp": "2024-01-01T00:00:00Z",
-        "sequence_num": 7,
+        "sequence_num": 9,
         "events": [
             {
                 "type": "snapshot",
                 "tickers": [
                     {
                         "product_id": "BTC-USD",
-                        "price": "41000.0",
-                        "best_bid": "40999.5",
-                        "best_ask": "41000.5",
-                        "best_bid_quantity": "1.2",
-                        "best_ask_quantity": "0.8",
+                        "price": "43000.0",
+                        "best_bid": "42999.0",
+                        "best_ask": "43001.0",
+                        "best_bid_quantity": "0.4",
+                        "best_ask_quantity": "0.6",
                     }
                 ],
             }
@@ -28,7 +28,7 @@ async def _message_source():
     }
 
 
-def test_collector_coinbase_inserts_row(tmp_path):
+def test_coinbase_run_summary_logged(tmp_path):
     db_path = tmp_path / "test.sqlite"
     log_path = tmp_path / "app.jsonl"
     settings = Settings(
@@ -48,10 +48,13 @@ def test_collector_coinbase_inserts_row(tmp_path):
         )
     )
 
-    conn = sqlite3.connect(db_path)
-    try:
-        count = conn.execute("SELECT COUNT(*) FROM spot_ticks").fetchone()[0]
-    finally:
-        conn.close()
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    summary = None
+    for line in lines:
+        payload = json.loads(line)
+        if payload.get("msg") == "coinbase_run_summary":
+            summary = payload
+            break
 
-    assert count >= 1
+    assert summary is not None
+    assert summary.get("parsed_row_count", 0) >= 1

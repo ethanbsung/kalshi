@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -53,7 +54,9 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
-def setup_logger(log_path: Path, level: int = logging.INFO) -> logging.Logger:
+def setup_logger(
+    log_path: Path, level: int = logging.INFO, also_stdout: bool = False
+) -> logging.Logger:
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger("kalshi")
@@ -63,6 +66,10 @@ def setup_logger(log_path: Path, level: int = logging.INFO) -> logging.Logger:
     handler = logging.FileHandler(log_path, encoding="utf-8")
     handler.setFormatter(JsonFormatter())
     logger.addHandler(handler)
+    if also_stdout:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(JsonFormatter())
+        logger.addHandler(stream_handler)
     logger.propagate = False
 
     return logger

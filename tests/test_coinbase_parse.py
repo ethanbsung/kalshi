@@ -10,13 +10,17 @@ def test_parse_ticker_message_returns_row():
         "sequence_num": 101,
         "events": [
             {
-                "type": "ticker",
-                "product_id": "BTC-USD",
-                "price": "42000.5",
-                "best_bid": "41999.9",
-                "best_ask": "42001.1",
-                "bid_qty": "0.25",
-                "ask_qty": "0.3",
+                "type": "snapshot",
+                "tickers": [
+                    {
+                        "product_id": "BTC-USD",
+                        "price": "42000.5",
+                        "best_bid": "41999.9",
+                        "best_ask": "42001.1",
+                        "best_bid_quantity": "0.25",
+                        "best_ask_quantity": "0.3",
+                    }
+                ],
             }
         ],
     }
@@ -44,9 +48,13 @@ def test_parse_ticker_message_missing_fields():
         "timestamp": "2024-01-01T00:00:01Z",
         "events": [
             {
-                "type": "ticker",
-                "product_id": "BTC-USD",
-                "price": "42010.0",
+                "type": "update",
+                "tickers": [
+                    {
+                        "product_id": "BTC-USD",
+                        "price": "42010.0",
+                    }
+                ],
             }
         ],
     }
