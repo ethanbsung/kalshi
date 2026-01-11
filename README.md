@@ -19,9 +19,9 @@ This repo is structured to be:
 
 Data plane:
 1) Coinbase Advanced Trade WebSocket market data (`BTC-USD` ticker, optional level2)
-2) Kalshi WebSocket v2 market data (`orderbook_snapshot` then `orderbook_delta`)
+2) Kalshi WebSocket v2 market data (`ticker` + `orderbook_snapshot`/`orderbook_delta`)
 3) Kalshi WebSocket v2 authenticated streams (`fill`, optional `market_positions`)
-4) Kalshi REST discovery + reconciliation (`/portfolio/positions` and market metadata endpoints)
+4) Kalshi REST discovery + reconciliation (`/markets`, `/portfolio/positions`)
 
 Decision plane:
 5) Volatility estimator (rolling realized vol on spot mid)
@@ -57,6 +57,7 @@ Implement this exactly once and reuse everywhere:
 - best_no_ask  = 1.00 - best_yes_bid
 
 (Use consistent units: prices in [0,1] in your internal code. Convert to cents/ticks only at IO boundaries.)
+In the DB, Kalshi prices are stored in cents as provided by the API.
 
 ### Settlement rule
 Kalshi BTC markets settle off the **simple average of the final 60 seconds** of CF Benchmarks’ BRTI before the settlement time.
@@ -79,6 +80,7 @@ src/
     data/          # SQLite helpers + migrations
       migrations/  # ordered SQL migrations (001_*.sql, 002_*.sql)
     feeds/         # Coinbase/Kalshi connectors
+    kalshi/        # Kalshi REST + WS clients
     models/        # volatility, probability, cost models
     strategy/      # filters, signals, risk logic
     execution/     # order/portfolio management
@@ -140,12 +142,19 @@ All config is loaded from environment variables.
 
 ### Required environment variables
 
-Kalshi (not used yet; reserved for later phases):
+Kalshi (market data ingestion):
 - `KALSHI_ENV` = `demo` or `prod`
-- `KALSHI_RW_KEY_ID`
-- `KALSHI_RW_PRIVATE_KEY_PATH` (or whatever Kalshi requires in your auth scheme)
-- `KALSHI_WS_URL` (optional override)
+- `KALSHI_API_KEY_ID`
+- `KALSHI_PRIVATE_KEY_PATH`
 - `KALSHI_REST_URL` (optional override)
+- `KALSHI_WS_URL` (optional override)
+- `KALSHI_WS_AUTH_MODE` = `header` or `query` (default `header`)
+- `KALSHI_WS_AUTH_QUERY_KEY`, `KALSHI_WS_AUTH_QUERY_SIGNATURE`, `KALSHI_WS_AUTH_QUERY_TIMESTAMP` (optional overrides)
+- `KALSHI_MARKET_TICKERS` (comma-separated; required if REST creds are not set)
+- `KALSHI_MARKET_STATUS` (default `open`)
+- `KALSHI_MARKET_LIMIT` (default `100`)
+- `KALSHI_MARKET_MAX_PAGES` (default `1`)
+- `KALSHI_EVENT_TICKER`, `KALSHI_SERIES_TICKER` (optional filters)
 
 Coinbase:
 - `COINBASE_WS_URL` = `wss://advanced-trade-ws.coinbase.com` (default)
@@ -189,6 +198,10 @@ Phase 1A (Coinbase ticker only):
 
 python -m kalshi_bot.app.collector --coinbase --seconds 30
 
+Kalshi market data (ticker + orderbook):
+
+python -m kalshi_bot.app.collector --kalshi --seconds 60 --debug
+
 Debug to stdout + file:
 
 python -m kalshi_bot.app.collector --coinbase --seconds 30 --debug
@@ -196,10 +209,12 @@ python -m kalshi_bot.app.collector --coinbase --seconds 30 --debug
 Check rows (example):
 
 sqlite3 ./data/kalshi.sqlite "SELECT COUNT(*) FROM spot_ticks;"
+sqlite3 ./data/kalshi.sqlite "SELECT COUNT(*) FROM kalshi_tickers;"
 
 Definition of done:
 - runs for the configured seconds without exceptions
-- spot ticks are inserted into `spot_ticks`
+- spot ticks are inserted into `spot_ticks` (Coinbase)
+- Kalshi tickers/orderbook rows are inserted when `--kalshi` is enabled
 
 ---
 
@@ -245,6 +260,7 @@ This system is built around proving edge, so you must log opportunities even whe
 Minimum tables:
 - `spot_ticks`
 - `kalshi_markets`
+- `kalshi_tickers`
 - `kalshi_orderbook_snapshots`
 - `kalshi_orderbook_deltas`
 - `opportunities` (one row per evaluation)
@@ -323,4 +339,5 @@ This is an experimental trading system.
 2) Set env vars (DB/LOG paths + Coinbase WS as needed)
 3) Run collector to create SQLite tables (migrations apply automatically)
 4) Run Coinbase collector for ~30 seconds and confirm `spot_ticks` rows exist
-5) Paper/live trading steps are placeholders until Kalshi integration lands
+5) Run Kalshi collector and confirm `kalshi_markets` + `kalshi_tickers` rows exist
+6) Paper/live trading steps are placeholders until trading logic lands

@@ -33,6 +33,47 @@ class Settings(BaseModel):
     coinbase_stale_seconds: int = Field(default=10, alias="COINBASE_STALE_SECONDS")
     collector_seconds: int = Field(default=60, alias="COLLECTOR_SECONDS")
 
+    kalshi_rest_url: str = Field(
+        default="https://api.elections.kalshi.com/trade-api/v2",
+        alias="KALSHI_REST_URL",
+    )
+    kalshi_ws_url: str = Field(
+        default="wss://api.elections.kalshi.com/trade-api/ws/v2",
+        alias="KALSHI_WS_URL",
+    )
+    kalshi_api_key_id: str | None = Field(default=None, alias="KALSHI_API_KEY_ID")
+    kalshi_private_key_path: Path | None = Field(
+        default=None, alias="KALSHI_PRIVATE_KEY_PATH"
+    )
+    kalshi_ws_auth_mode: Literal["header", "query"] = Field(
+        default="header", alias="KALSHI_WS_AUTH_MODE"
+    )
+    kalshi_ws_auth_query_key: str = Field(
+        default="apiKey", alias="KALSHI_WS_AUTH_QUERY_KEY"
+    )
+    kalshi_ws_auth_query_signature: str = Field(
+        default="signature", alias="KALSHI_WS_AUTH_QUERY_SIGNATURE"
+    )
+    kalshi_ws_auth_query_timestamp: str = Field(
+        default="timestamp", alias="KALSHI_WS_AUTH_QUERY_TIMESTAMP"
+    )
+    kalshi_market_status: str | None = Field(
+        default="open", alias="KALSHI_MARKET_STATUS"
+    )
+    kalshi_market_limit: int = Field(default=100, alias="KALSHI_MARKET_LIMIT")
+    kalshi_market_max_pages: int = Field(
+        default=1, alias="KALSHI_MARKET_MAX_PAGES"
+    )
+    kalshi_market_tickers: str | None = Field(
+        default=None, alias="KALSHI_MARKET_TICKERS"
+    )
+    kalshi_event_ticker: str | None = Field(
+        default=None, alias="KALSHI_EVENT_TICKER"
+    )
+    kalshi_series_ticker: str | None = Field(
+        default=None, alias="KALSHI_SERIES_TICKER"
+    )
+
 
 def load_settings(env_file: str | None = None) -> Settings:
     load_dotenv(env_file)

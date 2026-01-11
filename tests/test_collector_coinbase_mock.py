@@ -43,6 +43,7 @@ def test_collector_coinbase_inserts_row(tmp_path):
         collector.run_collector(
             settings,
             coinbase=True,
+            kalshi=False,
             seconds=1,
             message_source=_message_source(),
         )
