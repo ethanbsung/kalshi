@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import socket
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ class KalshiRestError(RuntimeError):
     body: str
     transient: bool
     retry_after: float | None = None
+    error_type: str | None = None
 
 
 class KalshiRestClient:
@@ -69,7 +71,15 @@ class KalshiRestClient:
                         retry_after = None
             raise KalshiRestError(exc.code, body, transient, retry_after) from exc
         except error.URLError as exc:
+            if isinstance(exc.reason, socket.timeout):
+                raise KalshiRestError(
+                    None, str(exc), True, error_type="timeout"
+                ) from exc
             raise KalshiRestError(None, str(exc), True) from exc
+        except TimeoutError as exc:
+            raise KalshiRestError(
+                None, str(exc), True, error_type="timeout"
+            ) from exc
 
         try:
             return json.loads(payload)

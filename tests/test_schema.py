@@ -130,5 +130,21 @@ def test_schema_tables_exist(tmp_path):
         missing_contracts = required_kalshi_contract_cols - kalshi_contract_cols
         assert not missing_contracts, f"kalshi_contracts missing cols: {missing_contracts}"
 
+        quote_fks = conn.execute(
+            "PRAGMA foreign_key_list(kalshi_quotes)"
+        ).fetchall()
+        assert any(
+            row[2] == "kalshi_markets" and row[3] == "market_id"
+            for row in quote_fks
+        ), "kalshi_quotes missing FK to kalshi_markets"
+
+        quote_indexes = conn.execute(
+            "PRAGMA index_list(kalshi_quotes)"
+        ).fetchall()
+        index_names = {row[1] for row in quote_indexes}
+        assert (
+            "idx_kalshi_quotes_market_ts" in index_names
+        ), "kalshi_quotes missing market_id,ts index"
+
     finally:
         conn.close()

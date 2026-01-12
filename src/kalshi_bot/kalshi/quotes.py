@@ -9,8 +9,14 @@ from typing import Any, Awaitable, Callable
 import aiosqlite
 
 from kalshi_bot.data.dao import Dao
+from kalshi_bot.kalshi.error_utils import (
+    add_failed_sample,
+    classify_exception,
+    init_error_counts,
+)
 from kalshi_bot.kalshi.market_filters import build_series_clause, normalize_series
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
+from kalshi_bot.kalshi.validation import validate_quote_row
 
 MarketFetcher = Callable[[str, float | None], Awaitable[dict[str, Any]]]
 
@@ -114,7 +120,7 @@ class KalshiQuotePoller:
         status: str | None = None,
         series: list[str] | None = None,
         tickers: list[str] | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         normalized_series = normalize_series(series)
         if tickers is None:
             tickers = await load_market_tickers(conn, status, normalized_series)
@@ -131,20 +137,36 @@ class KalshiQuotePoller:
                 "kalshi_quotes_no_markets",
                 extra={"status": status, "series": normalized_series},
             )
-            return {"successes": 0, "failures": 0, "inserted": 0}
+            empty_counts = init_error_counts()
+            return {
+                "successes": 0,
+                "failures": 0,
+                "inserted": 0,
+                "error_counts": empty_counts,
+                "failed_tickers_sample": [],
+            }
 
         end_time = time.monotonic() + run_seconds
         total_success = 0
         total_fail = 0
         total_inserted = 0
+        total_error_counts = init_error_counts()
+        total_failed_samples: list[str] = []
+        total_failed_set: set[str] = set()
 
         while time.monotonic() < end_time:
-            success, fail, inserted = await self.poll_once(
+            summary = await self.poll_once(
                 conn, tickers, end_time=end_time
             )
-            total_success += success
-            total_fail += fail
-            total_inserted += inserted
+            total_success += summary["successes"]
+            total_fail += summary["failures"]
+            total_inserted += summary["inserted"]
+            for key, value in summary["error_counts"].items():
+                total_error_counts[key] = total_error_counts.get(key, 0) + value
+            for ticker in summary["failed_tickers_sample"]:
+                add_failed_sample(
+                    total_failed_samples, total_failed_set, ticker
+                )
             now = time.monotonic()
             if now >= end_time:
                 break
@@ -159,12 +181,16 @@ class KalshiQuotePoller:
                 "successes": total_success,
                 "failures": total_fail,
                 "inserted": total_inserted,
+                "error_counts": total_error_counts,
+                "failed_tickers_sample": total_failed_samples,
             },
         )
         return {
             "successes": total_success,
             "failures": total_fail,
             "inserted": total_inserted,
+            "error_counts": total_error_counts,
+            "failed_tickers_sample": total_failed_samples,
         }
 
     async def poll_once(
@@ -172,50 +198,112 @@ class KalshiQuotePoller:
         conn: aiosqlite.Connection,
         tickers: list[str],
         end_time: float | None = None,
-    ) -> tuple[int, int, int]:
+    ) -> dict[str, Any]:
         semaphore = asyncio.Semaphore(self._max_concurrency)
+        error_counts = init_error_counts()
+        failed_samples: list[str] = []
+        failed_set: set[str] = set()
 
-        async def fetch_one(ticker: str) -> dict[str, Any] | None:
+        async def fetch_one(
+            ticker: str,
+        ) -> tuple[str, dict[str, Any] | None, str | None]:
             async with semaphore:
                 try:
-                    return await self._fetch_market(ticker, end_time)
+                    market = await self._fetch_market(ticker, end_time)
                 except Exception as exc:
-                    self._logger.warning(
-                        "kalshi_quote_fetch_failed",
-                        extra={"ticker": ticker, "error": str(exc)},
-                    )
-                    return None
+                    bucket = classify_exception(exc)
+                    if bucket == "auth_error":
+                        self._logger.error(
+                            "kalshi_quote_fetch_failed",
+                            extra={
+                                "ticker": ticker,
+                                "error": str(exc),
+                                "bucket": bucket,
+                            },
+                        )
+                    elif self._logger.isEnabledFor(logging.DEBUG):
+                        self._logger.warning(
+                            "kalshi_quote_fetch_failed",
+                            extra={
+                                "ticker": ticker,
+                                "error": str(exc),
+                                "bucket": bucket,
+                            },
+                        )
+                    return ticker, None, bucket
+                if not isinstance(market, dict):
+                    if self._logger.isEnabledFor(logging.DEBUG):
+                        self._logger.warning(
+                            "kalshi_quote_payload_invalid",
+                            extra={"ticker": ticker},
+                        )
+                    return ticker, None, "invalid_payload"
+                return ticker, market, None
 
         tasks = [asyncio.create_task(fetch_one(ticker)) for ticker in tickers]
         results = await asyncio.gather(*tasks)
 
         rows: list[dict[str, Any]] = []
-        failures = 0
         ts_now = int(time.time())
-        for market in results:
-            if market is None:
-                failures += 1
-                continue
-            if not isinstance(market, dict):
-                failures += 1
-                self._logger.warning("kalshi_quote_payload_invalid")
+        for ticker, market, error_bucket in results:
+            if error_bucket is not None:
+                error_counts[error_bucket] += 1
+                add_failed_sample(failed_samples, failed_set, ticker)
                 continue
             try:
-                rows.append(build_quote_row(market, ts_now))
+                row = build_quote_row(market, ts_now)
             except ValueError as exc:
-                failures += 1
-                self._logger.warning(
-                    "kalshi_quote_row_invalid",
-                    extra={"error": str(exc)},
-                )
+                error_counts["invalid_payload"] += 1
+                add_failed_sample(failed_samples, failed_set, ticker)
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.warning(
+                        "kalshi_quote_row_invalid",
+                        extra={"ticker": ticker, "error": str(exc)},
+                    )
+                continue
 
+            valid, reason = validate_quote_row(row)
+            if not valid:
+                error_counts["invalid_payload"] += 1
+                add_failed_sample(failed_samples, failed_set, ticker)
+                if self._logger.isEnabledFor(logging.DEBUG):
+                    self._logger.warning(
+                        "kalshi_quote_row_invalid",
+                        extra={"ticker": ticker, "reason": reason},
+                    )
+                continue
+            rows.append(row)
+
+        failures = sum(error_counts.values())
         successes = len(results) - failures
         if not rows:
-            return successes, failures, 0
+            summary = {
+                "successes": successes,
+                "failures": failures,
+                "inserted": 0,
+                "error_counts": error_counts,
+                "failed_tickers_sample": failed_samples,
+            }
+            self._logger.info(
+                "kalshi_quote_poll_iteration_summary",
+                extra=summary,
+            )
+            return summary
 
         dao = Dao(conn)
         for row in rows:
             await dao.insert_kalshi_quote(row)
         await conn.commit()
 
-        return successes, failures, len(rows)
+        summary = {
+            "successes": successes,
+            "failures": failures,
+            "inserted": len(rows),
+            "error_counts": error_counts,
+            "failed_tickers_sample": failed_samples,
+        }
+        self._logger.info(
+            "kalshi_quote_poll_iteration_summary",
+            extra=summary,
+        )
+        return summary

@@ -9,6 +9,11 @@ from typing import Any
 import aiosqlite
 
 from kalshi_bot.data.dao import Dao
+from kalshi_bot.kalshi.error_utils import (
+    add_failed_sample,
+    classify_exception,
+    init_error_counts,
+)
 from kalshi_bot.kalshi.market_filters import build_series_clause, normalize_series
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 
@@ -137,7 +142,7 @@ class KalshiContractRefresher:
         series: list[str] | None = None,
         rows: list[tuple[str, int | None]] | None = None,
         end_time: float | None = None,
-    ) -> dict[str, int]:
+    ) -> dict[str, Any]:
         normalized_series = normalize_series(series)
         if rows is None:
             rows = await load_market_rows(conn, status, normalized_series)
@@ -154,20 +159,49 @@ class KalshiContractRefresher:
                 "kalshi_contracts_no_markets",
                 extra={"status": status, "series": normalized_series},
             )
-            return {"successes": 0, "failures": 0, "upserted": 0}
+            empty_counts = init_error_counts()
+            return {
+                "successes": 0,
+                "failures": 0,
+                "upserted": 0,
+                "error_counts": empty_counts,
+                "failed_tickers_sample": [],
+            }
 
         semaphore = asyncio.Semaphore(self._max_concurrency)
 
-        async def fetch_market(ticker: str) -> dict[str, Any] | None:
+        async def fetch_market(
+            ticker: str,
+        ) -> tuple[str, dict[str, Any] | None, str | None]:
             async with semaphore:
                 try:
-                    return await self._rest_client.get_market(ticker, end_time=end_time)
-                except Exception as exc:
-                    self._logger.warning(
-                        "kalshi_contract_fetch_failed",
-                        extra={"ticker": ticker, "error": str(exc)},
+                    market = await self._rest_client.get_market(
+                        ticker, end_time=end_time
                     )
-                    return None
+                except Exception as exc:
+                    bucket = classify_exception(exc)
+                    if bucket == "auth_error":
+                        self._logger.error(
+                            "kalshi_contract_fetch_failed",
+                            extra={
+                                "ticker": ticker,
+                                "error": str(exc),
+                                "bucket": bucket,
+                            },
+                        )
+                    elif self._logger.isEnabledFor(logging.DEBUG):
+                        self._logger.warning(
+                            "kalshi_contract_fetch_failed",
+                            extra={
+                                "ticker": ticker,
+                                "error": str(exc),
+                                "bucket": bucket,
+                            },
+                        )
+                    return ticker, None, bucket
+                if not isinstance(market, dict):
+                    return ticker, None, "invalid_payload"
+                return ticker, market, None
 
         tasks = [asyncio.create_task(fetch_market(ticker)) for ticker, _ in rows]
         payloads = await asyncio.gather(*tasks)
@@ -176,10 +210,16 @@ class KalshiContractRefresher:
         successes = 0
         failures = 0
         upserted = 0
+        error_counts = init_error_counts()
+        failed_samples: list[str] = []
+        failed_set: set[str] = set()
 
-        for (ticker, settlement_ts), market in zip(rows, payloads):
-            if market is None:
+        for (ticker, settlement_ts), (_, market, bucket) in zip(rows, payloads):
+            if bucket is not None:
                 failures += 1
+                error_counts[bucket] += 1
+                add_failed_sample(failed_samples, failed_set, ticker)
+                market = None
             else:
                 successes += 1
             row = build_contract_row(ticker, settlement_ts, market, self._logger)
@@ -194,6 +234,14 @@ class KalshiContractRefresher:
                 "successes": successes,
                 "failures": failures,
                 "upserted": upserted,
+                "error_counts": error_counts,
+                "failed_tickers_sample": failed_samples,
             },
         )
-        return {"successes": successes, "failures": failures, "upserted": upserted}
+        return {
+            "successes": successes,
+            "failures": failures,
+            "upserted": upserted,
+            "error_counts": error_counts,
+            "failed_tickers_sample": failed_samples,
+        }
