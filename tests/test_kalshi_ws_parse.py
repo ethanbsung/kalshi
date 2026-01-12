@@ -1,6 +1,7 @@
 import json
 
 from kalshi_bot.kalshi.ws_client import (
+    compute_best_prices,
     parse_orderbook_delta,
     parse_orderbook_snapshot,
     parse_ticker_message,
@@ -53,8 +54,15 @@ def test_parse_orderbook_snapshot_and_delta():
     assert snapshot_row is not None
     assert snapshot_row["market_id"] == "FED-23DEC-T3.00"
     assert snapshot_row["seq"] == 2
-    assert json.loads(snapshot_row["yes_bids_json"]) == [[8, 300], [22, 333]]
-    assert json.loads(snapshot_row["no_bids_json"]) == [[54, 20], [56, 146]]
+    yes_levels = json.loads(snapshot_row["yes_bids_json"])
+    no_levels = json.loads(snapshot_row["no_bids_json"])
+    assert yes_levels == [[8, 300], [22, 333]]
+    assert no_levels == [[54, 20], [56, 146]]
+    best = compute_best_prices(yes_levels, no_levels)
+    assert best["best_yes_bid"] == 22.0
+    assert best["best_no_bid"] == 56.0
+    assert best["best_yes_ask"] == 44.0
+    assert best["best_no_ask"] == 78.0
 
     delta = {
         "type": "orderbook_delta",

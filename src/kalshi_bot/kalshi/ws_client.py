@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -19,6 +20,7 @@ SnapshotHandler = Callable[[dict[str, Any]], Awaitable[None]]
 DeltaHandler = Callable[[dict[str, Any]], Awaitable[None]]
 
 RAW_MESSAGE_LIMIT = 2000
+DEBUG_MESSAGE_LIMIT = 1500
 
 
 def _parse_float(value: Any) -> float | None:
@@ -49,6 +51,37 @@ def _implied_no_ask(yes_bid: float | None) -> float | None:
     if yes_bid is None:
         return None
     return 100.0 - yes_bid
+
+
+def _normalize_levels(value: Any) -> list[list[Any]] | None:
+    if not isinstance(value, list):
+        return None
+    return value
+
+
+def compute_best_prices(
+    yes_levels: list[list[Any]] | None, no_levels: list[list[Any]] | None
+) -> dict[str, float | None]:
+    def best_price(levels: list[list[Any]] | None) -> float | None:
+        if not levels:
+            return None
+        prices = []
+        for level in levels:
+            if not isinstance(level, list) or not level:
+                continue
+            price = _parse_float(level[0])
+            if price is not None:
+                prices.append(price)
+        return max(prices) if prices else None
+
+    best_yes_bid = best_price(yes_levels)
+    best_no_bid = best_price(no_levels)
+    return {
+        "best_yes_bid": best_yes_bid,
+        "best_no_bid": best_no_bid,
+        "best_yes_ask": _implied_no_bid(best_no_bid),
+        "best_no_ask": _implied_no_ask(best_yes_bid),
+    }
 
 
 def parse_ticker_message(
@@ -94,15 +127,15 @@ def parse_orderbook_snapshot(
     market_ticker = msg.get("market_ticker")
     if not market_ticker:
         return None
-    yes_levels = msg.get("yes")
-    no_levels = msg.get("no")
+    yes_levels = _normalize_levels(msg.get("yes"))
+    no_levels = _normalize_levels(msg.get("no"))
 
     return {
         "ts": int(received_ts),
         "market_id": market_ticker,
         "seq": _parse_int(message.get("seq")),
-        "yes_bids_json": json.dumps(yes_levels) if yes_levels is not None else None,
-        "no_bids_json": json.dumps(no_levels) if no_levels is not None else None,
+        "yes_bids_json": json.dumps(yes_levels) if yes_levels is not None else "[]",
+        "no_bids_json": json.dumps(no_levels) if no_levels is not None else "[]",
         "raw_json": json.dumps(message),
     }
 
@@ -157,6 +190,7 @@ class KalshiWsClient:
         self._logger = logger
         self._message_source = message_source
         self._signer: KalshiSigner | None = None
+        self._debug_payloads = os.getenv("KALSHI_DEBUG_PAYLOADS") == "1"
 
         self.connect_attempts = 0
         self.connect_successes = 0
@@ -250,6 +284,7 @@ class KalshiWsClient:
             raw = json.dumps(message, default=str)
             self._note_received(raw)
             self._log_message_summary(message)
+            self._log_debug_payload(raw, message)
             if self._log_error_message(message):
                 continue
             await self._handle_message(message, on_ticker, on_snapshot, on_delta)
@@ -323,6 +358,7 @@ class KalshiWsClient:
                     continue
 
                 self._log_message_summary(message)
+                self._log_debug_payload(raw_text, message)
                 if self._log_error_message(message):
                     continue
 
@@ -345,6 +381,18 @@ class KalshiWsClient:
         snapshot = parse_orderbook_snapshot(message, received_ts)
         if snapshot is not None:
             self.parsed_snapshot_count += 1
+            msg = message.get("msg") if isinstance(message.get("msg"), dict) else {}
+            yes_levels = _normalize_levels(msg.get("yes"))
+            no_levels = _normalize_levels(msg.get("no"))
+            if not yes_levels and not no_levels:
+                self._logger.warning(
+                    "kalshi_parse_empty_book",
+                    extra={
+                        "message_type": message.get("type"),
+                        "market_id": snapshot.get("market_id"),
+                        "keys": sorted(msg.keys()) if isinstance(msg, dict) else [],
+                    },
+                )
             await on_snapshot(snapshot)
             return
 
@@ -374,6 +422,24 @@ class KalshiWsClient:
             )
             return True
         return False
+
+    def _log_debug_payload(self, raw_json: str, message: dict[str, Any]) -> None:
+        if not self._debug_payloads:
+            return
+        msg_type = message.get("type")
+        if msg_type not in {"orderbook_snapshot", "orderbook_delta", "ticker"}:
+            return
+        msg = message.get("msg")
+        market_id = msg.get("market_ticker") if isinstance(msg, dict) else None
+        self._logger.info(
+            "kalshi_debug_payload",
+            extra={
+                "message_type": msg_type,
+                "market_id": market_id,
+                "seq": message.get("seq"),
+                "raw_json": raw_json[:DEBUG_MESSAGE_LIMIT],
+            },
+        )
 
     def _note_received(self, raw_message: str) -> None:
         self.recv_count += 1

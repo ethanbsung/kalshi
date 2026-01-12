@@ -181,6 +181,59 @@ class KalshiRestClient:
             await asyncio.sleep(0)
         return markets
 
+    async def list_markets_by_series(
+        self,
+        series_ticker: str,
+        status: str | None = None,
+        limit: int | None = None,
+        max_pages: int | None = None,
+        end_time: float | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        markets: list[dict[str, Any]] = []
+        payloads: list[dict[str, Any]] = []
+        cursor: str | None = None
+        pages = 0
+
+        while True:
+            params: dict[str, Any] = {
+                "limit": limit,
+                "cursor": cursor,
+                "status": status,
+                "series_ticker": series_ticker,
+            }
+            payload = await self._request_json(
+                "GET", "/markets", params, end_time=end_time
+            )
+            payloads.append(payload)
+            batch = payload.get("markets", [])
+            if isinstance(batch, list):
+                markets.extend(batch)
+            cursor = payload.get("cursor")
+            pages += 1
+            self._logger.info(
+                "kalshi_rest_call",
+                extra={
+                    "method": "GET",
+                    "path": "/markets",
+                    "limit": limit,
+                    "status": status,
+                    "cursor": params.get("cursor"),
+                    "series_ticker": series_ticker,
+                    "markets_returned": len(batch) if isinstance(batch, list) else 0,
+                },
+            )
+            if max_pages is not None and pages >= max_pages:
+                if cursor:
+                    self._logger.info(
+                        "kalshi_rest_pagination_stop",
+                        extra={"pages": pages, "cursor": cursor},
+                    )
+                break
+            if not cursor:
+                break
+            await asyncio.sleep(0)
+        return markets, payloads
+
     async def get_market(
         self, ticker: str, end_time: float | None = None
     ) -> dict[str, Any]:
