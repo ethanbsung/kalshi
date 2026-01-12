@@ -23,6 +23,8 @@ def test_schema_tables_exist(tmp_path):
             "spot_ticks",
             "kalshi_markets",
             "kalshi_tickers",
+            "kalshi_quotes",
+            "kalshi_contracts",
             "kalshi_orderbook_snapshots",
             "kalshi_orderbook_deltas",
             "opportunities",
@@ -96,6 +98,37 @@ def test_schema_tables_exist(tmp_path):
         }
         missing_kalshi = required_kalshi_ticker_cols - kalshi_ticker_cols
         assert not missing_kalshi, f"kalshi_tickers missing cols: {missing_kalshi}"
+
+        kalshi_quote_cols = _table_columns(conn, "kalshi_quotes")
+        required_kalshi_quote_cols = {
+            "ts",
+            "market_id",
+            "yes_bid",
+            "yes_ask",
+            "no_bid",
+            "no_ask",
+            "yes_mid",
+            "no_mid",
+            "p_mid",
+            "volume",
+            "volume_24h",
+            "open_interest",
+            "raw_json",
+        }
+        missing_quotes = required_kalshi_quote_cols - kalshi_quote_cols
+        assert not missing_quotes, f"kalshi_quotes missing cols: {missing_quotes}"
+
+        kalshi_contract_cols = _table_columns(conn, "kalshi_contracts")
+        required_kalshi_contract_cols = {
+            "ticker",
+            "lower",
+            "upper",
+            "strike_type",
+            "settlement_ts",
+            "updated_ts",
+        }
+        missing_contracts = required_kalshi_contract_cols - kalshi_contract_cols
+        assert not missing_contracts, f"kalshi_contracts missing cols: {missing_contracts}"
 
     finally:
         conn.close()
