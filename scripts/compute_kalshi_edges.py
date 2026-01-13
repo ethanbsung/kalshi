@@ -18,6 +18,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-spot-points", type=int, default=500)
     parser.add_argument("--ewma-lambda", type=float, default=0.94)
     parser.add_argument("--min-points", type=int, default=10)
+    parser.add_argument("--min-sigma-lookback-seconds", type=int, default=3600)
+    parser.add_argument("--sigma-resample-seconds", type=int, default=5)
     parser.add_argument("--sigma-default", type=float, default=0.6)
     parser.add_argument("--sigma-max", type=float, default=5.0)
     parser.add_argument(
@@ -38,9 +40,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--freshness-seconds", type=int, default=300)
     parser.add_argument("--max-horizon-seconds", type=int, default=10 * 24 * 3600)
+    parser.add_argument("--min-ask-cents", type=float, default=1.0)
+    parser.add_argument("--max-ask-cents", type=float, default=99.0)
     parser.add_argument("--contracts", type=int, default=1)
     parser.add_argument("--debug-market", action="append", default=[])
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--show-titles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser.parse_args()
 
 
@@ -78,6 +87,8 @@ async def _run() -> int:
             max_spot_points=args.max_spot_points,
             ewma_lambda=args.ewma_lambda,
             min_points=args.min_points,
+            min_sigma_lookback_seconds=args.min_sigma_lookback_seconds,
+            resample_seconds=args.sigma_resample_seconds,
             sigma_default=sigma_default,
             sigma_max=sigma_max,
             status=args.status,
@@ -87,6 +98,8 @@ async def _run() -> int:
             freshness_seconds=args.freshness_seconds,
             max_horizon_seconds=args.max_horizon_seconds,
             contracts=args.contracts,
+            min_ask_cents=args.min_ask_cents,
+            max_ask_cents=args.max_ask_cents,
             debug_market_ids=args.debug_market or None,
         )
 
@@ -104,6 +117,10 @@ async def _run() -> int:
 
         if args.debug:
             print(f"sample_relevant_ids={summary.get('relevant_ids_sample')}")
+            if args.show_titles:
+                print(
+                    f"sample_relevant_titles={summary.get('relevant_titles_sample')}"
+                )
             print(
                 f"sample_recent_quote_market_ids={summary.get('recent_quote_market_ids_sample')}"
             )
@@ -111,7 +128,12 @@ async def _run() -> int:
                 f"sample_missing_quote_market_ids={summary.get('missing_quote_sample')}"
             )
             print(
-                "sigma_source={sigma_source} sigma_ok={sigma_ok} sigma_reason={sigma_reason}".format(
+                "sigma_source={sigma_source} sigma_ok={sigma_ok} "
+                "sigma_quality={sigma_quality} sigma_reason={sigma_reason} "
+                "sigma_points_used={sigma_points_used} "
+                "sigma_lookback_seconds_used={sigma_lookback_seconds_used} "
+                "min_sigma_lookback_seconds={min_sigma_lookback_seconds} "
+                "resample_seconds={resample_seconds} step_seconds={step_seconds}".format(
                     **summary
                 )
             )
@@ -154,10 +176,11 @@ async def _run() -> int:
                     JOIN edge_ids e ON q.market_id = e.market_id
                     GROUP BY q.market_id
                 )
-                SELECT e.market_id, e.prob_yes, e.yes_ask, e.no_ask,
+                SELECT e.market_id, m.title, e.prob_yes, e.yes_ask, e.no_ask,
                        e.ev_take_yes, e.ev_take_no, q.yes_mid, q.no_mid
                 FROM kalshi_edges e
                 JOIN edge_ids i ON e.market_id = i.market_id
+                LEFT JOIN kalshi_markets m ON e.market_id = m.market_id
                 LEFT JOIN latest l ON e.market_id = l.market_id
                 LEFT JOIN kalshi_quotes q
                     ON q.market_id = l.market_id AND q.ts = l.max_ts
@@ -171,6 +194,7 @@ async def _run() -> int:
                 print("sanity_check_samples:")
                 for (
                     market_id,
+                    title,
                     prob_yes,
                     yes_ask,
                     no_ask,
@@ -185,13 +209,15 @@ async def _run() -> int:
                     implied_yes_from_no_mid = (
                         1.0 - (no_mid / 100.0) if no_mid is not None else None
                     )
+                    title_text = f' title="{title}"' if args.show_titles else ""
                     print(
-                        "  {market_id} prob_yes={prob_yes} "
+                        "  {market_id}{title_text} prob_yes={prob_yes} "
                         "implied_yes_mid={implied_yes_mid} "
                         "implied_yes_from_no_mid={implied_yes_from_no_mid} "
                         "yes_ask={yes_ask} no_ask={no_ask} "
                         "ev_yes={ev_yes} ev_no={ev_no}".format(
                             market_id=market_id,
+                            title_text=title_text,
                             prob_yes=prob_yes,
                             implied_yes_mid=implied_yes_mid,
                             implied_yes_from_no_mid=implied_yes_from_no_mid,
@@ -214,10 +240,11 @@ async def _run() -> int:
                         WHERE market_id IN ({placeholders})
                         GROUP BY market_id
                     )
-                    SELECT c.ticker, c.lower, c.upper, c.strike_type,
+                    SELECT c.ticker, m.title, c.lower, c.upper, c.strike_type,
                            COALESCE(c.close_ts, c.expected_expiration_ts, c.settlement_ts) AS close_ts,
                            q.ts, q.yes_bid, q.yes_ask, q.no_bid, q.no_ask
                     FROM kalshi_contracts c
+                    LEFT JOIN kalshi_markets m ON c.ticker = m.market_id
                     LEFT JOIN latest l ON c.ticker = l.market_id
                     LEFT JOIN kalshi_quotes q
                         ON q.market_id = l.market_id AND q.ts = l.max_ts
@@ -231,6 +258,7 @@ async def _run() -> int:
                     print("selection_sample_details:")
                     for (
                         ticker,
+                        title,
                         lower,
                         upper,
                         strike_type,
@@ -243,6 +271,11 @@ async def _run() -> int:
                     ) in rows:
                         horizon_seconds = (
                             int(close_ts) - summary["now_ts"]
+                            if close_ts is not None
+                            else None
+                        )
+                        prob_horizon_seconds = (
+                            int(close_ts) - summary["spot_ts"]
                             if close_ts is not None
                             else None
                         )
@@ -267,19 +300,22 @@ async def _run() -> int:
                             yes_ask, yes_bid
                         )
                         no_tradable = _tradable(no_ask, no_bid)
+                        title_text = f' title="{title}"' if args.show_titles else ""
                         print(
-                            f"  {ticker} strike_type={strike_type} lower={lower} upper={upper} "
-                            f"close_ts={close_ts} horizon_seconds={horizon_seconds} "
+                            f"  {ticker}{title_text} strike_type={strike_type} lower={lower} upper={upper} "
+                            f"close_ts={close_ts} selection_horizon_seconds={horizon_seconds} "
+                            f"prob_horizon_seconds={prob_horizon_seconds} "
                             f"quote_ts={quote_ts} quote_age={quote_age} "
                             f"yes_ask={yes_ask} no_ask={no_ask} "
                             f"yes_tradable={yes_tradable} no_tradable={no_tradable}"
                         )
 
         cursor = await conn.execute(
-            "SELECT e.market_id, e.prob_yes, e.yes_ask, e.ev_take_yes, "
+            "SELECT e.market_id, m.title, e.prob_yes, e.yes_ask, e.ev_take_yes, "
             "e.settlement_ts, e.horizon_seconds, c.strike_type, c.lower, c.upper "
             "FROM kalshi_edges e "
             "LEFT JOIN kalshi_contracts c ON e.market_id = c.ticker "
+            "LEFT JOIN kalshi_markets m ON e.market_id = m.market_id "
             "WHERE e.ts = ? "
             "ORDER BY e.ev_take_yes DESC LIMIT 5",
             (summary["now_ts"],),
@@ -287,10 +323,11 @@ async def _run() -> int:
         top_yes = await cursor.fetchall()
 
         cursor = await conn.execute(
-            "SELECT e.market_id, e.prob_yes, e.no_ask, e.ev_take_no, "
+            "SELECT e.market_id, m.title, e.prob_yes, e.no_ask, e.ev_take_no, "
             "e.settlement_ts, e.horizon_seconds, c.strike_type, c.lower, c.upper "
             "FROM kalshi_edges e "
             "LEFT JOIN kalshi_contracts c ON e.market_id = c.ticker "
+            "LEFT JOIN kalshi_markets m ON e.market_id = m.market_id "
             "WHERE e.ts = ? "
             "ORDER BY ev_take_no DESC LIMIT 5",
             (summary["now_ts"],),
@@ -314,6 +351,7 @@ async def _run() -> int:
         print("top_ev_yes:")
         for (
             market_id,
+            title,
             prob_yes,
             yes_ask,
             ev,
@@ -323,13 +361,21 @@ async def _run() -> int:
             lower,
             upper,
         ) in top_yes:
+            title_text = f' title="{title}"' if args.show_titles else ""
             line = (
-                f"  {market_id} prob={prob_yes} yes_ask={yes_ask} ev={ev}"
+                f"  {market_id}{title_text} prob={prob_yes} yes_ask={yes_ask} ev={ev}"
             )
             if args.debug:
+                selection_horizon = (
+                    settlement_ts - summary.get("now_ts", 0)
+                    if settlement_ts is not None
+                    else None
+                )
                 line += (
                     f" settlement_ts={settlement_ts} spot_ts={summary.get('spot_ts')}"
-                    f" horizon_seconds={horizon_seconds} strike_type={strike_type}"
+                    f" prob_horizon_seconds={horizon_seconds} "
+                    f"selection_horizon_seconds={selection_horizon} "
+                    f"strike_type={strike_type}"
                     f" lower={lower} upper={upper}"
                 )
             print(line)
@@ -338,6 +384,7 @@ async def _run() -> int:
         print("top_ev_no:")
         for (
             market_id,
+            title,
             prob_yes,
             no_ask,
             ev,
@@ -347,13 +394,21 @@ async def _run() -> int:
             lower,
             upper,
         ) in top_no:
+            title_text = f' title="{title}"' if args.show_titles else ""
             line = (
-                f"  {market_id} prob={prob_yes} no_ask={no_ask} ev={ev}"
+                f"  {market_id}{title_text} prob={prob_yes} no_ask={no_ask} ev={ev}"
             )
             if args.debug:
+                selection_horizon = (
+                    settlement_ts - summary.get("now_ts", 0)
+                    if settlement_ts is not None
+                    else None
+                )
                 line += (
                     f" settlement_ts={settlement_ts} spot_ts={summary.get('spot_ts')}"
-                    f" horizon_seconds={horizon_seconds} strike_type={strike_type}"
+                    f" prob_horizon_seconds={horizon_seconds} "
+                    f"selection_horizon_seconds={selection_horizon} "
+                    f"strike_type={strike_type}"
                     f" lower={lower} upper={upper}"
                 )
             print(line)

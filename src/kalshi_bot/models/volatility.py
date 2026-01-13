@@ -26,6 +26,44 @@ def compute_log_returns(prices: Iterable[float]) -> list[float]:
     return returns
 
 
+def resample_last_price_series(
+    timestamps: Iterable[int],
+    prices: Iterable[float],
+    bucket_seconds: int,
+) -> tuple[list[int], list[float]]:
+    """Resample to fixed buckets using last-tick prices."""
+    if not isinstance(bucket_seconds, int) or bucket_seconds <= 0:
+        raise ValueError("bucket_seconds must be a positive int")
+
+    pairs: list[tuple[int, float]] = []
+    for ts, price in zip(timestamps, prices):
+        if ts is None or price is None:
+            continue
+        if price <= 0:
+            continue
+        pairs.append((int(ts), float(price)))
+
+    if not pairs:
+        return [], []
+
+    pairs.sort(key=lambda item: item[0])
+    resampled_ts: list[int] = []
+    resampled_prices: list[float] = []
+    current_bucket: int | None = None
+
+    for ts, price in pairs:
+        bucket = ts // bucket_seconds
+        if current_bucket is None or bucket != current_bucket:
+            resampled_ts.append(ts)
+            resampled_prices.append(price)
+            current_bucket = bucket
+        else:
+            resampled_ts[-1] = ts
+            resampled_prices[-1] = price
+
+    return resampled_ts, resampled_prices
+
+
 def ewma_volatility(returns: list[float], lambda_: float) -> float | None:
     """EWMA volatility per sqrt(step) using variance recursion."""
     if not returns:

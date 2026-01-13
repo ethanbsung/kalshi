@@ -28,6 +28,7 @@ from kalshi_bot.models.volatility import (
     annualize_vol,
     compute_log_returns,
     ewma_volatility,
+    resample_last_price_series,
 )
 from kalshi_bot.strategy.edge_math import ev_take_no, ev_take_yes
 
@@ -47,7 +48,7 @@ class EdgeRow:
     ts: int
     market_id: str
     settlement_ts: int | None  # Market close time used for horizon.
-    horizon_seconds: int | None
+    horizon_seconds: int | None  # Horizon from spot_ts to close_ts.
     spot_price: float
     sigma_annualized: float
     prob_yes: float
@@ -149,6 +150,7 @@ def compute_edge_for_market(
     inputs: EdgeInputs,
     fee_fn: FeeFn,
     horizon_seconds: int,
+    selection_horizon_seconds: int | None = None,
     contracts: int = 1,
 ) -> EdgeRow | None:
     market_id = contract.get("ticker") or contract.get("market_id")
@@ -199,6 +201,8 @@ def compute_edge_for_market(
         "strike_type": contract.get("strike_type"),
         "lower": contract.get("lower"),
         "upper": contract.get("upper"),
+        "prob_horizon_seconds": horizon_seconds,
+        "selection_horizon_seconds": selection_horizon_seconds,
         "yes_ask_boundary": yes_boundary,
         "no_ask_boundary": no_boundary,
         "crossed_market": crossed_market,
@@ -386,6 +390,8 @@ async def _record_sigma(
                 "ts": ts,
                 "product_id": product_id,
                 "sigma": sigma,
+                "source": method or "unknown",
+                "reason": None,
                 "method": method,
                 "lookback_seconds": lookback_seconds,
                 "points": points,
@@ -404,6 +410,7 @@ async def compute_edges(
     ewma_lambda: float,
     min_points: int,
     min_sigma_lookback_seconds: int = 3600,
+    resample_seconds: int = 5,
     sigma_default: float,
     sigma_max: float,
     status: str | None,
@@ -441,12 +448,24 @@ async def compute_edges(
     history = await get_spot_history(
         conn, product_id, lookback_seconds, max_spot_points
     )
-    timestamps = [row[0] for row in history]
-    prices = [row[1] for row in history]
-    step_seconds = _estimate_step_seconds(timestamps)
-    returns = compute_log_returns(prices)
+    if not isinstance(resample_seconds, int) or resample_seconds <= 0:
+        raise ValueError("resample_seconds must be a positive int")
+    raw_timestamps = [row[0] for row in history]
+    raw_prices = [row[1] for row in history]
+    (
+        resampled_timestamps,
+        resampled_prices,
+    ) = resample_last_price_series(
+        raw_timestamps, raw_prices, resample_seconds
+    )
+    raw_points = len(raw_timestamps)
+    resampled_points = len(resampled_timestamps)
+    step_seconds = float(resample_seconds)
+    returns = compute_log_returns(resampled_prices)
     history_span_seconds = (
-        (timestamps[-1] - timestamps[0]) if len(timestamps) >= 2 else 0
+        (resampled_timestamps[-1] - resampled_timestamps[0])
+        if len(resampled_timestamps) >= 2
+        else 0
     )
 
     sigma_raw: float | None = None
@@ -465,6 +484,8 @@ async def compute_edges(
         sigma_reason = "missing_step"
     elif step_seconds < 1.0 or step_seconds > 3600.0:
         sigma_reason = "bad_step_seconds"
+    elif len(resampled_prices) < 2:
+        sigma_reason = "insufficient_points"
     elif history_span_seconds < min_sigma_lookback_seconds:
         sigma_reason = "insufficient_history_span"
     elif len(returns) < min_points:
@@ -525,6 +546,13 @@ async def compute_edges(
                 },
             )
 
+    if sigma_reason is None:
+        sigma_quality = "ok"
+    elif sigma_source == "history":
+        sigma_quality = "fallback_history"
+    else:
+        sigma_quality = "fallback_default"
+
     relevant_ids, _, selection = await get_relevant_universe(
         conn,
         pct_band=pct_band,
@@ -582,7 +610,11 @@ async def compute_edges(
     quotes_distinct_markets_recent = await _count_recent_quote_markets(
         conn, relevant_ids, cutoff
     )
-    titles_sample = await _load_market_titles(conn, relevant_ids[:5])
+    if len(relevant_ids) <= 200:
+        title_ids = relevant_ids
+    else:
+        title_ids = list(dict.fromkeys(relevant_ids[:5] + list(debug_set)))
+    titles_sample = await _load_market_titles(conn, title_ids)
 
     inputs = EdgeInputs(
         spot_price=spot_price,
@@ -618,20 +650,22 @@ async def compute_edges(
             ) + 1
             skipped += 1
             continue
-        horizon_raw = settlement_ts - now_ts
-        if horizon_raw < -5:
+        selection_horizon_raw = settlement_ts - now_ts
+        if selection_horizon_raw < -5:
             skip_reasons["expired_contract"] = skip_reasons.get(
                 "expired_contract", 0
             ) + 1
             skipped += 1
             continue
-        if horizon_raw > max_horizon_seconds + grace_seconds:
+        if selection_horizon_raw > max_horizon_seconds + grace_seconds:
             skip_reasons["horizon_out_of_range"] = skip_reasons.get(
                 "horizon_out_of_range", 0
             ) + 1
             skipped += 1
             continue
-        horizon_seconds = max(horizon_raw, 0)
+        horizon_seconds = max(selection_horizon_raw, 0)
+        prob_horizon_raw = settlement_ts - inputs.spot_ts
+        prob_horizon_seconds = max(prob_horizon_raw, 0)
         if market_id in debug_set and market_id not in debug_logged:
             debug_logged.add(market_id)
             strike_type = contract.get("strike_type")
@@ -639,6 +673,7 @@ async def compute_edges(
             upper = _safe_float(contract.get("upper"))
             debug_info: dict[str, Any] = {
                 "market_id": market_id,
+                "title": titles_sample.get(market_id),
                 "strike_type": strike_type,
                 "lower": lower,
                 "upper": upper,
@@ -650,21 +685,29 @@ async def compute_edges(
                 "sigma_reason": sigma_reason,
                 "sigma_points_used": sigma_points_used,
                 "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
+                "resample_seconds": resample_seconds,
+                "raw_points": raw_points,
+                "resampled_points": resampled_points,
                 "step_seconds": step_seconds,
                 "now_ts": now_ts,
                 "spot_ts": inputs.spot_ts,
                 "expected_expiration_ts": contract.get("expected_expiration_ts"),
                 "settlement_ts": settlement_ts,
-                "horizon_seconds": horizon_seconds,
+                "prob_horizon_seconds": prob_horizon_seconds,
+                "selection_horizon_seconds": horizon_seconds,
             }
             if strike_type == "between":
                 z_lower = (
-                    _z_score(inputs.spot_price, lower, horizon_seconds, sigma)
+                    _z_score(
+                        inputs.spot_price, lower, prob_horizon_seconds, sigma
+                    )
                     if lower is not None
                     else None
                 )
                 z_upper = (
-                    _z_score(inputs.spot_price, upper, horizon_seconds, sigma)
+                    _z_score(
+                        inputs.spot_price, upper, prob_horizon_seconds, sigma
+                    )
                     if upper is not None
                     else None
                 )
@@ -686,7 +729,9 @@ async def compute_edges(
                 )
             elif strike_type == "less":
                 z = (
-                    _z_score(inputs.spot_price, upper, horizon_seconds, sigma)
+                    _z_score(
+                        inputs.spot_price, upper, prob_horizon_seconds, sigma
+                    )
                     if upper is not None
                     else None
                 )
@@ -695,7 +740,9 @@ async def compute_edges(
                 )
             elif strike_type == "greater":
                 z = (
-                    _z_score(inputs.spot_price, lower, horizon_seconds, sigma)
+                    _z_score(
+                        inputs.spot_price, lower, prob_horizon_seconds, sigma
+                    )
                     if lower is not None
                     else None
                 )
@@ -734,11 +781,20 @@ async def compute_edges(
         yes_missing = not yes_tradable
         no_missing = not no_tradable
 
-        if _valid_ask(yes_ask) and _valid_ask(no_ask):
-            if (yes_ask + no_ask) < 100.0:
-                diagnostics["crossed_market"] = diagnostics.get(
-                    "crossed_market", 0
-                ) + 1
+        crossed_market = (
+            _valid_ask(yes_ask)
+            and _valid_ask(no_ask)
+            and (yes_ask + no_ask) < 100.0
+        )
+        if crossed_market:
+            skip_reasons["crossed_market"] = skip_reasons.get(
+                "crossed_market", 0
+            ) + 1
+            diagnostics["crossed_market"] = diagnostics.get(
+                "crossed_market", 0
+            ) + 1
+            skipped += 1
+            continue
         if yes_missing and no_missing:
             skip_reasons["missing_both_sides"] = skip_reasons.get(
                 "missing_both_sides", 0
@@ -762,7 +818,8 @@ async def compute_edges(
             quote,
             inputs,
             fee_fn,
-            horizon_seconds=horizon_seconds,
+            horizon_seconds=prob_horizon_seconds,
+            selection_horizon_seconds=horizon_seconds,
             contracts=contracts,
         )
         if edge is None:
@@ -802,8 +859,13 @@ async def compute_edges(
         "sigma_source": sigma_source,
         "sigma_ok": sigma_ok,
         "sigma_reason": sigma_reason,
+        "sigma_quality": sigma_quality,
         "sigma_points_used": sigma_points_used,
         "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
+        "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
+        "resample_seconds": resample_seconds,
+        "raw_points": raw_points,
+        "resampled_points": resampled_points,
         "step_seconds": step_seconds,
         "selection": selection,
         "relevant_total": len(relevant_ids),

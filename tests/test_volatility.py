@@ -4,6 +4,7 @@ from kalshi_bot.models.volatility import (
     compute_log_returns,
     estimate_sigma_annualized,
     ewma_volatility,
+    resample_last_price_series,
 )
 
 
@@ -43,3 +44,13 @@ def test_clamping_and_min_points():
         sigma_cap=0.2,
     )
     assert too_few is None
+
+
+def test_resample_last_price_series_last_tick():
+    timestamps = [2, 1, 2, 7, 1, 7]
+    prices = [20.0, 10.0, 21.0, 70.0, 11.0, 71.0]
+    resampled_ts, resampled_prices = resample_last_price_series(
+        timestamps, prices, bucket_seconds=5
+    )
+    assert resampled_ts == [2, 7]
+    assert resampled_prices == [21.0, 71.0]
