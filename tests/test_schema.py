@@ -25,6 +25,7 @@ def test_schema_tables_exist(tmp_path):
             "kalshi_tickers",
             "kalshi_quotes",
             "kalshi_contracts",
+            "kalshi_edges",
             "kalshi_orderbook_snapshots",
             "kalshi_orderbook_deltas",
             "opportunities",
@@ -52,6 +53,20 @@ def test_schema_tables_exist(tmp_path):
         }
         missing_spot = required_spot_cols - spot_cols
         assert not missing_spot, f"spot_ticks missing cols: {missing_spot}"
+
+        market_cols = _table_columns(conn, "kalshi_markets")
+        required_market_cols = {
+            "market_id",
+            "ts_loaded",
+            "title",
+            "strike",
+            "settlement_ts",
+            "expiration_ts",
+            "status",
+            "raw_json",
+        }
+        missing_markets = required_market_cols - market_cols
+        assert not missing_markets, f"kalshi_markets missing cols: {missing_markets}"
 
         opp_cols = _table_columns(conn, "opportunities")
         required_opp_cols = {
@@ -125,10 +140,39 @@ def test_schema_tables_exist(tmp_path):
             "upper",
             "strike_type",
             "settlement_ts",
+            "expiration_ts",
             "updated_ts",
         }
         missing_contracts = required_kalshi_contract_cols - kalshi_contract_cols
         assert not missing_contracts, f"kalshi_contracts missing cols: {missing_contracts}"
+
+        kalshi_edge_cols = _table_columns(conn, "kalshi_edges")
+        required_kalshi_edge_cols = {
+            "ts",
+            "market_id",
+            "settlement_ts",
+            "horizon_seconds",
+            "spot_price",
+            "sigma_annualized",
+            "prob_yes",
+            "yes_bid",
+            "yes_ask",
+            "no_bid",
+            "no_ask",
+            "ev_take_yes",
+            "ev_take_no",
+            "raw_json",
+        }
+        missing_edges = required_kalshi_edge_cols - kalshi_edge_cols
+        assert not missing_edges, f"kalshi_edges missing cols: {missing_edges}"
+
+        edge_indexes = conn.execute(
+            "PRAGMA index_list(kalshi_edges)"
+        ).fetchall()
+        edge_index_names = {row[1] for row in edge_indexes}
+        assert (
+            "idx_kalshi_edges_market_ts" in edge_index_names
+        ), "kalshi_edges missing market_id,ts index"
 
         quote_fks = conn.execute(
             "PRAGMA foreign_key_list(kalshi_quotes)"

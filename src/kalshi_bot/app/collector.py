@@ -201,6 +201,7 @@ async def _run_kalshi(
                 "title": market.get("title"),
                 "strike": None,
                 "settlement_ts": None,
+                "expiration_ts": None,
                 "status": market.get("status"),
                 "raw_json": json.dumps(market),
             }

@@ -83,3 +83,25 @@ def test_greater_equals_complement():
     assert less is not None
     assert greater is not None
     assert abs(greater - (1.0 - less)) < 1e-12
+
+
+def test_prob_between_near_spot_plausible():
+    spot = 91100.0
+    lower = 91000.0
+    upper = 91249.0
+    sigma = 0.2
+    horizon = 7 * 24 * 3600
+    prob = prob_between(spot, lower, upper, horizon, sigma)
+    assert prob is not None
+    assert 0.01 < prob < 0.2
+
+
+def test_prob_between_horizon_scaling():
+    spot = 91100.0
+    lower = 91000.0
+    upper = 91249.0
+    sigma = 0.2
+    prob_1d = prob_between(spot, lower, upper, 24 * 3600, sigma)
+    prob_7d = prob_between(spot, lower, upper, 7 * 24 * 3600, sigma)
+    assert prob_1d is not None and prob_7d is not None
+    assert prob_7d < prob_1d

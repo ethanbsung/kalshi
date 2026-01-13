@@ -4,6 +4,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+import json
+
+import aiosqlite
+
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 
 BTC_SERIES_TICKERS = ["KXBTC", "KXBTC15M"]
@@ -45,10 +49,10 @@ def _parse_ts(value: Any) -> int | None:
     return None
 
 
-def extract_settlement_ts(
+def extract_close_ts(
     market: dict[str, Any], logger: logging.Logger | None = None
 ) -> int | None:
-    for key in ("expiration_time", "close_time"):
+    for key in ("expected_expiration_time", "close_time"):
         if key in market:
             value = market.get(key)
             parsed = _parse_ts(value)
@@ -56,10 +60,32 @@ def extract_settlement_ts(
                 return parsed
             if logger is not None and value is not None:
                 logger.info(
-                    "kalshi_settlement_parse_failed",
+                    "kalshi_close_parse_failed",
                     extra={"key": key, "value": value},
                 )
     return None
+
+
+def extract_expiration_ts(
+    market: dict[str, Any], logger: logging.Logger | None = None
+) -> int | None:
+    value = market.get("expiration_time")
+    parsed = _parse_ts(value)
+    if parsed is not None:
+        return parsed
+    if logger is not None and value is not None:
+        logger.info(
+            "kalshi_expiration_parse_failed",
+            extra={"value": value},
+        )
+    return None
+
+
+def extract_settlement_ts(
+    market: dict[str, Any], logger: logging.Logger | None = None
+) -> int | None:
+    """Backward-compatible alias: settlement_ts now means market close time."""
+    return extract_close_ts(market, logger=logger)
 
 
 def empty_series_tickers(
@@ -71,6 +97,45 @@ def empty_series_tickers(
         if not markets:
             empty.append(series)
     return empty
+
+
+async def backfill_market_times(
+    conn: aiosqlite.Connection, logger: logging.Logger | None
+) -> int:
+    cursor = await conn.execute(
+        "SELECT market_id, settlement_ts, raw_json FROM kalshi_markets"
+    )
+    rows = await cursor.fetchall()
+    updated = 0
+    for market_id, settlement_ts, raw_json in rows:
+        if not raw_json:
+            continue
+        try:
+            market = json.loads(raw_json)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(market, dict):
+            continue
+        close_ts = extract_close_ts(market, logger=logger)
+        expiration_ts = extract_expiration_ts(market, logger=logger)
+        new_settlement = close_ts if close_ts is not None else settlement_ts
+        if new_settlement is None and expiration_ts is None:
+            continue
+        await conn.execute(
+            "UPDATE kalshi_markets "
+            "SET settlement_ts = ?, expiration_ts = COALESCE(?, expiration_ts) "
+            "WHERE market_id = ?",
+            (new_settlement, expiration_ts, market_id),
+        )
+        updated += 1
+
+    await conn.execute(
+        "UPDATE kalshi_contracts "
+        "SET settlement_ts = (SELECT settlement_ts FROM kalshi_markets WHERE market_id = ticker), "
+        "expiration_ts = (SELECT expiration_ts FROM kalshi_markets WHERE market_id = ticker) "
+        "WHERE ticker IN (SELECT market_id FROM kalshi_markets)"
+    )
+    return updated
 
 
 async def fetch_btc_markets(

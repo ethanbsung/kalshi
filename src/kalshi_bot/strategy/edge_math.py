@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-FeeFn = Callable[[float, int], float]
+from kalshi_bot.kalshi.fees import taker_fee_dollars
+
+FeeFn = Callable[[float | None, int], float | None]
 
 
 @dataclass(frozen=True)
@@ -42,14 +44,16 @@ def _ev_buy(
         return None
     cost = (price_cents / 100.0) * contracts
     payout = prob_yes * contracts
-    fees = fee_fn(cost, contracts)
+    fees = fee_fn(price_cents, contracts)
+    if fees is None:
+        return None
     return payout - cost - fees
 
 
 def ev_take_yes(
     prob_yes: float | None,
     yes_ask_cents: float | None,
-    fee_fn: FeeFn,
+    fee_fn: FeeFn = taker_fee_dollars,
     contracts: int = 1,
 ) -> float | None:
     """EV of buying YES at the ask."""
@@ -59,7 +63,7 @@ def ev_take_yes(
 def ev_take_no(
     prob_yes: float | None,
     no_ask_cents: float | None,
-    fee_fn: FeeFn,
+    fee_fn: FeeFn = taker_fee_dollars,
     contracts: int = 1,
 ) -> float | None:
     """EV of buying NO at the ask."""
@@ -71,7 +75,7 @@ def ev_take_no(
 def ev_make_yes(
     prob_yes: float | None,
     limit_price_cents: float | None,
-    fee_fn: FeeFn,
+    fee_fn: FeeFn = taker_fee_dollars,
     contracts: int = 1,
 ) -> float | None:
     """EV of placing a YES bid at a limit price."""
@@ -81,7 +85,7 @@ def ev_make_yes(
 def ev_make_no(
     prob_yes: float | None,
     limit_price_cents: float | None,
-    fee_fn: FeeFn,
+    fee_fn: FeeFn = taker_fee_dollars,
     contracts: int = 1,
 ) -> float | None:
     """EV of placing a NO bid at a limit price."""

@@ -11,7 +11,7 @@ def test_init_db_sets_latest_schema_version(tmp_path):
     conn = sqlite3.connect(db_path)
     try:
         version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert version == 7
+        assert version == 9
         tables = {
             r[0]
             for r in conn.execute(
@@ -30,6 +30,6 @@ def test_init_db_is_idempotent(tmp_path):
     conn = sqlite3.connect(db_path)
     try:
         versions = conn.execute("SELECT version FROM schema_version ORDER BY version").fetchall()
-        assert [v[0] for v in versions] == [1, 2, 3, 4, 5, 6, 7]
+        assert [v[0] for v in versions] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     finally:
         conn.close()

@@ -14,6 +14,7 @@ from kalshi_bot.kalshi.error_utils import (
     classify_exception,
     init_error_counts,
 )
+from kalshi_bot.kalshi.btc_markets import extract_close_ts, extract_expiration_ts
 from kalshi_bot.kalshi.market_filters import build_series_clause, normalize_series
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 
@@ -75,9 +76,15 @@ def build_contract_row(
     lower: float | None = None
     upper: float | None = None
     strike_type: str | None = None
+    expiration_ts: int | None = None
+    close_ts = settlement_ts  # settlement_ts now represents market close time.
 
     if market is not None:
         lower, upper, strike_type = bounds_from_payload(market)
+        parsed_close = extract_close_ts(market, logger=logger)
+        if parsed_close is not None:
+            close_ts = parsed_close
+        expiration_ts = extract_expiration_ts(market, logger=logger)
 
     if lower is None and upper is None:
         parsed_lower, parsed_upper, parsed_type = bounds_from_ticker(ticker)
@@ -98,7 +105,8 @@ def build_contract_row(
         "lower": lower,
         "upper": upper,
         "strike_type": strike_type,
-        "settlement_ts": settlement_ts,
+        "settlement_ts": close_ts,
+        "expiration_ts": expiration_ts,
         "updated_ts": int(time.time()),
     }
 
