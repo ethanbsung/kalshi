@@ -125,7 +125,18 @@ async def get_relevant_universe(
     series: list[str] | None,
     product_id: str,
     spot_price: float | None = None,
+    *,
+    now_ts: int | None = None,
+    freshness_seconds: int = 300,
+    max_horizon_seconds: int = 10 * 24 * 3600,
+    grace_seconds: int = 3600,
+    require_quotes: bool = True,
+    exclude_extreme_asks: bool = True,
+    min_ask_cents: float = 1.0,
+    max_ask_cents: float = 99.0,
+    max_spread_cents: float | None = None,
 ) -> tuple[list[str], float | None, dict[str, Any]]:
+    now_ts = int(time.time()) if now_ts is None else int(now_ts)
     spot_ts = None
     if spot_price is None:
         spot = await get_latest_spot_price(conn, product_id)
@@ -137,29 +148,130 @@ async def get_relevant_universe(
             "method": "unavailable",
             "pct_band": pct_band,
             "top_n": top_n,
-            "candidate_count": 0,
+            "candidate_count_total": 0,
+            "excluded_expired": 0,
+            "excluded_horizon_out_of_range": 0,
+            "excluded_missing_bounds": 0,
+            "excluded_missing_recent_quote": 0,
+            "excluded_untradable": 0,
             "selected_count": 0,
             "spot_ts": spot_ts,
+            "now_ts": now_ts,
+            "selection_samples": [],
         }
         return [], spot_price, summary
 
-    where_sql, params = _market_filters(status, series, alias="m")
+    normalized_series = normalize_series(series)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status is not None:
+        clauses.append("m.status = ?")
+        params.append(status)
+    series_clause, series_params = build_series_clause(
+        normalized_series, column="m.market_id"
+    )
+    if series_clause:
+        clauses.append(series_clause)
+        params.extend(series_params)
+
+    def _where(extra: list[str]) -> tuple[str, list[Any]]:
+        all_clauses = clauses + extra
+        if not all_clauses:
+            return "", params.copy()
+        return " WHERE " + " AND ".join(all_clauses), params.copy()
+
+    close_expr = (
+        "COALESCE(c.close_ts, m.close_ts, "
+        "c.expected_expiration_ts, m.expected_expiration_ts, "
+        "c.settlement_ts, m.settlement_ts)"
+    )
+    allowed_clause = "c.strike_type IN ('between','less','greater')"
+    bounds_clause = (
+        "("
+        "(c.strike_type = 'between' AND c.lower IS NOT NULL AND c.upper IS NOT NULL AND c.upper > c.lower)"
+        " OR (c.strike_type = 'less' AND c.upper IS NOT NULL)"
+        " OR (c.strike_type = 'greater' AND c.lower IS NOT NULL)"
+        ")"
+    )
+    base_from = "FROM kalshi_contracts c JOIN kalshi_markets m ON c.ticker = m.market_id"
+
+    where_sql, where_params = _where([allowed_clause])
     cursor = await conn.execute(
-        """
-        SELECT c.ticker, c.lower, c.upper, c.strike_type
-        FROM kalshi_contracts c
-        JOIN kalshi_markets m ON c.ticker = m.market_id
-        """ + where_sql,
-        params,
+        f"SELECT COUNT(*) {base_from}{where_sql}", where_params
+    )
+    candidate_count_total = int((await cursor.fetchone())[0])
+
+    where_sql, where_params = _where(
+        [allowed_clause, f"NOT {bounds_clause}"]
+    )
+    cursor = await conn.execute(
+        f"SELECT COUNT(*) {base_from}{where_sql}", where_params
+    )
+    excluded_missing_bounds = int((await cursor.fetchone())[0])
+
+    where_sql, where_params = _where(
+        [
+            allowed_clause,
+            bounds_clause,
+            f"{close_expr} IS NULL",
+        ]
+    )
+    cursor = await conn.execute(
+        f"SELECT COUNT(*) {base_from}{where_sql}", where_params
+    )
+    excluded_missing_close_ts = int((await cursor.fetchone())[0])
+
+    cutoff_min = now_ts - 5
+    cutoff_max = now_ts + max_horizon_seconds + grace_seconds
+
+    where_sql, where_params = _where(
+        [
+            allowed_clause,
+            bounds_clause,
+            f"{close_expr} IS NOT NULL",
+            f"{close_expr} < ?",
+        ]
+    )
+    cursor = await conn.execute(
+        f"SELECT COUNT(*) {base_from}{where_sql}",
+        [*where_params, cutoff_min],
+    )
+    excluded_expired = int((await cursor.fetchone())[0])
+
+    where_sql, where_params = _where(
+        [
+            allowed_clause,
+            bounds_clause,
+            f"{close_expr} IS NOT NULL",
+            f"{close_expr} > ?",
+        ]
+    )
+    cursor = await conn.execute(
+        f"SELECT COUNT(*) {base_from}{where_sql}",
+        [*where_params, cutoff_max],
+    )
+    excluded_horizon = int((await cursor.fetchone())[0])
+
+    where_sql, where_params = _where(
+        [
+            allowed_clause,
+            bounds_clause,
+            f"{close_expr} IS NOT NULL",
+            f"{close_expr} >= ?",
+            f"{close_expr} <= ?",
+        ]
+    )
+    cursor = await conn.execute(
+        f"SELECT c.ticker, c.lower, c.upper, c.strike_type, {close_expr} AS close_ts "
+        f"{base_from}{where_sql}",
+        [*where_params, cutoff_min, cutoff_max],
     )
     rows = await cursor.fetchall()
 
-    candidates: list[tuple[str, float]] = []
-    for ticker, lower, upper, strike_type in rows:
+    candidates: list[dict[str, Any]] = []
+    for ticker, lower, upper, strike_type, close_ts in rows:
         lower_val = _parse_float(lower)
         upper_val = _parse_float(upper)
-        if lower_val is None and upper_val is None:
-            continue
         price_ref = None
         if strike_type == "between":
             if lower_val is None or upper_val is None:
@@ -177,24 +289,128 @@ async def get_relevant_universe(
             continue
 
         distance_pct = abs(price_ref - spot_price) / spot_price * 100.0
-        candidates.append((ticker, distance_pct))
+        horizon_seconds = (
+            int(close_ts) - now_ts if close_ts is not None else None
+        )
+        candidates.append(
+            {
+                "ticker": ticker,
+                "distance_pct": distance_pct,
+                "close_ts": close_ts,
+                "horizon_seconds": horizon_seconds,
+            }
+        )
 
-    candidates.sort(key=lambda item: (item[1], item[0]))
-    selected = [item for item in candidates if item[1] <= pct_band]
+    excluded_missing_recent_quote = 0
+    excluded_untradable = 0
+    if require_quotes and candidates:
+        candidate_ids = [item["ticker"] for item in candidates]
+        placeholders = ",".join("?" for _ in candidate_ids)
+        threshold = now_ts - freshness_seconds
+        quote_rows = []
+        if candidate_ids:
+            cursor = await conn.execute(
+                f"""
+                WITH latest AS (
+                    SELECT market_id, MAX(ts) AS max_ts
+                    FROM kalshi_quotes
+                    WHERE ts >= ? AND market_id IN ({placeholders})
+                    GROUP BY market_id
+                )
+                SELECT q.market_id, q.ts, q.yes_bid, q.yes_ask, q.no_bid, q.no_ask
+                FROM kalshi_quotes q
+                JOIN latest l ON q.market_id = l.market_id AND q.ts = l.max_ts
+                """,
+                [threshold, *candidate_ids],
+            )
+            quote_rows = await cursor.fetchall()
+
+        quote_map: dict[str, dict[str, Any]] = {}
+        for market_id, ts, yes_bid, yes_ask, no_bid, no_ask in quote_rows:
+            quote_map[market_id] = {
+                "ts": ts,
+                "yes_bid": _parse_float(yes_bid),
+                "yes_ask": _parse_float(yes_ask),
+                "no_bid": _parse_float(no_bid),
+                "no_ask": _parse_float(no_ask),
+            }
+
+        filtered: list[dict[str, Any]] = []
+
+        def _ask_tradable(ask: float | None, bid: float | None) -> bool:
+            if ask is None:
+                return False
+            if ask < 0.0 or ask > 100.0:
+                return False
+            if ask in (0.0, 100.0):
+                return not exclude_extreme_asks
+            if exclude_extreme_asks and (
+                ask < min_ask_cents or ask > max_ask_cents
+            ):
+                return False
+            if max_spread_cents is not None:
+                if bid is None:
+                    return False
+                spread = ask - bid
+                if spread < 0 or spread > max_spread_cents:
+                    return False
+            return True
+
+        for candidate in candidates:
+            market_id = candidate["ticker"]
+            quote = quote_map.get(market_id)
+            if quote is None:
+                excluded_missing_recent_quote += 1
+                continue
+            yes_tradable = _ask_tradable(quote["yes_ask"], quote["yes_bid"])
+            no_tradable = _ask_tradable(quote["no_ask"], quote["no_bid"])
+            if not yes_tradable and not no_tradable:
+                excluded_untradable += 1
+                continue
+            candidate["quote_ts"] = quote["ts"]
+            candidate["quote_age_seconds"] = (
+                now_ts - quote["ts"] if quote["ts"] is not None else None
+            )
+            candidate["yes_ask"] = quote["yes_ask"]
+            candidate["no_ask"] = quote["no_ask"]
+            filtered.append(candidate)
+        candidates = filtered
+
+    candidates.sort(key=lambda item: (item["distance_pct"], item["ticker"]))
+    selected = [item for item in candidates if item["distance_pct"] <= pct_band]
     method = "pct_band"
-
     if top_n > 0 and len(selected) < min(top_n, len(candidates)):
         selected = candidates[:top_n]
         method = "top_n"
 
-    selected_ids = [ticker for ticker, _ in selected]
+    selected_ids = [item["ticker"] for item in selected]
+    selection_samples = [
+        {
+            "ticker": item["ticker"],
+            "distance_pct": item["distance_pct"],
+            "horizon_seconds": item["horizon_seconds"],
+            "close_ts": item["close_ts"],
+        }
+        for item in selected[:5]
+    ]
     summary = {
         "method": method,
         "pct_band": pct_band,
         "top_n": top_n,
-        "candidate_count": len(candidates),
+        "candidate_count_total": candidate_count_total,
+        "excluded_expired": excluded_expired,
+        "excluded_horizon_out_of_range": excluded_horizon,
+        "excluded_missing_bounds": excluded_missing_bounds,
+        "excluded_missing_recent_quote": excluded_missing_recent_quote,
+        "excluded_untradable": excluded_untradable,
+        "excluded_missing_close_ts": excluded_missing_close_ts,
         "selected_count": len(selected_ids),
         "spot_ts": spot_ts,
+        "now_ts": now_ts,
+        "selection_samples": selection_samples,
+        "series": normalized_series,
+        "status": status,
+        "require_quotes": require_quotes,
     }
     return selected_ids, spot_price, summary
 

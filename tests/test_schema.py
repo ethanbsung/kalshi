@@ -203,5 +203,17 @@ def test_schema_tables_exist(tmp_path):
             "idx_spot_sigma_history_product_ts" in sigma_index_names
         ), "spot_sigma_history missing product_id,ts index"
 
+        sigma_cols = _table_columns(conn, "spot_sigma_history")
+        required_sigma_cols = {
+            "ts",
+            "product_id",
+            "sigma",
+            "method",
+            "lookback_seconds",
+            "points",
+        }
+        missing_sigma = required_sigma_cols - sigma_cols
+        assert not missing_sigma, f"spot_sigma_history missing cols: {missing_sigma}"
+
     finally:
         conn.close()

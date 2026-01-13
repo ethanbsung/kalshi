@@ -66,6 +66,7 @@ class SigmaParams:
     max_points: int
     ewma_lambda: float
     min_points: int
+    min_lookback_seconds: int
     sigma_default: float
     sigma_max: float
 
@@ -184,11 +185,23 @@ def compute_edge_for_market(
     if ev_yes is None and ev_no is None:
         return None
 
+    yes_boundary = yes_ask in (0.0, 100.0)
+    no_boundary = no_ask in (0.0, 100.0)
+    crossed_market = (
+        yes_ask is not None
+        and no_ask is not None
+        and 0.0 <= yes_ask <= 100.0
+        and 0.0 <= no_ask <= 100.0
+        and (yes_ask + no_ask) < 100.0
+    )
     metadata = {
         "quote_ts": quote.get("ts"),
         "strike_type": contract.get("strike_type"),
         "lower": contract.get("lower"),
         "upper": contract.get("upper"),
+        "yes_ask_boundary": yes_boundary,
+        "no_ask_boundary": no_boundary,
+        "crossed_market": crossed_market,
     }
     return EdgeRow(
         ts=inputs.now_ts,
@@ -328,23 +341,29 @@ async def _count_recent_quote_markets(
     return int(row[0]) if row and row[0] is not None else 0
 
 
+async def _load_market_titles(
+    conn: aiosqlite.Connection, market_ids: list[str]
+) -> dict[str, str | None]:
+    if not market_ids:
+        return {}
+    placeholders = ",".join("?" for _ in market_ids)
+    cursor = await conn.execute(
+        f"SELECT market_id, title FROM kalshi_markets WHERE market_id IN ({placeholders})",
+        market_ids,
+    )
+    rows = await cursor.fetchall()
+    return {market_id: title for market_id, title in rows}
+
+
 async def _load_sigma_fallback(
     conn: aiosqlite.Connection, product_id: str
 ) -> float | None:
     try:
-        cursor = await conn.execute(
-            "SELECT sigma FROM spot_sigma_history "
-            "WHERE product_id = ? ORDER BY ts DESC LIMIT 1",
-            (product_id,),
-        )
-        row = await cursor.fetchone()
+        dao = Dao(conn)
+        value = await dao.get_latest_sigma(product_id)
     except sqlite3.OperationalError:
         return None
-    if not row or row[0] is None:
-        return None
-    try:
-        value = float(row[0])
-    except (TypeError, ValueError):
+    if value is None:
         return None
     if not math.isfinite(value) or value <= 0:
         return None
@@ -356,14 +375,21 @@ async def _record_sigma(
     product_id: str,
     ts: int,
     sigma: float,
-    source: str,
-    reason: str | None,
+    method: str,
+    lookback_seconds: int | None,
+    points: int | None,
 ) -> None:
     try:
-        await conn.execute(
-            "INSERT INTO spot_sigma_history (ts, product_id, sigma, source, reason) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (ts, product_id, sigma, source, reason),
+        dao = Dao(conn)
+        await dao.insert_sigma_history(
+            {
+                "ts": ts,
+                "product_id": product_id,
+                "sigma": sigma,
+                "method": method,
+                "lookback_seconds": lookback_seconds,
+                "points": points,
+            }
         )
     except sqlite3.OperationalError:
         return
@@ -377,6 +403,7 @@ async def compute_edges(
     max_spot_points: int,
     ewma_lambda: float,
     min_points: int,
+    min_sigma_lookback_seconds: int = 3600,
     sigma_default: float,
     sigma_max: float,
     status: str | None,
@@ -388,6 +415,9 @@ async def compute_edges(
     contracts: int = 1,
     fee_fn: FeeFn | None = None,
     now_ts: int | None = None,
+    require_quotes: bool = True,
+    min_ask_cents: float = 1.0,
+    max_ask_cents: float = 99.0,
     debug_market_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     now_ts = now_ts or int(time.time())
@@ -404,6 +434,7 @@ async def compute_edges(
             "error": "spot_missing",
             "edges_inserted": 0,
             "relevant_total": 0,
+            "skip_reasons": {},
         }
     spot_ts, spot_price = latest
 
@@ -414,39 +445,48 @@ async def compute_edges(
     prices = [row[1] for row in history]
     step_seconds = _estimate_step_seconds(timestamps)
     returns = compute_log_returns(prices)
+    history_span_seconds = (
+        (timestamps[-1] - timestamps[0]) if len(timestamps) >= 2 else 0
+    )
 
-    sigma_unclamped: float | None = None
+    sigma_raw: float | None = None
     sigma_reason: str | None = None
     sigma_source = "ewma"
     sigma_ok = True
+    sigma_points_used = len(returns)
+    sigma_lookback_seconds_used = int(history_span_seconds)
 
     if not math.isfinite(sigma_default) or sigma_default <= 0:
         raise ValueError("sigma_default must be positive and finite")
     if not math.isfinite(sigma_max) or sigma_max <= 0:
         raise ValueError("sigma_max must be positive and finite")
 
-    if step_seconds is None:
-        sigma_reason = "spot_step_missing"
+    if step_seconds is None or step_seconds <= 0:
+        sigma_reason = "missing_step"
+    elif step_seconds < 1.0 or step_seconds > 3600.0:
+        sigma_reason = "bad_step_seconds"
+    elif history_span_seconds < min_sigma_lookback_seconds:
+        sigma_reason = "insufficient_history_span"
     elif len(returns) < min_points:
-        sigma_reason = "sigma_insufficient_points"
+        sigma_reason = "insufficient_points"
     else:
         vol_step = ewma_volatility(returns, ewma_lambda)
         if vol_step is None:
             sigma_reason = "sigma_ewma_missing"
         else:
-            sigma_unclamped = annualize_vol(vol_step, step_seconds)
-            if not math.isfinite(sigma_unclamped):
-                sigma_reason = "sigma_non_finite"
-            elif sigma_unclamped <= 0:
-                sigma_reason = "sigma_non_positive"
-            elif sigma_unclamped > sigma_max:
-                sigma_reason = "sigma_above_max"
+            sigma_raw = annualize_vol(vol_step, step_seconds)
+            if not math.isfinite(sigma_raw):
+                sigma_reason = "nonfinite_sigma"
+            elif sigma_raw <= 0:
+                sigma_reason = "nonpositive_sigma"
+            elif sigma_raw > sigma_max:
+                sigma_reason = "out_of_bounds"
 
-    if sigma_reason is None and sigma_unclamped is None:
+    if sigma_reason is None and sigma_raw is None:
         sigma_reason = "sigma_missing"
 
     if sigma_reason is None:
-        sigma = sigma_unclamped
+        sigma = sigma_raw
         sigma_source = "ewma"
         sigma_ok = True
         await _record_sigma(
@@ -454,15 +494,16 @@ async def compute_edges(
             product_id=product_id,
             ts=now_ts,
             sigma=sigma,
-            source=sigma_source,
-            reason=None,
+            method="ewma",
+            lookback_seconds=sigma_lookback_seconds_used,
+            points=sigma_points_used,
         )
     else:
         sigma_fallback = await _load_sigma_fallback(conn, product_id)
         if sigma_fallback is not None:
             sigma = sigma_fallback
-            sigma_source = "fallback"
-            sigma_ok = True
+            sigma_source = "history"
+            sigma_ok = False
             logger.warning(
                 "sigma_fallback_used",
                 extra={
@@ -492,12 +533,41 @@ async def compute_edges(
         series=series,
         product_id=product_id,
         spot_price=spot_price,
+        now_ts=now_ts,
+        freshness_seconds=freshness_seconds,
+        max_horizon_seconds=max_horizon_seconds,
+        grace_seconds=grace_seconds,
+        require_quotes=require_quotes,
+        min_ask_cents=min_ask_cents,
+        max_ask_cents=max_ask_cents,
     )
     if not relevant_ids:
+        skip_reasons: dict[str, int] = {}
+        if selection:
+            expired = selection.get("excluded_expired")
+            if expired:
+                skip_reasons["expired_contract"] = int(expired)
+            horizon = selection.get("excluded_horizon_out_of_range")
+            if horizon:
+                skip_reasons["horizon_out_of_range"] = int(horizon)
+            missing_bounds = selection.get("excluded_missing_bounds")
+            if missing_bounds:
+                skip_reasons["missing_bounds"] = int(missing_bounds)
+            missing_close = selection.get("excluded_missing_close_ts")
+            if missing_close:
+                skip_reasons["missing_settlement_ts"] = int(missing_close)
+            missing_quote = selection.get("excluded_missing_recent_quote")
+            if missing_quote:
+                skip_reasons["missing_quote"] = int(missing_quote)
+            untradable = selection.get("excluded_untradable")
+            if untradable:
+                skip_reasons["missing_both_sides"] = int(untradable)
         return {
             "error": "no_relevant_markets",
             "edges_inserted": 0,
             "relevant_total": 0,
+            "selection": selection,
+            "skip_reasons": skip_reasons,
         }
 
     contract_map = await _load_contracts(conn, relevant_ids)
@@ -512,6 +582,7 @@ async def compute_edges(
     quotes_distinct_markets_recent = await _count_recent_quote_markets(
         conn, relevant_ids, cutoff
     )
+    titles_sample = await _load_market_titles(conn, relevant_ids[:5])
 
     inputs = EdgeInputs(
         spot_price=spot_price,
@@ -524,6 +595,7 @@ async def compute_edges(
     inserted = 0
     skipped = 0
     skip_reasons: dict[str, int] = {}
+    diagnostics: dict[str, int] = {}
     missing_quote_sample: list[str] = []
     missing_quote_set: set[str] = set()
 
@@ -572,10 +644,13 @@ async def compute_edges(
                 "upper": upper,
                 "spot_price": inputs.spot_price,
                 "sigma_annualized": sigma,
-                "sigma_unclamped": sigma_unclamped,
+                "sigma_unclamped": sigma_raw,
                 "sigma_source": sigma_source,
                 "sigma_ok": sigma_ok,
                 "sigma_reason": sigma_reason,
+                "sigma_points_used": sigma_points_used,
+                "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
+                "step_seconds": step_seconds,
                 "now_ts": now_ts,
                 "spot_ts": inputs.spot_ts,
                 "expected_expiration_ts": contract.get("expected_expiration_ts"),
@@ -640,8 +715,30 @@ async def compute_edges(
             continue
         yes_ask = _safe_float(quote.get("yes_ask"))
         no_ask = _safe_float(quote.get("no_ask"))
-        yes_missing = yes_ask is None or yes_ask < 0 or yes_ask > 100
-        no_missing = no_ask is None or no_ask < 0 or no_ask > 100
+
+        def _valid_ask(value: float | None) -> bool:
+            return value is not None and 0.0 <= value <= 100.0
+
+        def _is_boundary(value: float | None) -> bool:
+            return value in (0.0, 100.0)
+
+        def _tradable_ask(value: float | None) -> bool:
+            if not _valid_ask(value):
+                return False
+            if _is_boundary(value):
+                return True
+            return min_ask_cents <= value <= max_ask_cents
+
+        yes_tradable = _tradable_ask(yes_ask)
+        no_tradable = _tradable_ask(no_ask)
+        yes_missing = not yes_tradable
+        no_missing = not no_tradable
+
+        if _valid_ask(yes_ask) and _valid_ask(no_ask):
+            if (yes_ask + no_ask) < 100.0:
+                diagnostics["crossed_market"] = diagnostics.get(
+                    "crossed_market", 0
+                ) + 1
         if yes_missing and no_missing:
             skip_reasons["missing_both_sides"] = skip_reasons.get(
                 "missing_both_sides", 0
@@ -701,16 +798,19 @@ async def compute_edges(
         "spot_price": spot_price,
         "spot_ts": spot_ts,
         "sigma_annualized": sigma,
-        "sigma_unclamped": sigma_unclamped,
+        "sigma_unclamped": sigma_raw,
         "sigma_source": sigma_source,
         "sigma_ok": sigma_ok,
         "sigma_reason": sigma_reason,
+        "sigma_points_used": sigma_points_used,
+        "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
         "step_seconds": step_seconds,
         "selection": selection,
         "relevant_total": len(relevant_ids),
         "edges_inserted": inserted,
         "skipped": skipped,
         "skip_reasons": skip_reasons,
+        "diagnostics": diagnostics,
         "latest_quote_ts": latest_quote_ts,
         "quote_age_seconds": quote_age_seconds,
         "quotes_distinct_markets_recent": quotes_distinct_markets_recent,
@@ -718,4 +818,5 @@ async def compute_edges(
         "missing_quote_sample": missing_quote_sample,
         "recent_quote_market_ids_sample": list(quotes.keys())[:5],
         "relevant_ids_sample": relevant_ids[:5],
+        "relevant_titles_sample": titles_sample,
     }

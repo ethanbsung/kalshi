@@ -115,6 +115,29 @@ async def _run() -> int:
                     **summary
                 )
             )
+            selection = summary.get("selection", {})
+            if selection:
+                selection_counts = {
+                    "now_ts": selection.get("now_ts"),
+                    "candidate_count_total": selection.get("candidate_count_total"),
+                    "excluded_expired": selection.get("excluded_expired"),
+                    "excluded_horizon_out_of_range": selection.get(
+                        "excluded_horizon_out_of_range"
+                    ),
+                    "excluded_missing_bounds": selection.get(
+                        "excluded_missing_bounds"
+                    ),
+                    "excluded_missing_recent_quote": selection.get(
+                        "excluded_missing_recent_quote"
+                    ),
+                    "excluded_untradable": selection.get("excluded_untradable"),
+                    "selected_count": selection.get("selected_count"),
+                    "method": selection.get("method"),
+                }
+                print(f"selection_summary={selection_counts}")
+                print(
+                    f"selection_samples={selection.get('selection_samples')}"
+                )
 
             cursor = await conn.execute(
                 """
@@ -178,6 +201,79 @@ async def _run() -> int:
                             ev_no=ev_no,
                         )
                     )
+
+            samples = selection.get("selection_samples") if selection else None
+            if samples:
+                sample_ids = [item["ticker"] for item in samples][:5]
+                placeholders = ",".join("?" for _ in sample_ids)
+                cursor = await conn.execute(
+                    f"""
+                    WITH latest AS (
+                        SELECT market_id, MAX(ts) AS max_ts
+                        FROM kalshi_quotes
+                        WHERE market_id IN ({placeholders})
+                        GROUP BY market_id
+                    )
+                    SELECT c.ticker, c.lower, c.upper, c.strike_type,
+                           COALESCE(c.close_ts, c.expected_expiration_ts, c.settlement_ts) AS close_ts,
+                           q.ts, q.yes_bid, q.yes_ask, q.no_bid, q.no_ask
+                    FROM kalshi_contracts c
+                    LEFT JOIN latest l ON c.ticker = l.market_id
+                    LEFT JOIN kalshi_quotes q
+                        ON q.market_id = l.market_id AND q.ts = l.max_ts
+                    WHERE c.ticker IN ({placeholders})
+                    ORDER BY c.ticker
+                    """,
+                    [*sample_ids, *sample_ids],
+                )
+                rows = await cursor.fetchall()
+                if rows:
+                    print("selection_sample_details:")
+                    for (
+                        ticker,
+                        lower,
+                        upper,
+                        strike_type,
+                        close_ts,
+                        quote_ts,
+                        yes_bid,
+                        yes_ask,
+                        no_bid,
+                        no_ask,
+                    ) in rows:
+                        horizon_seconds = (
+                            int(close_ts) - summary["now_ts"]
+                            if close_ts is not None
+                            else None
+                        )
+                        quote_age = (
+                            summary["now_ts"] - int(quote_ts)
+                            if quote_ts is not None
+                            else None
+                        )
+
+                        def _tradable(ask: float | None, bid: float | None) -> bool:
+                            if ask is None:
+                                return False
+                            if ask < 1.0 or ask > 99.0:
+                                return False
+                            if bid is None:
+                                return True
+                            if ask < bid:
+                                return False
+                            return True
+
+                        yes_tradable = _tradable(
+                            yes_ask, yes_bid
+                        )
+                        no_tradable = _tradable(no_ask, no_bid)
+                        print(
+                            f"  {ticker} strike_type={strike_type} lower={lower} upper={upper} "
+                            f"close_ts={close_ts} horizon_seconds={horizon_seconds} "
+                            f"quote_ts={quote_ts} quote_age={quote_age} "
+                            f"yes_ask={yes_ask} no_ask={no_ask} "
+                            f"yes_tradable={yes_tradable} no_tradable={no_tradable}"
+                        )
 
         cursor = await conn.execute(
             "SELECT e.market_id, e.prob_yes, e.yes_ask, e.ev_take_yes, "

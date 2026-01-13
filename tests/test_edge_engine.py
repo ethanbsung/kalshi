@@ -403,7 +403,9 @@ def test_compute_edges_skips_expired_contract(tmp_path):
                 now_ts=now,
             )
             assert summary["edges_inserted"] == 0
-            assert summary["skip_reasons"].get("expired_contract") == 1
+            assert summary.get("error") == "no_relevant_markets"
+            selection = summary.get("selection", {})
+            assert selection.get("excluded_expired") == 1
 
     asyncio.run(_run())
 
