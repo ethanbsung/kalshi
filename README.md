@@ -1,343 +1,277 @@
-# Kalshi BTC Threshold Trader
+# Kalshi BTC Market Data + Edge Engine (Current State)
 
-A probability-driven trading system for BTC threshold binaries on Kalshi.
-
-Core idea:
-- Estimate the true probability of YES (`p_model`) using spot + volatility + time-to-settlement
-- Compare to market-implied probability (`p_market`)
-- Trade only when `EV = p_model - (price + costs)` clears a strict threshold
-- Prove edge via calibration plots and hypothesis tests (Brier score, log-loss) before sizing up
-
-This repo is structured to be:
-- Reliable (reconnects, stale-data detection, audit logs)
-- Measurable (every opportunity logged, not just trades)
-- Cross-platform (develop on macOS, deploy on Linux)
+This repo currently implements **data ingestion + edge computation** for BTC Kalshi markets. It does **not** place orders yet. The intent is to provide a reliable, debuggable pipeline from live data to EV calculations stored in SQLite.
 
 ---
 
-## High-level architecture
+## What the system does today
 
-Data plane:
-1) Coinbase Advanced Trade WebSocket market data (`BTC-USD` ticker, optional level2)
-2) Kalshi WebSocket v2 market data (`ticker` + `orderbook_snapshot`/`orderbook_delta`)
-3) Kalshi WebSocket v2 authenticated streams (`fill`, optional `market_positions`)
-4) Kalshi REST discovery + reconciliation (`/markets`, `/portfolio/positions`)
+**Ingestion + storage**
+- **Coinbase**: public WebSocket ticker for `BTC-USD` into `spot_ticks`.
+- **Kalshi REST**:
+  - Market discovery limited to **BTC series only**: `KXBTC` and `KXBTC15M` via `GET /trade-api/v2/markets?status=open&series_ticker=...` (no global scanning).
+  - Quote polling via `GET /trade-api/v2/markets/{ticker}` into `kalshi_quotes`.
+  - Contract refresh via `GET /trade-api/v2/markets/{ticker}` into `kalshi_contracts`.
+- **Kalshi WS v2**: optional streaming ticker + orderbook deltas/snapshots into `kalshi_tickers`, `kalshi_orderbook_snapshots`, `kalshi_orderbook_deltas`.
 
-Decision plane:
-5) Volatility estimator (rolling realized vol on spot mid)
-6) Probability model (short-horizon diffusion approximation + conservative buffers)
-7) Cost model (fees + slippage buffer, later replaced with empirical)
-8) EV gating + signal generation
+**Edge computation (DB-only)**
+- Uses **spot ticks from DB**, **contract bounds**, and **latest quotes** to compute:
+  - model probability `prob_yes`
+  - EV for **buy YES at ask** and **buy NO at ask** (taker)
+- Inserts rows into `kalshi_edges` (one row per market per run).
 
-Execution plane:
-9) Risk manager (exposure caps, daily loss limit, kill switch)
-10) Order manager (limit orders, cancel/replace with rate limiting)
-11) Portfolio + reconciliation (fills + REST positions)
-
-Audit / research:
-12) SQLite event store for ALL opportunities, orders, fills, settlements, and features
-13) Analysis scripts for calibration plots, Brier/log-loss tests, EV bin monotonicity
+**Reliability & diagnostics**
+- Structured JSON logging to `LOG_PATH`.
+- Guardrails for stale data, invalid quotes, and ambiguous contracts.
+- Debug output for specific market IDs when requested.
 
 ---
 
-## Important market mechanics (must understand)
+## What is NOT implemented yet
 
-### Kalshi orderbook representation
-Kalshi orderbooks provide:
-- YES bids
-- NO bids
-and do not directly provide asks.
-
-Asks must be derived from the opposite side bids.
-
-Implement this exactly once and reuse everywhere:
-- best_yes_bid = max(YES bids)
-- best_no_bid  = max(NO bids)
-- best_yes_ask = 1.00 - best_no_bid
-- best_no_ask  = 1.00 - best_yes_bid
-
-(Use consistent units: prices in [0,1] in your internal code. Convert to cents/ticks only at IO boundaries.)
-In the DB, Kalshi prices are stored in cents as provided by the API.
-
-### Settlement rule
-Kalshi BTC markets settle off the **simple average of the final 60 seconds** of CF Benchmarks’ BRTI before the settlement time.
-This is not necessarily equal to Coinbase last trade.
-Therefore:
-- use conservative cost buffers
-- avoid trading tiny edges
-- avoid new entries inside the final ~2 minutes by default
+- Order placement / execution logic (no trading).
+- Portfolio/risk management in production.
+- Kalshi authenticated trading endpoints.
+- Coinbase REST or orderbook ingestion (ticker only).
+- Model calibration workflows (Brier/log-loss plots are planned but not implemented).
 
 ---
 
-## Repo layout
+## BTC market universe (important)
 
-```text
-src/
-  kalshi_bot/      # all application code
-    app/           # entrypoints (collector/paper/live)
-    config/        # typed config loading, env parsing
-    infra/         # logging, retry, time utils, shutdown, metrics
-    data/          # SQLite helpers + migrations
-      migrations/  # ordered SQL migrations (001_*.sql, 002_*.sql)
-    feeds/         # Coinbase/Kalshi connectors
-    kalshi/        # Kalshi REST + WS clients
-    models/        # volatility, probability, cost models
-    strategy/      # filters, signals, risk logic
-    execution/     # order/portfolio management
-tests/
-scripts/
-README.md
-pyproject.toml
+This system **only** targets BTC series tickers:
+- `KXBTC`
+- `KXBTC15M`
+
+Market discovery uses **Kalshi REST**:
+```
+GET /trade-api/v2/markets?status=open&series_ticker=KXBTC
+GET /trade-api/v2/markets?status=open&series_ticker=KXBTC15M
+```
+If a series returns **zero markets**, refresh scripts treat it as fatal and log the raw payloads.
+
+No keyword scanning or heuristic detection is used.
+
+---
+
+## Time semantics (critical)
+
+**For probability horizons, use the market close time.**
+
+Stored timestamps:
+- `kalshi_markets.close_ts`: **close_time** (preferred)
+- `kalshi_markets.expected_expiration_ts`: expected_expiration_time (fallback)
+- `kalshi_markets.expiration_ts`: expiration_time (not used for horizons)
+- `kalshi_markets.settlement_ts`: **legacy field now equal to close_ts**
+
+`kalshi_contracts` mirrors these same fields.
+
+Edge computation uses:
+```
+close_ts -> expected_expiration_ts -> settlement_ts
+```
+If no close time is available, the market is skipped (no guessing).
+
+---
+
+## Data model (key tables + important columns)
+
+**Core ingestion tables**
+- `spot_ticks`: `ts`, `product_id`, `price`, `best_bid`, `best_ask`, `raw_json`
+- `kalshi_markets`: `market_id`, `title`, `strike`, `close_ts`, `expected_expiration_ts`, `expiration_ts`, `status`, `raw_json`
+- `kalshi_quotes`: `ts`, `market_id`, `yes_bid`, `yes_ask`, `no_bid`, `no_ask`, `yes_mid`, `no_mid`, `p_mid`, `volume`, `open_interest`, `raw_json`
+- `kalshi_contracts`: `ticker`, `lower`, `upper`, `strike_type`, `close_ts`, `expected_expiration_ts`, `expiration_ts`
+- `kalshi_tickers`: WS ticker snapshots (`best_yes_bid/ask`, `best_no_bid/ask`, volume, open_interest)
+- `kalshi_orderbook_snapshots` / `kalshi_orderbook_deltas`: raw orderbook levels
+
+**Computed tables**
+- `kalshi_edges`: `ts`, `market_id`, `prob_yes`, `yes_ask`, `no_ask`, `ev_take_yes`, `ev_take_no`, `horizon_seconds`, `raw_json`
+- `spot_sigma_history`: time series of sigma estimates for fallback and diagnostics
+
+All prices from Kalshi are stored in **cents (0–100)**. EV is stored in **dollars**.
+
+---
+
+## Models & math
+
+**Probability model**
+- GBM with **mu = 0** drift in price:
+  - `ln(S_T / S_0) ~ N(-0.5*sigma^2*t, sigma^2*t)`
+- Probability functions:
+  - `less`: `P(S_T <= upper)`
+  - `greater`: `P(S_T >= lower)`
+  - `between`: `P(lower <= S_T < upper)`
+- If inputs invalid (spot <= 0, sigma <= 0, horizon <= 0), probability returns **None**.
+
+**Volatility (sigma)**
+- EWMA log-returns from spot history, annualized.
+- Guardrails:
+  - If sigma is non-finite, <= 0, or above `sigma_max`, it is rejected.
+  - Fallback to last stored sigma in `spot_sigma_history` if available.
+  - Otherwise use a conservative default (`--sigma-default`).
+- Summary output includes `sigma_source` and `sigma_reason` for diagnostics.
+
+**Fees**
+- Kalshi taker fee formula:
+  - `fee = ceil(0.07 * C * P * (1 - P) * 100) / 100`
+  - `P` is price in dollars (`price_cents / 100`).
+
+---
+
+## Edge computation flow (DB-only)
+
+1. Load latest spot from `spot_ticks`.
+2. Estimate sigma from recent spot history.
+3. Select a **relevant universe** near spot using `kalshi_contracts` bounds.
+4. Fetch **latest quote per market_id** within freshness window.
+5. Compute `prob_yes` and EV for YES/NO **independently**.
+6. Insert into `kalshi_edges` even if one side is missing.
+
+Skip reasons are explicit (e.g., `missing_contract`, `missing_settlement_ts`, `expired_contract`, `missing_quote`, `missing_yes_ask`, `missing_no_ask`).
+
+---
+
+## Kalshi contract parsing behavior
+
+- Primary source of bounds: **payload fields** from REST (`floor_strike`, `cap_strike`, `strike_type`).
+- For BTC series (`KXBTC`, `KXBTC15M`): **ticker fallback is disabled**.
+- If bounds are missing, strike_type is `None`, and the market is skipped.
+
+---
+
+## Entry points & scripts
+
+### Core collectors
+- Coinbase ticker:
+  ```bash
+  python -m kalshi_bot.app.collector --coinbase --seconds 30
+  ```
+- Kalshi WS (ticker + orderbook):
+  ```bash
+  python -m kalshi_bot.app.collector --kalshi --seconds 60 --debug
+  ```
+
+### Market refresh (REST)
+- Fetch BTC series markets:
+  ```bash
+  python3 scripts/refresh_btc_markets.py
+  ```
+
+### Contract refresh (REST)
+```bash
+python3 scripts/refresh_kalshi_contracts.py --status active
+```
+
+### Quote polling (REST)
+```bash
+python3 scripts/poll_kalshi_quotes.py --seconds 60 --interval 5 --status active
+```
+
+### Edge computation (DB-only)
+```bash
+python3 scripts/compute_kalshi_edges.py --debug
+```
+
+### Full pipeline smoke test
+```bash
+python3 scripts/smoke_kalshi_pipeline.py --seconds 30 --interval 5
+```
+
+### Orderbook / WS smoke test
+```bash
+KALSHI_ENV=prod KALSHI_MARKET_TICKERS="..." python3 scripts/kalshi_smoke_test.py
+```
+
+### Convenience runner
+```bash
+bash scripts/refresh_all.sh
 ```
 
 ---
 
-## Environments: macOS dev vs Linux prod
+## Configuration (env vars)
 
-This project is designed to run the same on:
-- macOS (development)
-- Linux (deployment)
+Core:
+- `DB_PATH` (default `./data/kalshi.sqlite`)
+- `LOG_PATH` (default `./logs/app.jsonl`)
+- `TRADING_ENABLED` (currently unused; trading not implemented)
 
-Rules to keep it consistent:
-- Python version pinned (see below)
-- Use `uv` or `pip` with `requirements.lock` / `pyproject` pinned dependencies
-- Use only cross-platform libraries (no OS-specific assumptions)
-- All timestamps stored and computed in UTC
-
-Recommended deployment approach:
-- Run on Linux in a `tmux` session or as a `systemd` service (see below)
-
----
-
-## Prerequisites
-
-- Python 3.11.x (required)
-- macOS: Xcode command line tools (only for building some Python deps if needed)
-- Linux: `python3.11`, `python3.11-venv`, `build-essential` (if needed)
-
----
-
-## Installation
-
-### Option A (recommended): `uv`
-1) Install uv
-2) Create venv and install deps
-
-uv venv
-source .venv/bin/activate
-uv pip install -e .
-
-### Option B: pip + venv
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install -e .
-
----
-
-## Configuration
-
-All config is loaded from environment variables.
-
-### Required environment variables
-
-Kalshi (market data ingestion):
+Kalshi REST/WS:
 - `KALSHI_ENV` = `demo` or `prod`
 - `KALSHI_API_KEY_ID`
 - `KALSHI_PRIVATE_KEY_PATH`
-- `KALSHI_REST_URL` (optional override)
-- `KALSHI_WS_URL` (optional override)
-- `KALSHI_WS_AUTH_MODE` = `header` or `query` (default `header`)
-- `KALSHI_WS_AUTH_QUERY_KEY`, `KALSHI_WS_AUTH_QUERY_SIGNATURE`, `KALSHI_WS_AUTH_QUERY_TIMESTAMP` (optional overrides)
-- `KALSHI_MARKET_TICKERS` (comma-separated; required if REST creds are not set)
-- `KALSHI_MARKET_STATUS` (default `open`)
+- `KALSHI_REST_URL` (default `https://api.elections.kalshi.com/trade-api/v2`)
+- `KALSHI_WS_URL` (default `wss://api.elections.kalshi.com/trade-api/ws/v2`)
+- `KALSHI_WS_AUTH_MODE` = `header` or `query`
+- `KALSHI_WS_AUTH_QUERY_KEY`, `KALSHI_WS_AUTH_QUERY_SIGNATURE`, `KALSHI_WS_AUTH_QUERY_TIMESTAMP`
+- `KALSHI_MARKET_STATUS` (REST filter, default `open`)
 - `KALSHI_MARKET_LIMIT` (default `100`)
 - `KALSHI_MARKET_MAX_PAGES` (default `1`)
-- `KALSHI_EVENT_TICKER`, `KALSHI_SERIES_TICKER` (optional filters)
+- `KALSHI_MARKET_TICKERS` (comma-separated; overrides REST list for WS)
 
 Coinbase:
-- `COINBASE_WS_URL` = `wss://advanced-trade-ws.coinbase.com` (default)
-- `COINBASE_PRODUCT_ID` = `BTC-USD` (default)
-- `COINBASE_STALE_SECONDS` = `10` (default)
-- `COLLECTOR_SECONDS` = `60` (default)
-- If you use authenticated Coinbase channels later, add those keys (not required for public ticker)
+- `COINBASE_WS_URL` (default `wss://advanced-trade-ws.coinbase.com`)
+- `COINBASE_PRODUCT_ID` (default `BTC-USD`)
+- `COINBASE_STALE_SECONDS` (default `10`)
+- `COLLECTOR_SECONDS` (default `60`)
 
-Storage/logging:
-- `DB_PATH` = path to sqlite db (e.g. `./data/kalshi.sqlite`)
-- `LOG_PATH` = path to json logs (e.g. `./logs/app.jsonl`)
-
-Safety:
-- `TRADING_ENABLED` = `0/1` (hard gate)
-- `MAX_DAILY_LOSS_PCT` = e.g. `0.03`
-- `MAX_POSITION_PCT` = e.g. `0.02`
-
-### Config defaults (recommended)
-Start conservative:
-- `TAU_MAX_MINUTES` = 60
-- `EV_MIN` = 0.03
-- `SPREAD_MAX_TICKS` = 6
-- `NO_NEW_ENTRIES_LAST_SECONDS` = 120
-- `MAX_OPEN_POSITIONS` = 1 (initially)
+Note: Kalshi DB statuses often appear as `active`, while REST listing uses `open`. Scripts that read from DB default to **no status filter**; pass `--status active` explicitly when needed.
 
 ---
 
-## Run modes
+## Logging
 
-### 1) Collector (data only)
-Purpose:
-- verify feeds and parsing
-- record orderbooks and spot ticks
-- no EV logic required
+Logs are JSONL written to `LOG_PATH` with fields like:
+- timestamp (UTC ISO8601)
+- level
+- msg
+- module
+- extra fields (e.g., counters, errors)
 
-Run:
+Collector `--debug` also logs to stdout.
 
-python -m kalshi_bot.app.collector
+---
 
-Phase 1A (Coinbase ticker only):
+## Testing
 
-python -m kalshi_bot.app.collector --coinbase --seconds 30
+Tests are offline and do not require network:
+```bash
+python -m pytest -q
+```
 
-Kalshi market data (ticker + orderbook):
+Key test coverage:
+- probability model correctness and monotonicity
+- fee rounding and EV math
+- quote validation and parsing
+- market/contract parsing
+- DB migrations and schema integrity
 
-python -m kalshi_bot.app.collector --kalshi --seconds 60 --debug
+---
 
-Debug to stdout + file:
+## Quick sanity checks
 
-python -m kalshi_bot.app.collector --coinbase --seconds 30 --debug
-
-Check rows (example):
-
+Check spot ticks:
+```bash
 sqlite3 ./data/kalshi.sqlite "SELECT COUNT(*) FROM spot_ticks;"
-sqlite3 ./data/kalshi.sqlite "SELECT COUNT(*) FROM kalshi_tickers;"
+```
 
-Definition of done:
-- runs for the configured seconds without exceptions
-- spot ticks are inserted into `spot_ticks` (Coinbase)
-- Kalshi tickers/orderbook rows are inserted when `--kalshi` is enabled
+Check Kalshi markets:
+```bash
+sqlite3 ./data/kalshi.sqlite "SELECT COUNT(*) FROM kalshi_markets;"
+```
 
----
-
-### 2) Paper (shadow trading)
-Purpose:
-- compute `p_model`, `p_market`, EV, and “would trade” decisions
-- log every opportunity (even no-trade)
-- no orders placed
-
-Run:
-
-python -m kalshi_bot.app.paper
-
-Definition of done:
-- not implemented yet (placeholder)
+Check edges:
+```bash
+sqlite3 ./data/kalshi.sqlite "SELECT COUNT(*) FROM kalshi_edges;"
+```
 
 ---
 
-### 3) Live (demo/prod)
-Purpose:
-- place real orders (start in demo)
-- small sizing and strict risk gating
+## Summary
 
-Run:
+This repo is currently a **data + analytics pipeline** for BTC Kalshi markets:
+- Live data ingestion (Coinbase + Kalshi)
+- Deterministic, DB-only edge computation
+- Strong diagnostics and schema-backed evidence
 
-python -m kalshi_bot.app.live
-
-Hard safety requirements before enabling:
-- `TRADING_ENABLED=1`
-- kill switch wired and tested
-- REST reconciliation works
-- write-rate limiting is enforced
- 
-Status:
-- not implemented yet (placeholder)
-
----
-
-## Data model (minimum required tables)
-
-This system is built around proving edge, so you must log opportunities even when you do nothing.
-
-Minimum tables:
-- `spot_ticks`
-- `kalshi_markets`
-- `kalshi_tickers`
-- `kalshi_orderbook_snapshots`
-- `kalshi_orderbook_deltas`
-- `opportunities` (one row per evaluation)
-- `orders`
-- `fills`
-- `positions_snapshots`
-- `settlements`
-- `features` (sigma, tau, etc.)
-
-See `EDGE_VALIDATION.md` for the exact fields required for proof of edge.
-
----
-
-## Edge validation workflow
-
-### What “edge” means here
-You have edge only if:
-- your probability estimates are better calibrated than market-implied probabilities
-- Brier score and/or log-loss beat the market with statistical significance
-- high predicted EV bins outperform low EV bins
-- results persist out-of-sample
-
-### How long it typically takes
-- <100 settled observations: too noisy
-- ~200: enough to kill obvious bad models
-- 300–500: meaningful calibration and hypothesis tests
-- 400–600+: out-of-sample confirmation
-
-Do not scale size until these tests pass.
-
----
-
-## Reliability requirements (do not skip)
-
-Must-have before real trading:
-- stale-data detection (Coinbase and Kalshi)
-- reconnect with exponential backoff
-- orderbook consistency checks (no negative size, seq monotonic)
-- write-rate limiter for create/cancel/reprice
-- “stop trading on inconsistency” policy
-- periodic reconciliation against REST positions endpoint
-- kill switch that cancels all open orders and stops the loop
-
-If any of these fail, the bot must stop trading immediately.
-
----
-
-## Development notes
-
-- All timestamps in UTC
-- Use structured JSON logging
-- Never hardcode API keys
-- Prefer small, testable modules
-- Add unit tests for:
-  - derived ask/bid logic
-  - sigma stability
-  - probability monotonicity
-  - cost model sanity
-  - EV computation
-
----
-
-## Safety disclaimers
-
-This is an experimental trading system.
-- Start in demo
-- Size tiny in prod
-- Prefer validation over profit early
-- If metrics degrade, stop and diagnose
-
----
-
-## Quickstart checklist
-
-1) Install deps and create venv
-2) Set env vars (DB/LOG paths + Coinbase WS as needed)
-3) Run collector to create SQLite tables (migrations apply automatically)
-4) Run Coinbase collector for ~30 seconds and confirm `spot_ticks` rows exist
-5) Run Kalshi collector and confirm `kalshi_markets` + `kalshi_tickers` rows exist
-6) Paper/live trading steps are placeholders until trading logic lands
+It is **not** a trading bot yet. The focus is correctness, reproducibility, and measurable edge before execution logic is added.
