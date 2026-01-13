@@ -14,12 +14,27 @@ from kalshi_bot.strategy.edge_engine import compute_edges
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute Kalshi edges from DB")
     parser.add_argument("--product-id", type=str, default="BTC-USD")
-    parser.add_argument("--lookback-seconds", type=int, default=3600)
+    parser.add_argument(
+        "--lookback-seconds",
+        type=int,
+        default=3600,
+        help="History window (seconds) to query spot_ticks for sigma.",
+    )
     parser.add_argument("--max-spot-points", type=int, default=500)
     parser.add_argument("--ewma-lambda", type=float, default=0.94)
     parser.add_argument("--min-points", type=int, default=10)
-    parser.add_argument("--min-sigma-lookback-seconds", type=int, default=3600)
-    parser.add_argument("--sigma-resample-seconds", type=int, default=5)
+    parser.add_argument(
+        "--min-sigma-lookback-seconds",
+        type=int,
+        default=3600,
+        help="Minimum spot history span (seconds) required for valid sigma.",
+    )
+    parser.add_argument(
+        "--sigma-resample-seconds",
+        type=int,
+        default=5,
+        help="Bucket size (seconds) for spot resampling before sigma.",
+    )
     parser.add_argument("--sigma-default", type=float, default=0.6)
     parser.add_argument("--sigma-max", type=float, default=5.0)
     parser.add_argument(
@@ -105,6 +120,30 @@ async def _run() -> int:
 
         if "error" in summary:
             print(f"ERROR: {summary['error']}")
+            selection = summary.get("selection", {})
+            if selection:
+                selection_counts = {
+                    "now_ts": selection.get("now_ts"),
+                    "candidate_count_total": selection.get("candidate_count_total"),
+                    "excluded_expired": selection.get("excluded_expired"),
+                    "excluded_horizon_out_of_range": selection.get(
+                        "excluded_horizon_out_of_range"
+                    ),
+                    "excluded_missing_bounds": selection.get(
+                        "excluded_missing_bounds"
+                    ),
+                    "excluded_missing_recent_quote": selection.get(
+                        "excluded_missing_recent_quote"
+                    ),
+                    "excluded_untradable": selection.get("excluded_untradable"),
+                    "selected_count": selection.get("selected_count"),
+                    "method": selection.get("method"),
+                    "require_quotes": selection.get("require_quotes"),
+                }
+                print(f"selection_summary={selection_counts}")
+            skip_reasons = summary.get("skip_reasons")
+            if skip_reasons:
+                print(f"skip_reasons={skip_reasons}")
             return 1
 
         print(

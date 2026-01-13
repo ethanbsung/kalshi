@@ -21,8 +21,11 @@ from kalshi_bot.kalshi.fees import taker_fee_dollars
 from kalshi_bot.models.probability import (
     SECONDS_PER_YEAR,
     prob_between,
+    prob_between_raw,
     prob_greater_equal,
+    prob_greater_equal_raw,
     prob_less_equal,
+    prob_less_equal_raw,
 )
 from kalshi_bot.models.volatility import (
     annualize_vol,
@@ -144,6 +147,34 @@ def prob_yes_for_contract(
     return None
 
 
+def prob_yes_for_contract_raw(
+    spot: float,
+    sigma: float,
+    horizon_seconds: int,
+    contract_row: dict[str, Any],
+) -> float | None:
+    """Return unclamped YES probability for Kalshi strike/range contracts."""
+    strike_type = contract_row.get("strike_type")
+    lower = _safe_float(contract_row.get("lower"))
+    upper = _safe_float(contract_row.get("upper"))
+
+    if strike_type == "less":
+        if upper is None or upper <= 0:
+            return None
+        return prob_less_equal_raw(spot, upper, horizon_seconds, sigma)
+    if strike_type == "greater":
+        if lower is None or lower <= 0:
+            return None
+        return prob_greater_equal_raw(spot, lower, horizon_seconds, sigma)
+    if strike_type == "between":
+        if lower is None or upper is None:
+            return None
+        if lower <= 0 or upper <= 0 or upper <= lower:
+            return None
+        return prob_between_raw(spot, lower, upper, horizon_seconds, sigma)
+    return None
+
+
 def compute_edge_for_market(
     contract: dict[str, Any],
     quote: dict[str, Any],
@@ -168,6 +199,12 @@ def compute_edge_for_market(
     if horizon_seconds < 0:
         horizon_seconds = 0
 
+    raw_prob_yes = prob_yes_for_contract_raw(
+        inputs.spot_price,
+        inputs.sigma_annualized,
+        horizon_seconds,
+        contract,
+    )
     prob_yes = prob_yes_for_contract(
         inputs.spot_price,
         inputs.sigma_annualized,
@@ -203,6 +240,8 @@ def compute_edge_for_market(
         "upper": contract.get("upper"),
         "prob_horizon_seconds": horizon_seconds,
         "selection_horizon_seconds": selection_horizon_seconds,
+        "prob_yes_raw": raw_prob_yes,
+        "prob_yes_clamped": prob_yes,
         "yes_ask_boundary": yes_boundary,
         "no_ask_boundary": no_boundary,
         "crossed_market": crossed_market,
@@ -696,6 +735,20 @@ async def compute_edges(
                 "prob_horizon_seconds": prob_horizon_seconds,
                 "selection_horizon_seconds": horizon_seconds,
             }
+            raw_prob = prob_yes_for_contract_raw(
+                inputs.spot_price,
+                sigma,
+                prob_horizon_seconds,
+                contract,
+            )
+            clamped_prob = prob_yes_for_contract(
+                inputs.spot_price,
+                sigma,
+                prob_horizon_seconds,
+                contract,
+            )
+            debug_info["prob_yes_raw"] = raw_prob
+            debug_info["prob_yes_clamped"] = clamped_prob
             if strike_type == "between":
                 z_lower = (
                     _z_score(

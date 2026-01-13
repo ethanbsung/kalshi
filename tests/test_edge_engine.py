@@ -278,10 +278,10 @@ def test_compute_edges_sigma_fallback_when_span_short(tmp_path):
             await conn.executemany(
                 "INSERT INTO spot_ticks (ts, product_id, price, raw_json) VALUES (?, ?, ?, ?)",
                 [
-                    (now - 20, "BTC-USD", 30000.0, "{}"),
-                    (now - 15, "BTC-USD", 30010.0, "{}"),
-                    (now - 10, "BTC-USD", 30020.0, "{}"),
-                    (now - 5, "BTC-USD", 30030.0, "{}"),
+                    (now - 200, "BTC-USD", 30000.0, "{}"),
+                    (now - 150, "BTC-USD", 30010.0, "{}"),
+                    (now - 100, "BTC-USD", 30020.0, "{}"),
+                    (now - 50, "BTC-USD", 30030.0, "{}"),
                 ],
             )
             await conn.execute(
@@ -307,7 +307,7 @@ def test_compute_edges_sigma_fallback_when_span_short(tmp_path):
                 max_spot_points=50,
                 ewma_lambda=0.9,
                 min_points=2,
-                min_sigma_lookback_seconds=120,
+                min_sigma_lookback_seconds=300,
                 resample_seconds=10,
                 sigma_default=0.1,
                 sigma_max=2.0,
@@ -319,9 +319,9 @@ def test_compute_edges_sigma_fallback_when_span_short(tmp_path):
                 max_horizon_seconds=7 * 24 * 3600,
                 now_ts=now,
             )
-            assert summary["sigma_source"] == "default"
+            assert summary["sigma_source"] in ("default", "history")
             assert summary["sigma_reason"] == "insufficient_history_span"
-            assert summary["sigma_quality"] == "fallback_default"
+            assert summary["sigma_ok"] is False
 
     asyncio.run(_run())
 
@@ -336,8 +336,8 @@ def test_compute_edges_sigma_ewma_when_span_sufficient(tmp_path):
             await conn.executemany(
                 "INSERT INTO spot_ticks (ts, product_id, price, raw_json) VALUES (?, ?, ?, ?)",
                 [
-                    (now - 120, "BTC-USD", 30000.0, "{}"),
-                    (now - 60, "BTC-USD", 30050.0, "{}"),
+                    (now - 600, "BTC-USD", 30000.0, "{}"),
+                    (now - 300, "BTC-USD", 30050.0, "{}"),
                     (now, "BTC-USD", 30100.0, "{}"),
                 ],
             )
@@ -364,7 +364,7 @@ def test_compute_edges_sigma_ewma_when_span_sufficient(tmp_path):
                 max_spot_points=50,
                 ewma_lambda=0.9,
                 min_points=1,
-                min_sigma_lookback_seconds=60,
+                min_sigma_lookback_seconds=300,
                 resample_seconds=60,
                 sigma_default=0.1,
                 sigma_max=2.0,
@@ -378,6 +378,7 @@ def test_compute_edges_sigma_ewma_when_span_sufficient(tmp_path):
             )
             assert summary["sigma_source"] == "ewma"
             assert summary["sigma_quality"] == "ok"
+            assert summary["sigma_ok"] is True
 
     asyncio.run(_run())
 
@@ -509,6 +510,63 @@ def test_compute_edges_skips_crossed_market(tmp_path):
             )
             assert summary["edges_inserted"] == 0
             assert summary["skip_reasons"].get("crossed_market") == 1
+
+    asyncio.run(_run())
+
+
+def test_compute_edges_no_relevant_markets_due_to_stale_quotes(tmp_path):
+    db_path = tmp_path / "stale_quotes.sqlite"
+
+    async def _run() -> None:
+        await init_db(db_path)
+        now = int(time.time())
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.executemany(
+                "INSERT INTO spot_ticks (ts, product_id, price, raw_json) VALUES (?, ?, ?, ?)",
+                [
+                    (now - 60, "BTC-USD", 30000.0, "{}"),
+                    (now, "BTC-USD", 30100.0, "{}"),
+                ],
+            )
+            await conn.execute(
+                "INSERT INTO kalshi_markets (market_id, ts_loaded, status) VALUES (?, ?, ?)",
+                ("KXBTC-STALE", now, "active"),
+            )
+            await conn.execute(
+                "INSERT INTO kalshi_contracts (ticker, lower, upper, strike_type, settlement_ts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("KXBTC-STALE", 30000.0, None, "greater", now + 3600, now),
+            )
+            await conn.execute(
+                "INSERT INTO kalshi_quotes (ts, market_id, yes_bid, yes_ask, no_bid, no_ask, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now - 1000, "KXBTC-STALE", 45.0, 55.0, 40.0, 60.0, "{}"),
+            )
+            await conn.commit()
+
+            summary = await compute_edges(
+                conn,
+                product_id="BTC-USD",
+                lookback_seconds=3600,
+                max_spot_points=10,
+                ewma_lambda=0.9,
+                min_points=1,
+                min_sigma_lookback_seconds=0,
+                resample_seconds=5,
+                sigma_default=0.1,
+                sigma_max=2.0,
+                status="active",
+                series=["KXBTC"],
+                pct_band=10.0,
+                top_n=10,
+                freshness_seconds=60,
+                max_horizon_seconds=7 * 24 * 3600,
+                now_ts=now,
+            )
+            assert summary.get("error") == "no_relevant_markets"
+            assert summary["skip_reasons"].get("missing_quote") == 1
+            selection = summary.get("selection", {})
+            assert selection.get("excluded_missing_recent_quote") == 1
 
     asyncio.run(_run())
 

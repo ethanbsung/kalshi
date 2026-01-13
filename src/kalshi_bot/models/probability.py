@@ -13,10 +13,11 @@ import math
 from typing import Final
 
 SECONDS_PER_YEAR: Final[float] = 365.0 * 24.0 * 60.0 * 60.0
+EPS: Final[float] = 1e-12
 
 
-def _clamp(prob: float) -> float:
-    return max(0.0, min(1.0, prob))
+def _clamp_prob(prob: float) -> float:
+    return max(EPS, min(1.0 - EPS, prob))
 
 
 def _year_fraction(horizon_seconds: float) -> float:
@@ -44,20 +45,22 @@ def prob_less_equal(
     For horizon_seconds > 0, invalid inputs (spot<=0, K<=0, sigma<=0) return None.
     """
     if horizon_seconds <= 0:
-        return _step_prob(spot, K, greater=False)
+        step = _step_prob(spot, K, greater=False)
+        return _clamp_prob(step) if step is not None else None
     if spot <= 0 or sigma_annualized <= 0 or K <= 0:
         return None
 
     t = _year_fraction(horizon_seconds)
     if t <= 0:
-        return _step_prob(spot, K, greater=False)
+        step = _step_prob(spot, K, greater=False)
+        return _clamp_prob(step) if step is not None else None
 
     sigma_t = sigma_annualized * math.sqrt(t)
     if sigma_t <= 0:
         return None
 
     z = (math.log(K / spot) + 0.5 * sigma_t * sigma_t) / sigma_t
-    return _clamp(_norm_cdf(z))
+    return _clamp_prob(_norm_cdf(z))
 
 
 def prob_greater_equal(
@@ -65,11 +68,12 @@ def prob_greater_equal(
 ) -> float | None:
     """P(S_T >= K) under mu=0 GBM (None for invalid inputs)."""
     if horizon_seconds <= 0:
-        return _step_prob(spot, K, greater=True)
-    prob = prob_less_equal(spot, K, horizon_seconds, sigma_annualized)
+        step = _step_prob(spot, K, greater=True)
+        return _clamp_prob(step) if step is not None else None
+    prob = prob_less_equal_raw(spot, K, horizon_seconds, sigma_annualized)
     if prob is None:
         return None
-    return _clamp(1.0 - prob)
+    return _clamp_prob(1.0 - prob)
 
 
 def prob_between(
@@ -85,14 +89,78 @@ def prob_between(
     deterministic step outcome (or None if spot<=0).
     """
     if upper <= lower:
-        return 0.0
+        return None
+    if horizon_seconds <= 0:
+        if spot <= 0:
+            return None
+        return _clamp_prob(1.0 if lower <= spot < upper else 0.0)
+
+    upper_raw = prob_less_equal_raw(
+        spot, upper, horizon_seconds, sigma_annualized
+    )
+    lower_raw = prob_less_equal_raw(
+        spot, lower, horizon_seconds, sigma_annualized
+    )
+    if upper_raw is None or lower_raw is None:
+        return None
+    upper_prob = _clamp_prob(upper_raw)
+    lower_prob = _clamp_prob(lower_raw)
+    return _clamp_prob(upper_prob - lower_prob)
+
+
+def prob_less_equal_raw(
+    spot: float, K: float, horizon_seconds: float, sigma_annualized: float
+) -> float | None:
+    """Unclamped P(S_T <= K) under mu=0 GBM."""
+    if horizon_seconds <= 0:
+        return _step_prob(spot, K, greater=False)
+    if spot <= 0 or sigma_annualized <= 0 or K <= 0:
+        return None
+
+    t = _year_fraction(horizon_seconds)
+    if t <= 0:
+        return _step_prob(spot, K, greater=False)
+
+    sigma_t = sigma_annualized * math.sqrt(t)
+    if sigma_t <= 0:
+        return None
+
+    z = (math.log(K / spot) + 0.5 * sigma_t * sigma_t) / sigma_t
+    return _norm_cdf(z)
+
+
+def prob_greater_equal_raw(
+    spot: float, K: float, horizon_seconds: float, sigma_annualized: float
+) -> float | None:
+    """Unclamped P(S_T >= K) under mu=0 GBM."""
+    if horizon_seconds <= 0:
+        return _step_prob(spot, K, greater=True)
+    prob = prob_less_equal_raw(spot, K, horizon_seconds, sigma_annualized)
+    if prob is None:
+        return None
+    return 1.0 - prob
+
+
+def prob_between_raw(
+    spot: float,
+    lower: float,
+    upper: float,
+    horizon_seconds: float,
+    sigma_annualized: float,
+) -> float | None:
+    """Unclamped P(lower <= S_T < upper)."""
+    if upper <= lower:
+        return None
     if horizon_seconds <= 0:
         if spot <= 0:
             return None
         return 1.0 if lower <= spot < upper else 0.0
-
-    upper_prob = prob_less_equal(spot, upper, horizon_seconds, sigma_annualized)
-    lower_prob = prob_less_equal(spot, lower, horizon_seconds, sigma_annualized)
+    upper_prob = prob_less_equal_raw(
+        spot, upper, horizon_seconds, sigma_annualized
+    )
+    lower_prob = prob_less_equal_raw(
+        spot, lower, horizon_seconds, sigma_annualized
+    )
     if upper_prob is None or lower_prob is None:
         return None
-    return _clamp(upper_prob - lower_prob)
+    return upper_prob - lower_prob

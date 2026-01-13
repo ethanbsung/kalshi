@@ -1,6 +1,7 @@
 import math
 
 from kalshi_bot.models.probability import (
+    EPS,
     prob_between,
     prob_greater_equal,
     prob_less_equal,
@@ -28,18 +29,19 @@ def test_prob_between_consistency():
     )
     assert between is not None
     assert 0.0 <= between <= 1.0
+    expected = max(EPS, min(1.0 - EPS, expected))
     assert abs(between - expected) < 1e-12
 
 
 def test_horizon_zero_step_behavior_quotes():
     spot = 100.0
     sigma = 0.5
-    assert prob_less_equal(spot, 100.0, 0.0, sigma) == 1.0
-    assert prob_less_equal(spot, 99.0, 0.0, sigma) == 0.0
-    assert prob_greater_equal(spot, 100.0, 0.0, sigma) == 1.0
-    assert prob_greater_equal(spot, 101.0, 0.0, sigma) == 0.0
-    assert prob_between(spot, 90.0, 100.0, 0.0, sigma) == 0.0
-    assert prob_between(spot, 90.0, 101.0, 0.0, sigma) == 1.0
+    assert prob_less_equal(spot, 100.0, 0.0, sigma) == 1.0 - EPS
+    assert prob_less_equal(spot, 99.0, 0.0, sigma) == EPS
+    assert prob_greater_equal(spot, 100.0, 0.0, sigma) == 1.0 - EPS
+    assert prob_greater_equal(spot, 101.0, 0.0, sigma) == EPS
+    assert prob_between(spot, 90.0, 100.0, 0.0, sigma) == EPS
+    assert prob_between(spot, 90.0, 101.0, 0.0, sigma) == 1.0 - EPS
 
 
 def test_median_shift_gt_half():
@@ -105,3 +107,23 @@ def test_prob_between_horizon_scaling():
     prob_7d = prob_between(spot, lower, upper, 7 * 24 * 3600, sigma)
     assert prob_1d is not None and prob_7d is not None
     assert prob_7d < prob_1d
+
+
+def test_extreme_otm_probs_are_clamped():
+    spot = 100.0
+    sigma = 0.4
+    horizon = 3600
+    low = prob_less_equal(spot, 1e-6, horizon, sigma)
+    high = prob_less_equal(spot, 1e6, horizon, sigma)
+    assert low is not None and high is not None
+    assert EPS <= low < 1.0 - EPS
+    assert EPS < high <= 1.0 - EPS
+
+
+def test_between_tiny_prob_clamped():
+    spot = 100.0
+    sigma = 0.4
+    horizon = 3600
+    prob = prob_between(spot, 1e-6, 1e-5, horizon, sigma)
+    assert prob is not None
+    assert EPS <= prob < 1.0 - EPS

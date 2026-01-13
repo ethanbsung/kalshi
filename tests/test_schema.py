@@ -27,6 +27,7 @@ def test_schema_tables_exist(tmp_path):
             "kalshi_quotes",
             "kalshi_contracts",
             "kalshi_edges",
+            "kalshi_edge_snapshots",
             "kalshi_orderbook_snapshots",
             "kalshi_orderbook_deltas",
             "opportunities",
@@ -171,6 +172,36 @@ def test_schema_tables_exist(tmp_path):
         missing_edges = required_kalshi_edge_cols - kalshi_edge_cols
         assert not missing_edges, f"kalshi_edges missing cols: {missing_edges}"
 
+        snapshot_cols = _table_columns(conn, "kalshi_edge_snapshots")
+        required_snapshot_cols = {
+            "asof_ts",
+            "market_id",
+            "settlement_ts",
+            "spot_ts",
+            "spot_price",
+            "sigma_annualized",
+            "prob_yes",
+            "prob_yes_raw",
+            "horizon_seconds",
+            "quote_ts",
+            "yes_bid",
+            "yes_ask",
+            "no_bid",
+            "no_ask",
+            "yes_mid",
+            "no_mid",
+            "ev_take_yes",
+            "ev_take_no",
+            "spot_age_seconds",
+            "quote_age_seconds",
+            "skip_reason",
+            "raw_json",
+        }
+        missing_snapshots = required_snapshot_cols - snapshot_cols
+        assert (
+            not missing_snapshots
+        ), f"kalshi_edge_snapshots missing cols: {missing_snapshots}"
+
         edge_indexes = conn.execute(
             "PRAGMA index_list(kalshi_edges)"
         ).fetchall()
@@ -178,6 +209,20 @@ def test_schema_tables_exist(tmp_path):
         assert (
             "idx_kalshi_edges_market_ts" in edge_index_names
         ), "kalshi_edges missing market_id,ts index"
+
+        snapshot_indexes = conn.execute(
+            "PRAGMA index_list(kalshi_edge_snapshots)"
+        ).fetchall()
+        snapshot_index_names = {row[1] for row in snapshot_indexes}
+        assert (
+            "idx_kalshi_edge_snapshots_market_asof" in snapshot_index_names
+        ), "kalshi_edge_snapshots missing market_id,asof_ts index"
+        assert (
+            "idx_kalshi_edge_snapshots_asof" in snapshot_index_names
+        ), "kalshi_edge_snapshots missing asof_ts index"
+        assert (
+            "idx_kalshi_edge_snapshots_settlement_ts" in snapshot_index_names
+        ), "kalshi_edge_snapshots missing settlement_ts index"
 
         quote_fks = conn.execute(
             "PRAGMA foreign_key_list(kalshi_quotes)"
@@ -208,6 +253,8 @@ def test_schema_tables_exist(tmp_path):
             "ts",
             "product_id",
             "sigma",
+            "source",
+            "reason",
             "method",
             "lookback_seconds",
             "points",

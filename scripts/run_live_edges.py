@@ -1,0 +1,377 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import sqlite3
+from typing import Any
+
+import aiosqlite
+
+from kalshi_bot.config import load_settings
+from kalshi_bot.data import init_db
+from kalshi_bot.data.dao import Dao
+from kalshi_bot.infra.logging import setup_logger
+from kalshi_bot.strategy.edge_engine import compute_edges
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Continuously compute edges and write snapshots."
+    )
+    parser.add_argument("--interval-seconds", type=int, default=10)
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--product-id", type=str, default="BTC-USD")
+    parser.add_argument("--lookback-seconds", type=int, default=3600)
+    parser.add_argument("--max-spot-points", type=int, default=500)
+    parser.add_argument("--ewma-lambda", type=float, default=0.94)
+    parser.add_argument("--min-points", type=int, default=10)
+    parser.add_argument("--min-sigma-lookback-seconds", type=int, default=3600)
+    parser.add_argument("--sigma-resample-seconds", type=int, default=5)
+    parser.add_argument("--sigma-default", type=float, default=0.6)
+    parser.add_argument("--sigma-max", type=float, default=5.0)
+    parser.add_argument("--status", type=str, default="active")
+    parser.add_argument("--series", action="append", default=["KXBTC", "KXBTC15M"])
+    parser.add_argument("--pct-band", type=float, default=3.0)
+    parser.add_argument("--top-n", type=int, default=40)
+    parser.add_argument("--freshness-seconds", type=int, default=300)
+    parser.add_argument("--max-horizon-seconds", type=int, default=10 * 24 * 3600)
+    parser.add_argument("--min-ask-cents", type=float, default=1.0)
+    parser.add_argument("--max-ask-cents", type=float, default=99.0)
+    parser.add_argument("--contracts", type=int, default=1)
+    parser.add_argument("--debug-market", action="append", default=[])
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--show-titles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    return parser.parse_args()
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _load_edges(
+    conn: aiosqlite.Connection, asof_ts: int
+) -> list[dict[str, Any]]:
+    cursor = await conn.execute(
+        "SELECT market_id, settlement_ts, horizon_seconds, spot_price, "
+        "sigma_annualized, prob_yes, ev_take_yes, ev_take_no, raw_json "
+        "FROM kalshi_edges WHERE ts = ?",
+        (asof_ts,),
+    )
+    rows = await cursor.fetchall()
+    edges: list[dict[str, Any]] = []
+    for (
+        market_id,
+        settlement_ts,
+        horizon_seconds,
+        spot_price,
+        sigma_annualized,
+        prob_yes,
+        ev_take_yes,
+        ev_take_no,
+        raw_json,
+    ) in rows:
+        edges.append(
+            {
+                "market_id": market_id,
+                "settlement_ts": settlement_ts,
+                "horizon_seconds": horizon_seconds,
+                "spot_price": spot_price,
+                "sigma_annualized": sigma_annualized,
+                "prob_yes": prob_yes,
+                "ev_take_yes": ev_take_yes,
+                "ev_take_no": ev_take_no,
+                "raw_json": raw_json,
+            }
+        )
+    return edges
+
+
+async def _load_latest_quotes(
+    conn: aiosqlite.Connection, market_ids: list[str], asof_ts: int
+) -> dict[str, dict[str, Any]]:
+    if not market_ids:
+        return {}
+    placeholders = ",".join("?" for _ in market_ids)
+    cursor = await conn.execute(
+        f"""
+        WITH latest AS (
+            SELECT market_id, MAX(ts) AS max_ts
+            FROM kalshi_quotes
+            WHERE ts <= ? AND market_id IN ({placeholders})
+            GROUP BY market_id
+        )
+        SELECT q.market_id, q.ts, q.yes_bid, q.yes_ask, q.no_bid, q.no_ask,
+               q.yes_mid, q.no_mid
+        FROM kalshi_quotes q
+        JOIN latest l ON q.market_id = l.market_id AND q.ts = l.max_ts
+        """,
+        [asof_ts, *market_ids],
+    )
+    rows = await cursor.fetchall()
+    quotes: dict[str, dict[str, Any]] = {}
+    for (
+        market_id,
+        ts,
+        yes_bid,
+        yes_ask,
+        no_bid,
+        no_ask,
+        yes_mid,
+        no_mid,
+    ) in rows:
+        quotes[market_id] = {
+            "quote_ts": ts,
+            "yes_bid": _safe_float(yes_bid),
+            "yes_ask": _safe_float(yes_ask),
+            "no_bid": _safe_float(no_bid),
+            "no_ask": _safe_float(no_ask),
+            "yes_mid": _safe_float(yes_mid),
+            "no_mid": _safe_float(no_mid),
+        }
+    return quotes
+
+
+def _compute_mid(bid: float | None, ask: float | None) -> float | None:
+    if bid is None or ask is None:
+        return None
+    return (bid + ask) / 2.0
+
+
+def _parse_edge_metadata(raw_json: str | None) -> dict[str, Any]:
+    if not raw_json:
+        return {}
+    try:
+        payload = json.loads(raw_json)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        return {}
+    return {}
+
+
+async def run_tick(
+    conn: aiosqlite.Connection, args: argparse.Namespace
+) -> dict[str, Any]:
+    backoffs = [0.2, 0.5, 1.0]
+    attempt = 0
+    while True:
+        try:
+            summary = await compute_edges(
+                conn,
+                product_id=args.product_id,
+                lookback_seconds=args.lookback_seconds,
+                max_spot_points=args.max_spot_points,
+                ewma_lambda=args.ewma_lambda,
+                min_points=args.min_points,
+                min_sigma_lookback_seconds=args.min_sigma_lookback_seconds,
+                resample_seconds=args.sigma_resample_seconds,
+                sigma_default=args.sigma_default,
+                sigma_max=args.sigma_max,
+                status=args.status,
+                series=args.series,
+                pct_band=args.pct_band,
+                top_n=args.top_n,
+                freshness_seconds=args.freshness_seconds,
+                max_horizon_seconds=args.max_horizon_seconds,
+                min_ask_cents=args.min_ask_cents,
+                max_ask_cents=args.max_ask_cents,
+                contracts=args.contracts,
+                debug_market_ids=args.debug_market or None,
+                now_ts=getattr(args, "now_ts", None),
+            )
+            if "error" in summary:
+                return summary
+
+            asof_ts = summary["now_ts"]
+            edges = await _load_edges(conn, asof_ts)
+            if not edges:
+                summary["snapshots_inserted"] = 0
+                summary["snapshots_total"] = 0
+                return summary
+
+            market_ids = [edge["market_id"] for edge in edges]
+            quotes = await _load_latest_quotes(conn, market_ids, asof_ts)
+            dao = Dao(conn)
+            snapshot_rows: list[dict[str, Any]] = []
+            max_spot_age = None
+            max_quote_age = None
+            for edge in edges:
+                market_id = edge["market_id"]
+                quote = quotes.get(market_id, {})
+                edge_meta = _parse_edge_metadata(edge.get("raw_json"))
+                prob_yes_raw = _safe_float(edge_meta.get("prob_yes_raw"))
+                prob_yes_clamped = _safe_float(edge_meta.get("prob_yes_clamped"))
+                if prob_yes_clamped is None:
+                    prob_yes_clamped = _safe_float(edge.get("prob_yes"))
+                quote_ts = quote.get("quote_ts")
+                yes_bid = quote.get("yes_bid")
+                yes_ask = quote.get("yes_ask")
+                no_bid = quote.get("no_bid")
+                no_ask = quote.get("no_ask")
+                yes_mid = quote.get("yes_mid")
+                no_mid = quote.get("no_mid")
+                if yes_mid is None:
+                    yes_mid = _compute_mid(yes_bid, yes_ask)
+                if no_mid is None:
+                    no_mid = _compute_mid(no_bid, no_ask)
+                spot_ts = summary.get("spot_ts")
+                spot_age_seconds = (
+                    asof_ts - spot_ts if spot_ts is not None else None
+                )
+                quote_age_seconds = (
+                    asof_ts - quote_ts if quote_ts is not None else None
+                )
+                if spot_age_seconds is not None:
+                    max_spot_age = (
+                        spot_age_seconds
+                        if max_spot_age is None
+                        else max(max_spot_age, spot_age_seconds)
+                    )
+                if quote_age_seconds is not None:
+                    max_quote_age = (
+                        quote_age_seconds
+                        if max_quote_age is None
+                        else max(max_quote_age, quote_age_seconds)
+                    )
+                snapshot_meta = dict(edge_meta)
+                snapshot_meta.update(
+                    {
+                        "snapshot_version": 1,
+                        "sigma_source": summary.get("sigma_source"),
+                        "sigma_ok": summary.get("sigma_ok"),
+                        "sigma_reason": summary.get("sigma_reason"),
+                    }
+                )
+                snapshot_rows.append(
+                    {
+                        "asof_ts": asof_ts,
+                        "market_id": market_id,
+                        "settlement_ts": edge.get("settlement_ts"),
+                        "spot_ts": spot_ts,
+                        "spot_price": summary.get("spot_price"),
+                        "sigma_annualized": edge.get("sigma_annualized"),
+                        "prob_yes": prob_yes_clamped,
+                        "prob_yes_raw": prob_yes_raw,
+                        "horizon_seconds": edge.get("horizon_seconds"),
+                        "quote_ts": quote_ts,
+                        "yes_bid": yes_bid,
+                        "yes_ask": yes_ask,
+                        "no_bid": no_bid,
+                        "no_ask": no_ask,
+                        "yes_mid": yes_mid,
+                        "no_mid": no_mid,
+                        "ev_take_yes": edge.get("ev_take_yes"),
+                        "ev_take_no": edge.get("ev_take_no"),
+                        "spot_age_seconds": spot_age_seconds,
+                        "quote_age_seconds": quote_age_seconds,
+                        "skip_reason": None,
+                        "raw_json": json.dumps(snapshot_meta),
+                    }
+                )
+            await dao.insert_kalshi_edge_snapshots(snapshot_rows)
+            await conn.commit()
+
+            summary["snapshots_inserted"] = len(snapshot_rows)
+            summary["snapshots_total"] = len(snapshot_rows)
+            summary["max_spot_age_seconds"] = max_spot_age
+            summary["max_quote_age_seconds"] = max_quote_age
+            return summary
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "database is locked" in message and attempt < len(backoffs):
+                await asyncio.sleep(backoffs[attempt])
+                attempt += 1
+                continue
+            raise
+
+
+def _print_debug(summary: dict[str, Any], show_titles: bool) -> None:
+    print(
+        "sigma_source={sigma_source} sigma_ok={sigma_ok} "
+        "sigma_quality={sigma_quality} sigma_reason={sigma_reason} "
+        "sigma_points_used={sigma_points_used} "
+        "sigma_lookback_seconds_used={sigma_lookback_seconds_used} "
+        "resample_seconds={resample_seconds} step_seconds={step_seconds}".format(
+            **summary
+        )
+    )
+    print(f"sample_relevant_ids={summary.get('relevant_ids_sample')}")
+    if show_titles:
+        print(f"sample_relevant_titles={summary.get('relevant_titles_sample')}")
+    selection = summary.get("selection", {})
+    if selection:
+        selection_counts = {
+            "now_ts": selection.get("now_ts"),
+            "candidate_count_total": selection.get("candidate_count_total"),
+            "excluded_expired": selection.get("excluded_expired"),
+            "excluded_horizon_out_of_range": selection.get(
+                "excluded_horizon_out_of_range"
+            ),
+            "excluded_missing_bounds": selection.get("excluded_missing_bounds"),
+            "excluded_missing_recent_quote": selection.get(
+                "excluded_missing_recent_quote"
+            ),
+            "excluded_untradable": selection.get("excluded_untradable"),
+            "selected_count": selection.get("selected_count"),
+            "method": selection.get("method"),
+        }
+        print(f"selection_summary={selection_counts}")
+
+
+async def _run() -> int:
+    args = _parse_args()
+    settings = load_settings()
+    logger = setup_logger(settings.log_path)
+
+    print(f"DB path: {settings.db_path}")
+    await init_db(settings.db_path)
+
+    async with aiosqlite.connect(settings.db_path) as conn:
+        await conn.execute("PRAGMA foreign_keys = ON;")
+        await conn.execute("PRAGMA journal_mode = WAL;")
+        await conn.execute("PRAGMA synchronous = NORMAL;")
+        await conn.execute("PRAGMA busy_timeout = 5000;")
+        await conn.commit()
+
+        while True:
+            summary = await run_tick(conn, args)
+            if "error" in summary:
+                print(f"ERROR: {summary['error']}")
+                selection = summary.get("selection", {})
+                if selection:
+                    print(f"selection_summary={selection}")
+                if summary.get("skip_reasons"):
+                    print(f"skip_reasons={summary['skip_reasons']}")
+            else:
+                print(
+                    "asof_ts={now_ts} edges_inserted={edges_inserted} "
+                    "snapshots_inserted={snapshots_inserted} "
+                    "max_spot_age_seconds={max_spot_age_seconds} "
+                    "max_quote_age_seconds={max_quote_age_seconds}".format(
+                        **summary
+                    )
+                )
+                if args.debug:
+                    _print_debug(summary, args.show_titles)
+            if args.once:
+                return 0
+            await asyncio.sleep(args.interval_seconds)
+
+
+def main() -> int:
+    return asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
