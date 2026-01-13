@@ -52,7 +52,7 @@ def _parse_ts(value: Any) -> int | None:
 def extract_close_ts(
     market: dict[str, Any], logger: logging.Logger | None = None
 ) -> int | None:
-    for key in ("expected_expiration_time", "close_time"):
+    for key in ("close_time", "expected_expiration_time"):
         if key in market:
             value = market.get(key)
             parsed = _parse_ts(value)
@@ -63,6 +63,21 @@ def extract_close_ts(
                     "kalshi_close_parse_failed",
                     extra={"key": key, "value": value},
                 )
+    return None
+
+
+def extract_expected_expiration_ts(
+    market: dict[str, Any], logger: logging.Logger | None = None
+) -> int | None:
+    value = market.get("expected_expiration_time")
+    parsed = _parse_ts(value)
+    if parsed is not None:
+        return parsed
+    if logger is not None and value is not None:
+        logger.info(
+            "kalshi_expected_expiration_parse_failed",
+            extra={"value": value},
+        )
     return None
 
 
@@ -103,11 +118,12 @@ async def backfill_market_times(
     conn: aiosqlite.Connection, logger: logging.Logger | None
 ) -> int:
     cursor = await conn.execute(
-        "SELECT market_id, settlement_ts, raw_json FROM kalshi_markets"
+        "SELECT market_id, settlement_ts, close_ts, expected_expiration_ts, raw_json "
+        "FROM kalshi_markets"
     )
     rows = await cursor.fetchall()
     updated = 0
-    for market_id, settlement_ts, raw_json in rows:
+    for market_id, settlement_ts, close_ts_db, expected_expiration_db, raw_json in rows:
         if not raw_json:
             continue
         try:
@@ -116,22 +132,42 @@ async def backfill_market_times(
             continue
         if not isinstance(market, dict):
             continue
-        close_ts = extract_close_ts(market, logger=logger)
+        close_ts = extract_close_ts(market, logger=logger) or close_ts_db
+        expected_expiration_ts = (
+            extract_expected_expiration_ts(market, logger=logger)
+            or expected_expiration_db
+        )
         expiration_ts = extract_expiration_ts(market, logger=logger)
         new_settlement = close_ts if close_ts is not None else settlement_ts
-        if new_settlement is None and expiration_ts is None:
+        if (
+            new_settlement is None
+            and close_ts is None
+            and expected_expiration_ts is None
+            and expiration_ts is None
+        ):
             continue
         await conn.execute(
             "UPDATE kalshi_markets "
-            "SET settlement_ts = ?, expiration_ts = COALESCE(?, expiration_ts) "
+            "SET settlement_ts = ?, "
+            "close_ts = COALESCE(?, close_ts), "
+            "expected_expiration_ts = COALESCE(?, expected_expiration_ts), "
+            "expiration_ts = COALESCE(?, expiration_ts) "
             "WHERE market_id = ?",
-            (new_settlement, expiration_ts, market_id),
+            (
+                new_settlement,
+                close_ts,
+                expected_expiration_ts,
+                expiration_ts,
+                market_id,
+            ),
         )
         updated += 1
 
     await conn.execute(
         "UPDATE kalshi_contracts "
         "SET settlement_ts = (SELECT settlement_ts FROM kalshi_markets WHERE market_id = ticker), "
+        "close_ts = (SELECT close_ts FROM kalshi_markets WHERE market_id = ticker), "
+        "expected_expiration_ts = (SELECT expected_expiration_ts FROM kalshi_markets WHERE market_id = ticker), "
         "expiration_ts = (SELECT expiration_ts FROM kalshi_markets WHERE market_id = ticker) "
         "WHERE ticker IN (SELECT market_id FROM kalshi_markets)"
     )

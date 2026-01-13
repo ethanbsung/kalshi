@@ -2,6 +2,7 @@ from kalshi_bot.kalshi.btc_markets import (
     backfill_market_times,
     empty_series_tickers,
     extract_close_ts,
+    extract_expected_expiration_ts,
     extract_expiration_ts,
     extract_strike_basic,
 )
@@ -42,7 +43,8 @@ def test_extract_close_and_expiration_ts():
         "expected_expiration_time": "2025-01-01T00:04:00Z",
         "expiration_time": "2025-01-07T00:00:00Z",
     }
-    assert extract_close_ts(market) == 1735689840
+    assert extract_close_ts(market) == 1735689540
+    assert extract_expected_expiration_ts(market) == 1735689840
     assert extract_expiration_ts(market) == 1736208000
 
 
@@ -61,8 +63,9 @@ def test_backfill_market_times_updates_close_ts(tmp_path):
         await init_db(db_path)
         async with aiosqlite.connect(db_path) as conn:
             await conn.execute(
-                "INSERT INTO kalshi_markets (market_id, ts_loaded, settlement_ts, status, raw_json, expiration_ts) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO kalshi_markets ("
+                "market_id, ts_loaded, settlement_ts, status, raw_json, expiration_ts"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
                 (
                     "KXBTC-26JAN1222-B91125",
                     1700000000,
@@ -83,19 +86,27 @@ def test_backfill_market_times_updates_close_ts(tmp_path):
             assert updated == 1
             await conn.commit()
 
-            row = await (await conn.execute(
-                "SELECT settlement_ts, expiration_ts FROM kalshi_markets WHERE market_id = ?",
-                ("KXBTC-26JAN1222-B91125",),
-            )).fetchone()
-            assert row[0] == 1768273500
-            assert row[1] == 1768878000
-            assert row[1] - row[0] >= 6 * 24 * 3600
+            row = await (
+                await conn.execute(
+                    "SELECT settlement_ts, close_ts, expected_expiration_ts, expiration_ts "
+                    "FROM kalshi_markets WHERE market_id = ?",
+                    ("KXBTC-26JAN1222-B91125",),
+                )
+            ).fetchone()
+            assert row[0] == 1768273200
+            assert row[1] == 1768273200
+            assert row[2] == 1768273500
+            assert row[3] == 1768878000
+            assert row[3] - row[0] >= 6 * 24 * 3600
 
             row = await (await conn.execute(
-                "SELECT settlement_ts, expiration_ts FROM kalshi_contracts WHERE ticker = ?",
+                "SELECT settlement_ts, close_ts, expected_expiration_ts, expiration_ts "
+                "FROM kalshi_contracts WHERE ticker = ?",
                 ("KXBTC-26JAN1222-B91125",),
             )).fetchone()
-            assert row[0] == 1768273500
-            assert row[1] == 1768878000
+            assert row[0] == 1768273200
+            assert row[1] == 1768273200
+            assert row[2] == 1768273500
+            assert row[3] == 1768878000
 
     asyncio.run(_run())

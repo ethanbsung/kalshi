@@ -14,6 +14,7 @@ from kalshi_bot.kalshi.btc_markets import (
     backfill_market_times,
     empty_series_tickers,
     extract_close_ts,
+    extract_expected_expiration_ts,
     extract_expiration_ts,
     extract_strike_basic,
     fetch_btc_markets,
@@ -79,12 +80,17 @@ async def _refresh_btc_markets() -> int:
             if not market_id:
                 continue
             strike = extract_strike_basic(market)
+            close_ts = extract_close_ts(market, logger=logger)
             row = {
                 "market_id": market_id,
                 "ts_loaded": ts_loaded,
                 "title": market.get("title"),
                 "strike": strike,
-                "settlement_ts": extract_close_ts(market, logger=logger),
+                "settlement_ts": close_ts,
+                "close_ts": close_ts,
+                "expected_expiration_ts": extract_expected_expiration_ts(
+                    market, logger=logger
+                ),
                 "expiration_ts": extract_expiration_ts(market, logger=logger),
                 "status": market.get("status"),
                 "raw_json": json.dumps(market),

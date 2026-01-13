@@ -18,8 +18,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-spot-points", type=int, default=500)
     parser.add_argument("--ewma-lambda", type=float, default=0.94)
     parser.add_argument("--min-points", type=int, default=10)
-    parser.add_argument("--sigma-floor", type=float, default=0.2)
-    parser.add_argument("--sigma-cap", type=float, default=2.0)
+    parser.add_argument("--sigma-default", type=float, default=0.6)
+    parser.add_argument("--sigma-max", type=float, default=5.0)
+    parser.add_argument(
+        "--sigma-floor",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--sigma-cap",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--status", type=str, default="active")
     parser.add_argument("--series", action="append", default=["KXBTC", "KXBTC15M"])
     parser.add_argument("--pct-band", type=float, default=3.0)
@@ -48,6 +60,17 @@ async def _run() -> int:
         await conn.execute("PRAGMA busy_timeout = 5000;")
         await conn.commit()
 
+        sigma_default = (
+            args.sigma_floor
+            if args.sigma_floor is not None
+            else args.sigma_default
+        )
+        sigma_max = (
+            args.sigma_cap
+            if args.sigma_cap is not None
+            else args.sigma_max
+        )
+
         summary = await compute_edges(
             conn,
             product_id=args.product_id,
@@ -55,8 +78,8 @@ async def _run() -> int:
             max_spot_points=args.max_spot_points,
             ewma_lambda=args.ewma_lambda,
             min_points=args.min_points,
-            sigma_floor=args.sigma_floor,
-            sigma_cap=args.sigma_cap,
+            sigma_default=sigma_default,
+            sigma_max=sigma_max,
             status=args.status,
             series=args.series,
             pct_band=args.pct_band,
@@ -87,6 +110,74 @@ async def _run() -> int:
             print(
                 f"sample_missing_quote_market_ids={summary.get('missing_quote_sample')}"
             )
+            print(
+                "sigma_source={sigma_source} sigma_ok={sigma_ok} sigma_reason={sigma_reason}".format(
+                    **summary
+                )
+            )
+
+            cursor = await conn.execute(
+                """
+                WITH edge_ids AS (
+                    SELECT market_id
+                    FROM kalshi_edges
+                    WHERE ts = ?
+                    ORDER BY market_id
+                    LIMIT 5
+                ),
+                latest AS (
+                    SELECT q.market_id, MAX(q.ts) AS max_ts
+                    FROM kalshi_quotes q
+                    JOIN edge_ids e ON q.market_id = e.market_id
+                    GROUP BY q.market_id
+                )
+                SELECT e.market_id, e.prob_yes, e.yes_ask, e.no_ask,
+                       e.ev_take_yes, e.ev_take_no, q.yes_mid, q.no_mid
+                FROM kalshi_edges e
+                JOIN edge_ids i ON e.market_id = i.market_id
+                LEFT JOIN latest l ON e.market_id = l.market_id
+                LEFT JOIN kalshi_quotes q
+                    ON q.market_id = l.market_id AND q.ts = l.max_ts
+                WHERE e.ts = ?
+                ORDER BY e.market_id
+                """,
+                (summary["now_ts"], summary["now_ts"]),
+            )
+            sanity_rows = await cursor.fetchall()
+            if sanity_rows:
+                print("sanity_check_samples:")
+                for (
+                    market_id,
+                    prob_yes,
+                    yes_ask,
+                    no_ask,
+                    ev_yes,
+                    ev_no,
+                    yes_mid,
+                    no_mid,
+                ) in sanity_rows:
+                    implied_yes_mid = (
+                        yes_mid / 100.0 if yes_mid is not None else None
+                    )
+                    implied_yes_from_no_mid = (
+                        1.0 - (no_mid / 100.0) if no_mid is not None else None
+                    )
+                    print(
+                        "  {market_id} prob_yes={prob_yes} "
+                        "implied_yes_mid={implied_yes_mid} "
+                        "implied_yes_from_no_mid={implied_yes_from_no_mid} "
+                        "yes_ask={yes_ask} no_ask={no_ask} "
+                        "ev_yes={ev_yes} ev_no={ev_no}".format(
+                            market_id=market_id,
+                            prob_yes=prob_yes,
+                            implied_yes_mid=implied_yes_mid,
+                            implied_yes_from_no_mid=implied_yes_from_no_mid,
+                            yes_ask=yes_ask,
+                            no_ask=no_ask,
+                            ev_yes=ev_yes,
+                            ev_no=ev_no,
+                        )
+                    )
 
         cursor = await conn.execute(
             "SELECT e.market_id, e.prob_yes, e.yes_ask, e.ev_take_yes, "

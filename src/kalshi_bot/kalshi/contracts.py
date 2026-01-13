@@ -14,7 +14,12 @@ from kalshi_bot.kalshi.error_utils import (
     classify_exception,
     init_error_counts,
 )
-from kalshi_bot.kalshi.btc_markets import extract_close_ts, extract_expiration_ts
+from kalshi_bot.kalshi.btc_markets import (
+    BTC_SERIES_TICKERS,
+    extract_close_ts,
+    extract_expected_expiration_ts,
+    extract_expiration_ts,
+)
 from kalshi_bot.kalshi.market_filters import build_series_clause, normalize_series
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 
@@ -67,6 +72,13 @@ def bounds_from_ticker(ticker: str) -> tuple[float | None, float | None, str | N
     return None, None, None
 
 
+def _is_btc_series_ticker(ticker: str) -> bool:
+    for series in BTC_SERIES_TICKERS:
+        if ticker == series or ticker.startswith(f"{series}-"):
+            return True
+    return False
+
+
 def build_contract_row(
     ticker: str,
     settlement_ts: int | None,
@@ -77,6 +89,7 @@ def build_contract_row(
     upper: float | None = None
     strike_type: str | None = None
     expiration_ts: int | None = None
+    expected_expiration_ts: int | None = None
     close_ts = settlement_ts  # settlement_ts now represents market close time.
 
     if market is not None:
@@ -84,21 +97,34 @@ def build_contract_row(
         parsed_close = extract_close_ts(market, logger=logger)
         if parsed_close is not None:
             close_ts = parsed_close
+        expected_expiration_ts = extract_expected_expiration_ts(
+            market, logger=logger
+        )
         expiration_ts = extract_expiration_ts(market, logger=logger)
 
     if lower is None and upper is None:
-        parsed_lower, parsed_upper, parsed_type = bounds_from_ticker(ticker)
-        if parsed_type is not None:
-            lower, upper, strike_type = parsed_lower, parsed_upper, parsed_type
+        if _is_btc_series_ticker(ticker):
             logger.warning(
-                "kalshi_contract_ticker_fallback",
-                extra={"ticker": ticker, "strike_type": strike_type},
-            )
-        else:
-            logger.warning(
-                "kalshi_contract_parse_ambiguous",
+                "kalshi_contract_btc_missing_bounds",
                 extra={"ticker": ticker},
             )
+        else:
+            parsed_lower, parsed_upper, parsed_type = bounds_from_ticker(ticker)
+            if parsed_type is not None:
+                lower, upper, strike_type = (
+                    parsed_lower,
+                    parsed_upper,
+                    parsed_type,
+                )
+                logger.warning(
+                    "kalshi_contract_ticker_fallback",
+                    extra={"ticker": ticker, "strike_type": strike_type},
+                )
+            else:
+                logger.warning(
+                    "kalshi_contract_parse_ambiguous",
+                    extra={"ticker": ticker},
+                )
 
     return {
         "ticker": ticker,
@@ -106,6 +132,8 @@ def build_contract_row(
         "upper": upper,
         "strike_type": strike_type,
         "settlement_ts": close_ts,
+        "close_ts": close_ts,
+        "expected_expiration_ts": expected_expiration_ts,
         "expiration_ts": expiration_ts,
         "updated_ts": int(time.time()),
     }
@@ -123,7 +151,10 @@ async def load_market_rows(
     if series_clause:
         where.append(series_clause)
         params.extend(series_params)
-    sql = "SELECT market_id, settlement_ts FROM kalshi_markets"
+    sql = (
+        "SELECT market_id, COALESCE(close_ts, expected_expiration_ts) "
+        "FROM kalshi_markets"
+    )
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY market_id"

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import aiosqlite
+import sqlite3
 
 from kalshi_bot.data.dao import Dao
 from kalshi_bot.data.spot_dao import get_latest_spot, get_spot_history
@@ -45,7 +46,7 @@ class EdgeInputs:
 class EdgeRow:
     ts: int
     market_id: str
-    settlement_ts: int | None
+    settlement_ts: int | None  # Market close time used for horizon.
     horizon_seconds: int | None
     spot_price: float
     sigma_annualized: float
@@ -65,8 +66,8 @@ class SigmaParams:
     max_points: int
     ewma_lambda: float
     min_points: int
-    sigma_floor: float
-    sigma_cap: float
+    sigma_default: float
+    sigma_max: float
 
 
 def _safe_int(value: Any) -> int | None:
@@ -153,7 +154,11 @@ def compute_edge_for_market(
     if not market_id or not isinstance(market_id, str):
         return None
 
-    settlement_ts = _safe_int(contract.get("settlement_ts"))
+    settlement_ts = (
+        _safe_int(contract.get("close_ts"))
+        or _safe_int(contract.get("expected_expiration_ts"))
+        or _safe_int(contract.get("settlement_ts"))
+    )
     if settlement_ts is None:
         return None
 
@@ -225,18 +230,31 @@ async def _load_contracts(
         return {}
     placeholders = ",".join("?" for _ in market_ids)
     cursor = await conn.execute(
-        f"SELECT ticker, lower, upper, strike_type, settlement_ts FROM kalshi_contracts WHERE ticker IN ({placeholders})",
+        f"SELECT ticker, lower, upper, strike_type, settlement_ts, close_ts, expected_expiration_ts, expiration_ts "
+        f"FROM kalshi_contracts WHERE ticker IN ({placeholders})",
         market_ids,
     )
     rows = await cursor.fetchall()
     contracts: dict[str, dict[str, Any]] = {}
-    for ticker, lower, upper, strike_type, settlement_ts in rows:
+    for (
+        ticker,
+        lower,
+        upper,
+        strike_type,
+        settlement_ts,
+        close_ts,
+        expected_expiration_ts,
+        expiration_ts,
+    ) in rows:
         contracts[ticker] = {
             "ticker": ticker,
             "lower": lower,
             "upper": upper,
             "strike_type": strike_type,
             "settlement_ts": settlement_ts,
+            "close_ts": close_ts,
+            "expected_expiration_ts": expected_expiration_ts,
+            "expiration_ts": expiration_ts,
         }
     return contracts
 
@@ -310,6 +328,47 @@ async def _count_recent_quote_markets(
     return int(row[0]) if row and row[0] is not None else 0
 
 
+async def _load_sigma_fallback(
+    conn: aiosqlite.Connection, product_id: str
+) -> float | None:
+    try:
+        cursor = await conn.execute(
+            "SELECT sigma FROM spot_sigma_history "
+            "WHERE product_id = ? ORDER BY ts DESC LIMIT 1",
+            (product_id,),
+        )
+        row = await cursor.fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row or row[0] is None:
+        return None
+    try:
+        value = float(row[0])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+async def _record_sigma(
+    conn: aiosqlite.Connection,
+    product_id: str,
+    ts: int,
+    sigma: float,
+    source: str,
+    reason: str | None,
+) -> None:
+    try:
+        await conn.execute(
+            "INSERT INTO spot_sigma_history (ts, product_id, sigma, source, reason) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ts, product_id, sigma, source, reason),
+        )
+    except sqlite3.OperationalError:
+        return
+
+
 async def compute_edges(
     conn: aiosqlite.Connection,
     *,
@@ -318,8 +377,8 @@ async def compute_edges(
     max_spot_points: int,
     ewma_lambda: float,
     min_points: int,
-    sigma_floor: float,
-    sigma_cap: float,
+    sigma_default: float,
+    sigma_max: float,
     status: str | None,
     series: list[str] | None,
     pct_band: float,
@@ -354,32 +413,76 @@ async def compute_edges(
     timestamps = [row[0] for row in history]
     prices = [row[1] for row in history]
     step_seconds = _estimate_step_seconds(timestamps)
-    if step_seconds is None:
-        return {
-            "error": "spot_step_missing",
-            "edges_inserted": 0,
-            "relevant_total": 0,
-        }
-
     returns = compute_log_returns(prices)
-    if len(returns) < min_points:
-        return {
-            "error": "sigma_missing",
-            "edges_inserted": 0,
-            "relevant_total": 0,
-        }
-    vol_step = ewma_volatility(returns, ewma_lambda)
-    if vol_step is None:
-        return {
-            "error": "sigma_missing",
-            "edges_inserted": 0,
-            "relevant_total": 0,
-        }
-    sigma_unclamped = annualize_vol(vol_step, step_seconds)
-    if sigma_floor > sigma_cap:
-        raise ValueError("sigma_floor must be <= sigma_cap")
-    sigma = max(sigma_floor, min(sigma_cap, sigma_unclamped))
-    sigma_clamped = abs(sigma - sigma_unclamped) > 1e-12
+
+    sigma_unclamped: float | None = None
+    sigma_reason: str | None = None
+    sigma_source = "ewma"
+    sigma_ok = True
+
+    if not math.isfinite(sigma_default) or sigma_default <= 0:
+        raise ValueError("sigma_default must be positive and finite")
+    if not math.isfinite(sigma_max) or sigma_max <= 0:
+        raise ValueError("sigma_max must be positive and finite")
+
+    if step_seconds is None:
+        sigma_reason = "spot_step_missing"
+    elif len(returns) < min_points:
+        sigma_reason = "sigma_insufficient_points"
+    else:
+        vol_step = ewma_volatility(returns, ewma_lambda)
+        if vol_step is None:
+            sigma_reason = "sigma_ewma_missing"
+        else:
+            sigma_unclamped = annualize_vol(vol_step, step_seconds)
+            if not math.isfinite(sigma_unclamped):
+                sigma_reason = "sigma_non_finite"
+            elif sigma_unclamped <= 0:
+                sigma_reason = "sigma_non_positive"
+            elif sigma_unclamped > sigma_max:
+                sigma_reason = "sigma_above_max"
+
+    if sigma_reason is None and sigma_unclamped is None:
+        sigma_reason = "sigma_missing"
+
+    if sigma_reason is None:
+        sigma = sigma_unclamped
+        sigma_source = "ewma"
+        sigma_ok = True
+        await _record_sigma(
+            conn,
+            product_id=product_id,
+            ts=now_ts,
+            sigma=sigma,
+            source=sigma_source,
+            reason=None,
+        )
+    else:
+        sigma_fallback = await _load_sigma_fallback(conn, product_id)
+        if sigma_fallback is not None:
+            sigma = sigma_fallback
+            sigma_source = "fallback"
+            sigma_ok = True
+            logger.warning(
+                "sigma_fallback_used",
+                extra={
+                    "product_id": product_id,
+                    "sigma_reason": sigma_reason,
+                    "sigma_fallback": sigma_fallback,
+                },
+            )
+        else:
+            sigma = sigma_default
+            sigma_source = "default"
+            sigma_ok = False
+            logger.warning(
+                "sigma_default_used",
+                extra={
+                    "product_id": product_id,
+                    "sigma_reason": sigma_reason,
+                    "sigma_default": sigma_default,
+                },
+            )
 
     relevant_ids, _, selection = await get_relevant_universe(
         conn,
@@ -432,7 +535,11 @@ async def compute_edges(
             ) + 1
             skipped += 1
             continue
-        settlement_ts = _safe_int(contract.get("settlement_ts"))  # close time
+        settlement_ts = (
+            _safe_int(contract.get("close_ts"))
+            or _safe_int(contract.get("expected_expiration_ts"))
+            or _safe_int(contract.get("settlement_ts"))
+        )  # Close/decision timestamp for horizon.
         if settlement_ts is None:
             skip_reasons["missing_settlement_ts"] = skip_reasons.get(
                 "missing_settlement_ts", 0
@@ -466,9 +573,12 @@ async def compute_edges(
                 "spot_price": inputs.spot_price,
                 "sigma_annualized": sigma,
                 "sigma_unclamped": sigma_unclamped,
-                "sigma_clamped": sigma_clamped,
+                "sigma_source": sigma_source,
+                "sigma_ok": sigma_ok,
+                "sigma_reason": sigma_reason,
                 "now_ts": now_ts,
                 "spot_ts": inputs.spot_ts,
+                "expected_expiration_ts": contract.get("expected_expiration_ts"),
                 "settlement_ts": settlement_ts,
                 "horizon_seconds": horizon_seconds,
             }
@@ -592,7 +702,9 @@ async def compute_edges(
         "spot_ts": spot_ts,
         "sigma_annualized": sigma,
         "sigma_unclamped": sigma_unclamped,
-        "sigma_clamped": sigma_clamped,
+        "sigma_source": sigma_source,
+        "sigma_ok": sigma_ok,
+        "sigma_reason": sigma_reason,
         "step_seconds": step_seconds,
         "selection": selection,
         "relevant_total": len(relevant_ids),

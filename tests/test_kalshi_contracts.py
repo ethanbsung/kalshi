@@ -68,5 +68,25 @@ def test_build_contract_row_close_over_expiration():
         market=market,
         logger=logging.getLogger("test"),
     )
-    assert row["settlement_ts"] == 1768273500
+    assert row["settlement_ts"] == 1768273200
+    assert row["close_ts"] == 1768273200
+    assert row["expected_expiration_ts"] == 1768273500
     assert row["expiration_ts"] == 1768878000
+
+
+def test_build_contract_row_btc_missing_bounds_warns(caplog):
+    logger = logging.getLogger("contracts_test")
+    caplog.set_level(logging.WARNING, logger="contracts_test")
+    row = build_contract_row(
+        "KXBTC-24JUN28-RANGE",
+        settlement_ts=1700000000,
+        market={},
+        logger=logger,
+    )
+    assert row["lower"] is None
+    assert row["upper"] is None
+    assert row["strike_type"] is None
+    assert any(
+        record.msg == "kalshi_contract_btc_missing_bounds"
+        for record in caplog.records
+    )

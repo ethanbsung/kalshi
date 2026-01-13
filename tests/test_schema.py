@@ -21,6 +21,7 @@ def test_schema_tables_exist(tmp_path):
 
         required_tables = {
             "spot_ticks",
+            "spot_sigma_history",
             "kalshi_markets",
             "kalshi_tickers",
             "kalshi_quotes",
@@ -61,6 +62,8 @@ def test_schema_tables_exist(tmp_path):
             "title",
             "strike",
             "settlement_ts",
+            "close_ts",
+            "expected_expiration_ts",
             "expiration_ts",
             "status",
             "raw_json",
@@ -140,6 +143,8 @@ def test_schema_tables_exist(tmp_path):
             "upper",
             "strike_type",
             "settlement_ts",
+            "close_ts",
+            "expected_expiration_ts",
             "expiration_ts",
             "updated_ts",
         }
@@ -189,6 +194,14 @@ def test_schema_tables_exist(tmp_path):
         assert (
             "idx_kalshi_quotes_market_ts" in index_names
         ), "kalshi_quotes missing market_id,ts index"
+
+        sigma_indexes = conn.execute(
+            "PRAGMA index_list(spot_sigma_history)"
+        ).fetchall()
+        sigma_index_names = {row[1] for row in sigma_indexes}
+        assert (
+            "idx_spot_sigma_history_product_ts" in sigma_index_names
+        ), "spot_sigma_history missing product_id,ts index"
 
     finally:
         conn.close()

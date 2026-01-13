@@ -61,6 +61,23 @@ def test_prob_none_returns_none_without_fees():
     assert calls == []
 
 
+def test_ev_fair_price_zero_without_fees():
+    def fee_fn(cost: float, contracts: int) -> float:
+        return 0.0
+
+    ev_yes = ev_take_yes(0.5, 50.0, fee_fn)
+    ev_no = ev_take_no(0.5, 50.0, fee_fn)
+    assert ev_yes is not None and abs(ev_yes) < 1e-12
+    assert ev_no is not None and abs(ev_no) < 1e-12
+
+
+def test_ev_fair_price_negative_with_fees():
+    ev_yes = ev_take_yes(0.5, 50.0)
+    ev_no = ev_take_no(0.5, 50.0)
+    assert ev_yes is not None and abs(ev_yes + 0.02) < 1e-12
+    assert ev_no is not None and abs(ev_no + 0.02) < 1e-12
+
+
 def test_implied_prob_from_quote():
     quote = Quote(yes_bid=45.0, yes_ask=55.0, no_bid=40.0, no_ask=60.0)
     probs = quote.implied_probs()
