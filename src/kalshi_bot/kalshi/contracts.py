@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -92,6 +93,7 @@ def build_contract_row(
     expected_expiration_ts: int | None = None
     close_ts = settlement_ts  # settlement_ts now represents market close time.
 
+    raw_json: str | None = None
     if market is not None:
         lower, upper, strike_type = bounds_from_payload(market)
         parsed_close = extract_close_ts(market, logger=logger)
@@ -101,6 +103,10 @@ def build_contract_row(
             market, logger=logger
         )
         expiration_ts = extract_expiration_ts(market, logger=logger)
+        try:
+            raw_json = json.dumps(market)
+        except (TypeError, ValueError):
+            raw_json = None
 
     if lower is None and upper is None:
         if _is_btc_series_ticker(ticker):
@@ -135,6 +141,9 @@ def build_contract_row(
         "close_ts": close_ts,
         "expected_expiration_ts": expected_expiration_ts,
         "expiration_ts": expiration_ts,
+        "settled_ts": None,
+        "outcome": None,
+        "raw_json": raw_json,
         "updated_ts": int(time.time()),
     }
 

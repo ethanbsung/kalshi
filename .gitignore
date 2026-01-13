@@ -11,7 +11,9 @@ __pycache__/
 build/
 dist/
 .DS_Store
-data/
+/data/
+data/__pycache__/
+data/migrations/__pycache__/
 logs/
 *.sqlite
 *.sqlite3

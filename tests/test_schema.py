@@ -28,6 +28,7 @@ def test_schema_tables_exist(tmp_path):
             "kalshi_contracts",
             "kalshi_edges",
             "kalshi_edge_snapshots",
+            "kalshi_edge_snapshot_scores",
             "kalshi_orderbook_snapshots",
             "kalshi_orderbook_deltas",
             "opportunities",
@@ -147,6 +148,9 @@ def test_schema_tables_exist(tmp_path):
             "close_ts",
             "expected_expiration_ts",
             "expiration_ts",
+            "settled_ts",
+            "outcome",
+            "raw_json",
             "updated_ts",
         }
         missing_contracts = required_kalshi_contract_cols - kalshi_contract_cols
@@ -223,6 +227,35 @@ def test_schema_tables_exist(tmp_path):
         assert (
             "idx_kalshi_edge_snapshots_settlement_ts" in snapshot_index_names
         ), "kalshi_edge_snapshots missing settlement_ts index"
+
+        score_cols = _table_columns(conn, "kalshi_edge_snapshot_scores")
+        required_score_cols = {
+            "asof_ts",
+            "market_id",
+            "settled_ts",
+            "outcome",
+            "pnl_take_yes",
+            "pnl_take_no",
+            "brier",
+            "logloss",
+            "error",
+            "created_ts",
+        }
+        missing_scores = required_score_cols - score_cols
+        assert (
+            not missing_scores
+        ), f"kalshi_edge_snapshot_scores missing cols: {missing_scores}"
+
+        score_indexes = conn.execute(
+            "PRAGMA index_list(kalshi_edge_snapshot_scores)"
+        ).fetchall()
+        score_index_names = {row[1] for row in score_indexes}
+        assert (
+            "idx_kalshi_edge_snapshot_scores_settled_ts" in score_index_names
+        ), "kalshi_edge_snapshot_scores missing settled_ts index"
+        assert (
+            "idx_kalshi_edge_snapshot_scores_created_ts" in score_index_names
+        ), "kalshi_edge_snapshot_scores missing created_ts index"
 
         quote_fks = conn.execute(
             "PRAGMA foreign_key_list(kalshi_quotes)"

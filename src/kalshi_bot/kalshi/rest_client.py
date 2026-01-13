@@ -143,6 +143,9 @@ class KalshiRestClient:
         event_ticker: str | None = None,
         series_ticker: str | None = None,
         tickers: list[str] | None = None,
+        min_settled_ts: int | None = None,
+        max_settled_ts: int | None = None,
+        max_total: int | None = None,
         end_time: float | None = None,
     ) -> list[dict[str, Any]]:
         markets: list[dict[str, Any]] = []
@@ -156,6 +159,8 @@ class KalshiRestClient:
                 "event_ticker": event_ticker,
                 "series_ticker": series_ticker,
                 "status": status,
+                "min_settled_ts": min_settled_ts,
+                "max_settled_ts": max_settled_ts,
             }
             if tickers:
                 params["tickers"] = ",".join(tickers)
@@ -176,9 +181,14 @@ class KalshiRestClient:
                     "limit": limit,
                     "status": status,
                     "cursor": params.get("cursor"),
+                    "min_settled_ts": min_settled_ts,
+                    "max_settled_ts": max_settled_ts,
                     "markets_returned": len(batch) if isinstance(batch, list) else 0,
                 },
             )
+            if max_total is not None and len(markets) >= max_total:
+                markets = markets[:max_total]
+                break
             if max_pages is not None and pages >= max_pages:
                 if cursor:
                     self._logger.info(
