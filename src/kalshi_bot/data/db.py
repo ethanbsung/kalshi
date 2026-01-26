@@ -148,6 +148,16 @@ async def _migration_sql_for_version(
         if "raw_json" in contract_cols:
             return "BEGIN; COMMIT;"
         return sql
+    if version == 16:
+        try:
+            cursor = await conn.execute("PRAGMA index_list(opportunities)")
+        except sqlite3.OperationalError:
+            return sql
+        rows = await cursor.fetchall()
+        index_names = {row[1] for row in rows}
+        if "idx_opportunities_unique" in index_names:
+            return "BEGIN; COMMIT;"
+        return sql
     return sql
 
 

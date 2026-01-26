@@ -295,5 +295,13 @@ def test_schema_tables_exist(tmp_path):
         missing_sigma = required_sigma_cols - sigma_cols
         assert not missing_sigma, f"spot_sigma_history missing cols: {missing_sigma}"
 
+        opp_indexes = conn.execute(
+            "PRAGMA index_list(opportunities)"
+        ).fetchall()
+        opp_index_names = {row[1] for row in opp_indexes}
+        assert (
+            "idx_opportunities_unique" in opp_index_names
+        ), "opportunities missing unique index"
+
     finally:
         conn.close()

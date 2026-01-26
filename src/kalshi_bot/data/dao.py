@@ -124,6 +124,30 @@ class Dao:
         "error",
         "created_ts",
     )
+    OPPORTUNITY_COLUMNS = (
+        "ts_eval",
+        "market_id",
+        "settlement_ts",
+        "strike",
+        "spot_price",
+        "sigma",
+        "tau",
+        "p_model",
+        "p_market",
+        "best_yes_bid",
+        "best_yes_ask",
+        "best_no_bid",
+        "best_no_ask",
+        "spread",
+        "eligible",
+        "reason_not_eligible",
+        "would_trade",
+        "side",
+        "ev_raw",
+        "ev_net",
+        "cost_buffer",
+        "raw_json",
+    )
     SPOT_SIGMA_HISTORY_COLUMNS = (
         "ts",
         "product_id",
@@ -384,7 +408,27 @@ class Dao:
             return None
 
     async def insert_opportunity(self, row: Mapping[str, Any]) -> None:
+        self._validate_columns("opportunities", self.OPPORTUNITY_COLUMNS, row)
         await self._insert_row("opportunities", row)
+
+    async def insert_opportunities(
+        self, rows: list[Mapping[str, Any]]
+    ) -> None:
+        if not rows:
+            return
+        columns = self.OPPORTUNITY_COLUMNS
+        sql = (
+            "INSERT OR IGNORE INTO opportunities ("
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in columns)
+            + ")"
+        )
+        values = []
+        for row in rows:
+            self._validate_columns("opportunities", columns, row)
+            values.append(tuple(row[col] for col in columns))
+        await self._conn.executemany(sql, values)
 
     async def insert_order(self, row: Mapping[str, Any]) -> None:
         await self._insert_row("orders", row)

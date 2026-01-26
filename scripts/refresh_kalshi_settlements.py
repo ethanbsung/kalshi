@@ -185,11 +185,16 @@ def build_settlement_updates(
     if logger is None:
         logger = logging.getLogger("kalshi_settlements")
     counters = {
+        "markets_after_since_filter": 0,
         "failures": 0,
         "updated_outcomes_count": 0,
         "already_had_outcome_count": 0,
         "created_contracts": 0,
+        "contracts_missing_before_create": 0,
         "conflict_outcome_count": 0,
+        "updates_built_total": 0,
+        "updates_with_outcome": 0,
+        "updates_without_outcome": 0,
     }
     for market in markets:
         if not isinstance(market, dict):
@@ -203,6 +208,7 @@ def build_settlement_updates(
         settled_ts, ts_errors, ts_source = _extract_settled_ts(market, now_ts)
         if settled_ts < since_ts:
             continue
+        counters["markets_after_since_filter"] += 1
         outcome, outcome_errors = _extract_outcome(market)
         error_set = set(ts_errors + outcome_errors)
 
@@ -212,6 +218,7 @@ def build_settlement_updates(
             )
             existing_outcome = None
             counters["created_contracts"] += 1
+            counters["contracts_missing_before_create"] += 1
         else:
             existing_outcome = existing.get("outcome")
         if outcome is not None:
@@ -247,6 +254,11 @@ def build_settlement_updates(
                 "raw_json": raw_json,
             }
         )
+        counters["updates_built_total"] += 1
+        if outcome is None:
+            counters["updates_without_outcome"] += 1
+        else:
+            counters["updates_with_outcome"] += 1
     return updates, create_rows, counters
 
 
@@ -338,6 +350,8 @@ async def _run() -> int:
         for market in markets
         if isinstance(market, dict)
     ]
+    markets_fetched_total = len(markets)
+    markets_with_ticker = len([t for t in tickers if isinstance(t, str) and t])
 
     async with aiosqlite.connect(settings.db_path) as conn:
         await conn.execute("PRAGMA foreign_keys = ON;")
@@ -382,6 +396,27 @@ async def _run() -> int:
             already_had_outcome_count=counters["already_had_outcome_count"],
             created_contracts=counters["created_contracts"],
             conflict_outcome_count=counters["conflict_outcome_count"],
+        )
+    )
+    print(
+        "Settlement refresh counters: markets_fetched_total={markets_fetched_total} "
+        "markets_with_ticker={markets_with_ticker} "
+        "markets_after_since_filter={markets_after_since_filter} "
+        "contracts_missing_before_create={contracts_missing_before_create} "
+        "updates_built_total={updates_built_total} "
+        "updates_with_outcome={updates_with_outcome} "
+        "updates_without_outcome={updates_without_outcome} "
+        "applied_total={applied_total}".format(
+            markets_fetched_total=markets_fetched_total,
+            markets_with_ticker=markets_with_ticker,
+            markets_after_since_filter=counters["markets_after_since_filter"],
+            contracts_missing_before_create=counters[
+                "contracts_missing_before_create"
+            ],
+            updates_built_total=counters["updates_built_total"],
+            updates_with_outcome=counters["updates_with_outcome"],
+            updates_without_outcome=counters["updates_without_outcome"],
+            applied_total=applied,
         )
     )
     if args.debug and markets:

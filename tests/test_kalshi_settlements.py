@@ -140,6 +140,50 @@ def test_refresh_settlements_dry_run_and_idempotent(tmp_path):
     asyncio.run(_run())
 
 
+def test_refresh_settlements_dry_run_no_changes(tmp_path):
+    db_path = tmp_path / "settlements_dry_no_change.sqlite"
+    module = _load_settlements_module()
+
+    async def _run() -> None:
+        await init_db(db_path)
+        now = int(time.time())
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute(
+                "INSERT INTO kalshi_contracts (ticker, lower, upper, strike_type, settlement_ts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("KXBTC-DRY", 30000.0, None, "greater", now, now),
+            )
+            await conn.commit()
+
+            market = {
+                "ticker": "KXBTC-DRY",
+                "result": "yes",
+                "settlement_ts": _iso_ts(now),
+            }
+            existing = {"KXBTC-DRY": {"outcome": None, "settled_ts": None}}
+            updates, _, _ = module.build_settlement_updates(
+                [market],
+                existing,
+                now_ts=now,
+                since_ts=now - 60,
+                logger=None,
+                force=False,
+            )
+            applied = await module._apply_updates(
+                conn, updates, now_ts=now, dry_run=True, force=False
+            )
+            assert applied == 0
+
+            cursor = await conn.execute(
+                "SELECT outcome, settled_ts FROM kalshi_contracts WHERE ticker = ?",
+                ("KXBTC-DRY",),
+            )
+            row = await cursor.fetchone()
+            assert row == (None, None)
+
+    asyncio.run(_run())
+
+
 def test_refresh_settlements_creates_missing_contract_and_conflict(tmp_path):
     db_path = tmp_path / "settlements_conflict.sqlite"
     module = _load_settlements_module()

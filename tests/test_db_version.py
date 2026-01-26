@@ -11,7 +11,7 @@ def test_init_db_sets_latest_schema_version(tmp_path):
     conn = sqlite3.connect(db_path)
     try:
         version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-        assert version == 15
+        assert version == 16
         tables = {
             r[0]
             for r in conn.execute(
@@ -46,6 +46,7 @@ def test_init_db_is_idempotent(tmp_path):
             13,
             14,
             15,
+            16,
         ]
     finally:
         conn.close()
