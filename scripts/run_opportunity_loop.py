@@ -28,7 +28,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--interval-seconds", type=int, default=10)
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--min-ev", type=float, default=0.01)
+    parser.add_argument("--min-ev", type=float, default=0.03)
     parser.add_argument("--top-n", type=int, default=None)
     parser.add_argument("--emit-passes", action="store_true")
     parser.add_argument("--both-sides", action="store_true")
@@ -227,6 +227,32 @@ async def _load_recent_take_keys(
     return keys
 
 
+async def _load_open_take_state(
+    conn: aiosqlite.Connection,
+) -> tuple[set[tuple[str, str]], int]:
+    cursor = await conn.execute(
+        """
+        SELECT o.market_id, o.side, COUNT(*) AS qty
+        FROM opportunities o
+        LEFT JOIN kalshi_contracts c ON c.ticker = o.market_id
+        WHERE o.would_trade = 1
+          AND c.outcome IS NULL
+        GROUP BY o.market_id, o.side
+        """
+    )
+    rows = await cursor.fetchall()
+    keys: set[tuple[str, str]] = set()
+    open_qty_total = 0
+    for market_id, side, qty in rows:
+        if isinstance(market_id, str) and isinstance(side, str):
+            keys.add((market_id, side))
+        try:
+            open_qty_total += int(qty or 0)
+        except (TypeError, ValueError):
+            continue
+    return keys, open_qty_total
+
+
 def _select_pass_samples(
     pass_rows: list[dict[str, Any]],
     reason_counts: dict[str, int],
@@ -307,7 +333,8 @@ def _write_decision_log(
             f"{_fmt_ts(asof_ts)} TICK "
             f"asof_ts={asof_ts} snapshots={summary['snapshots']} "
             f"takes={summary['takes']} passes={summary['passes']} "
-            f"inserted={summary['inserted']} min_ev={_fmt_num(min_ev, 4)}\n"
+            f"inserted={summary['inserted']} open_positions={summary['open_positions']} "
+            f"min_ev={_fmt_num(min_ev, 4)}\n"
         )
 
         if top_reasons:
@@ -343,6 +370,19 @@ async def run_tick(conn: aiosqlite.Connection, args: argparse.Namespace) -> dict
     pass_rows = [row for row in all_rows if int(row.get("would_trade") or 0) != 1]
     take_rows.sort(key=lambda row: float(row.get("ev_raw") or -1e9), reverse=True)
 
+    open_take_keys, open_qty_before = await _load_open_take_state(conn)
+    open_position_blocked = 0
+    if take_rows:
+        kept_take_rows: list[dict[str, Any]] = []
+        for row in take_rows:
+            key = (str(row.get("market_id") or ""), str(row.get("side") or ""))
+            if key in open_take_keys:
+                pass_rows.append(_as_pass_row(row, "position_open"))
+                open_position_blocked += 1
+            else:
+                kept_take_rows.append(row)
+        take_rows = kept_take_rows
+
     cooldown_blocked = 0
     cooldown_seconds = max(int(args.take_cooldown_seconds or 0), 0)
     if cooldown_seconds > 0 and take_rows:
@@ -370,6 +410,9 @@ async def run_tick(conn: aiosqlite.Connection, args: argparse.Namespace) -> dict
     if args.live:
         return {"error": "live_trading_not_supported"}
 
+    open_qty_after = open_qty_before + len(take_rows)
+
+    counters["open_position_blocked"] = open_position_blocked
     counters["cooldown_blocked"] = cooldown_blocked
     counters["take_cap_blocked"] = take_cap_blocked
     counters["takes"] = len(take_rows)
@@ -390,6 +433,7 @@ async def run_tick(conn: aiosqlite.Connection, args: argparse.Namespace) -> dict
         "takes": len(take_rows),
         "passes": len(pass_rows),
         "inserted": inserted,
+        "open_positions": open_qty_after,
         "counters": counters,
         "take_rows": take_rows,
         "pass_rows": pass_rows,
@@ -455,7 +499,8 @@ async def _run_loop() -> int:
             else:
                 print(
                     "opportunity_tick ts={asof_ts} snapshots={snapshots} "
-                    "takes={takes} passes={passes} inserted={inserted}".format(
+                    "takes={takes} passes={passes} inserted={inserted} "
+                    "open_positions={open_positions}".format(
                         **summary
                     )
                 )

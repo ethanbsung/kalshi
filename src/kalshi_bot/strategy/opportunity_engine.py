@@ -7,7 +7,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class OpportunityConfig:
-    min_ev: float = 0.01
+    min_ev: float = 0.03
     min_ask_cents: float = 1.0
     max_ask_cents: float = 99.0
     max_spot_age: int | None = None
@@ -47,6 +47,15 @@ def _safe_int(value: Any) -> int | None:
         if value is None:
             return None
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -108,6 +117,8 @@ def build_opportunities_from_snapshots(
         prob_yes = snap.get("prob_yes")
         yes_ask = snap.get("yes_ask")
         no_ask = snap.get("no_ask")
+        ev_take_yes = snap.get("ev_take_yes")
+        ev_take_no = snap.get("ev_take_no")
         spot_age = snap.get("spot_age_seconds")
         quote_age = snap.get("quote_age_seconds")
         snapshot_meta = _snapshot_meta(snap)
@@ -245,7 +256,9 @@ def build_opportunities_from_snapshots(
                 ):
                     counters["missing_yes_ask"] += 1
                     return None, "missing_yes_ask"
-                ev = _ev_take_yes(prob_yes, yes_ask)
+                ev = _safe_float(ev_take_yes)
+                if ev is None:
+                    ev = _ev_take_yes(prob_yes, yes_ask)
                 row = build_row(side="YES", ev=ev, ask=yes_ask, reason=None)
                 return row, None
             if side == "NO":
@@ -254,7 +267,9 @@ def build_opportunities_from_snapshots(
                 ):
                     counters["missing_no_ask"] += 1
                     return None, "missing_no_ask"
-                ev = _ev_take_no(prob_yes, no_ask)
+                ev = _safe_float(ev_take_no)
+                if ev is None:
+                    ev = _ev_take_no(prob_yes, no_ask)
                 row = build_row(side="NO", ev=ev, ask=no_ask, reason=None)
                 return row, None
             return None, "invalid_side"

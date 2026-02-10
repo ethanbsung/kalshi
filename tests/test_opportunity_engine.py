@@ -175,3 +175,44 @@ def test_build_opportunities_freshness_gate_when_age_missing():
     assert counters["passes"] == 1
     assert any("spot_stale" in (row["reason_not_eligible"] or "") for row in rows)
     assert any("quote_stale" in (row["reason_not_eligible"] or "") for row in rows)
+
+
+def test_build_opportunities_prefers_fee_aware_ev_from_snapshot():
+    snapshots = [
+        {
+            "asof_ts": 100,
+            "market_id": "KXBTC-TEST",
+            "settlement_ts": 200,
+            "spot_ts": 90,
+            "spot_price": 30000.0,
+            "sigma_annualized": 0.5,
+            "prob_yes": 0.6,
+            "horizon_seconds": 110,
+            "quote_ts": 95,
+            "yes_bid": 45.0,
+            "yes_ask": 50.0,
+            "no_bid": 45.0,
+            "no_ask": 50.0,
+            # Fee-aware EV supplied by edge snapshot path.
+            "ev_take_yes": 0.02,
+            "ev_take_no": -0.12,
+            "spot_age_seconds": 5,
+            "quote_age_seconds": 5,
+            "raw_json": json.dumps(
+                {
+                    "sigma_source": "ewma",
+                    "sigma_ok": True,
+                    "sigma_points_used": 20,
+                    "min_sigma_points": 10,
+                    "sigma_lookback_seconds_used": 4000,
+                    "min_sigma_lookback_seconds": 3600,
+                }
+            ),
+        }
+    ]
+    config = OpportunityConfig(min_ev=0.03, emit_passes=True)
+    rows, counters = build_opportunities_from_snapshots(snapshots, config)
+    assert counters["takes"] == 0
+    assert counters["passes"] == 1
+    assert rows[0]["ev_raw"] == 0.02
+    assert rows[0]["reason_not_eligible"] == "ev_below_threshold"
