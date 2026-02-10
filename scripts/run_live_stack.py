@@ -14,6 +14,7 @@ import aiosqlite
 from kalshi_bot.app.live_stack_health import collect_live_health, format_live_health
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
+from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
 
 
 @dataclass(frozen=True)
@@ -61,7 +62,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--python-bin", type=str, default=sys.executable)
     parser.add_argument("--status", type=str, default="active")
-    parser.add_argument("--series", action="append", default=["KXBTC", "KXBTC15M"])
+    parser.add_argument("--series", action="append", default=list(BTC_SERIES_TICKERS))
     parser.add_argument("--product-id", type=str, default=None)
     parser.add_argument("--component-debug", action="store_true")
 
@@ -70,6 +71,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quote-interval", type=float, default=5.0)
     parser.add_argument("--quote-concurrency", type=int, default=5)
     parser.add_argument("--edge-interval-seconds", type=int, default=10)
+    parser.add_argument("--max-horizon-seconds", type=int, default=6 * 3600)
     parser.add_argument("--opportunity-interval-seconds", type=int, default=10)
 
     parser.add_argument("--settlements-every-minutes", type=int, default=10)
@@ -226,6 +228,7 @@ async def _run_health_loop(
     *,
     db_path: Path,
     product_id: str,
+    max_horizon_seconds: int,
     every_seconds: int,
     window_minutes: int,
     stop_event: asyncio.Event,
@@ -241,6 +244,7 @@ async def _run_health_loop(
                     now_ts=now_ts,
                     product_id=product_id,
                     window_minutes=window_minutes,
+                    max_horizon_seconds=max_horizon_seconds,
                 )
             print(f"[health] {format_live_health(summary)}")
         except Exception as exc:
@@ -298,6 +302,8 @@ async def _run() -> int:
         product_id,
         "--status",
         args.status,
+        "--max-horizon-seconds",
+        str(args.max_horizon_seconds),
         *series_args,
     ]
     if args.component_debug:
@@ -389,11 +395,12 @@ async def _run() -> int:
     tasks.append(
         asyncio.create_task(
             _run_health_loop(
-                db_path=settings.db_path,
-                product_id=product_id,
-                every_seconds=args.health_every_seconds,
-                window_minutes=args.health_window_minutes,
-                stop_event=stop_event,
+                    db_path=settings.db_path,
+                    product_id=product_id,
+                    max_horizon_seconds=args.max_horizon_seconds,
+                    every_seconds=args.health_every_seconds,
+                    window_minutes=args.health_window_minutes,
+                    stop_event=stop_event,
             )
         )
     )

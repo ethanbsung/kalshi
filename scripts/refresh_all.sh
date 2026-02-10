@@ -20,11 +20,11 @@ if [[ "$FAST" == "1" ]]; then
   python3 scripts/compute_kalshi_edges.py \
     "${EDGE_ARGS[@]}" \
     --freshness-seconds 400 \
-    --debug-market KXBTC --debug-market KXBTC15M --debug
+    --debug-market KXBTC --debug-market KXBTC15M --debug-market KXBTCD --debug
 else
   python -m kalshi_bot.app.collector --coinbase --seconds "$COINBASE_SECONDS" --debug
   python3 scripts/poll_kalshi_quotes.py --seconds 60 --interval 5 --status active
   python3 scripts/compute_kalshi_edges.py \
     "${EDGE_ARGS[@]}" \
-    --debug-market KXBTC --debug-market KXBTC15M --debug
+    --debug-market KXBTC --debug-market KXBTC15M --debug-market KXBTCD --debug
 fi

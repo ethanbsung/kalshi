@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import aiosqlite
+import pytest
 
 from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
@@ -79,7 +80,7 @@ def test_report_model_performance_summary(tmp_path):
                 "sigma": 0.5,
                 "tau": 1.0,
                 "p_model": 0.6,
-                "p_market": None,
+                "p_market": 0.55,
                 "best_yes_bid": 45.0,
                 "best_yes_ask": 30.0,
                 "best_no_bid": 70.0,
@@ -101,7 +102,13 @@ def test_report_model_performance_summary(tmp_path):
             assert report["total"] == 1
             assert report["settled"] == 1
             assert report["unsettled"] == 0
-            assert report["avg_brier"] == 0.01
-            assert report["avg_logloss"] == 0.02
+            assert report["avg_model_brier"] == pytest.approx(0.16)
+            assert report["avg_model_logloss"] == pytest.approx(0.5108256238)
+            assert report["avg_market_brier"] == pytest.approx(0.2025)
+            assert report["avg_market_logloss"] == pytest.approx(0.5978370008)
+            assert report["delta_brier"] == pytest.approx(-0.0425)
+            assert report["delta_logloss"] == pytest.approx(-0.0870113770)
+            assert report["avg_brier"] == pytest.approx(report["avg_model_brier"])
+            assert report["avg_logloss"] == pytest.approx(report["avg_model_logloss"])
 
     asyncio.run(_run())

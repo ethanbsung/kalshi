@@ -11,7 +11,9 @@ async def collect_live_health(
     now_ts: int,
     product_id: str,
     window_minutes: int,
+    max_horizon_seconds: int | None = None,
 ) -> dict[str, Any]:
+    _ = max_horizon_seconds  # Forward-compatible with stack-level horizon config.
     window_seconds = max(window_minutes, 1) * 60
     window_start = now_ts - window_seconds
 

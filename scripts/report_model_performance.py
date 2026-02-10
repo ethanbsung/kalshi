@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -11,6 +12,8 @@ import aiosqlite
 
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
+from kalshi_bot.kalshi.fees import taker_fee_dollars
+from kalshi_bot.models.probability import EPS
 
 
 def _parse_args() -> argparse.Namespace:
@@ -44,13 +47,36 @@ def _parse_price_used(raw_json: str | None) -> float | None:
         return None
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _realized_pnl(
     outcome: int, side: str, price_cents: float
 ) -> float:
+    fee = taker_fee_dollars(price_cents, 1)
+    fee_value = fee if fee is not None else 0.0
     price = price_cents / 100.0
     if side == "YES":
-        return outcome - price
-    return (1 - outcome) - price
+        return outcome - price - fee_value
+    return (1 - outcome) - price - fee_value
+
+
+def _score_prob(prob: float | None, outcome: int) -> tuple[float | None, float | None]:
+    if prob is None or outcome not in (0, 1):
+        return None, None
+    p = max(EPS, min(1.0 - EPS, float(prob)))
+    brier = (p - outcome) ** 2
+    logloss = -(
+        outcome * math.log(p)
+        + (1 - outcome) * math.log(1.0 - p)
+    )
+    return brier, logloss
 
 
 async def compute_report(
@@ -58,9 +84,8 @@ async def compute_report(
 ) -> dict[str, Any]:
     cursor = await conn.execute(
         """
-        SELECT o.ts_eval, o.market_id, o.side, o.p_model, o.best_yes_ask,
-               o.best_no_ask, o.raw_json, s.outcome, s.brier, s.logloss,
-               s.settled_ts
+        SELECT o.ts_eval, o.market_id, o.side, o.p_model, o.p_market,
+               o.best_yes_ask, o.best_no_ask, o.raw_json, s.outcome, s.settled_ts
         FROM opportunities o
         LEFT JOIN kalshi_edge_snapshot_scores s
           ON s.market_id = o.market_id AND s.asof_ts = o.ts_eval
@@ -74,10 +99,12 @@ async def compute_report(
     total = len(rows)
     settled = 0
     pnl_total = 0.0
-    brier_total = 0.0
-    logloss_total = 0.0
-    brier_count = 0
-    logloss_count = 0
+    model_brier_total = 0.0
+    model_logloss_total = 0.0
+    model_score_count = 0
+    market_brier_total = 0.0
+    market_logloss_total = 0.0
+    market_score_count = 0
 
     by_day: dict[str, dict[str, float]] = {}
     buckets: dict[str, dict[str, float]] = {}
@@ -87,12 +114,11 @@ async def compute_report(
         market_id,
         side,
         p_model,
+        p_market,
         yes_ask,
         no_ask,
         raw_json,
         outcome,
-        brier,
-        logloss,
         settled_ts,
     ) in rows:
         if outcome is None:
@@ -102,12 +128,35 @@ async def compute_report(
             outcome_val = int(outcome)
         except (TypeError, ValueError):
             continue
-        if brier is not None:
-            brier_total += float(brier)
-            brier_count += 1
-        if logloss is not None:
-            logloss_total += float(logloss)
-            logloss_count += 1
+        model_brier, model_logloss = _score_prob(_safe_float(p_model), outcome_val)
+        if model_brier is not None and model_logloss is not None:
+            model_brier_total += model_brier
+            model_logloss_total += model_logloss
+            model_score_count += 1
+
+        market_prob = _safe_float(p_market)
+        if market_prob is None:
+            if side == "YES":
+                yes_price = (
+                    _safe_float(yes_ask)
+                    if yes_ask is not None
+                    else _safe_float(_parse_price_used(raw_json))
+                )
+                if yes_price is not None:
+                    market_prob = yes_price / 100.0
+            elif side == "NO":
+                no_price = (
+                    _safe_float(no_ask)
+                    if no_ask is not None
+                    else _safe_float(_parse_price_used(raw_json))
+                )
+                if no_price is not None:
+                    market_prob = 1.0 - (no_price / 100.0)
+        market_brier, market_logloss = _score_prob(market_prob, outcome_val)
+        if market_brier is not None and market_logloss is not None:
+            market_brier_total += market_brier
+            market_logloss_total += market_logloss
+            market_score_count += 1
 
         price_used = _parse_price_used(raw_json)
         if price_used is None:
@@ -142,15 +191,44 @@ async def compute_report(
         day_info["wins"] += outcome_val
 
     unsettled = total - settled
-    avg_brier = brier_total / brier_count if brier_count else None
-    avg_logloss = logloss_total / logloss_count if logloss_count else None
+    avg_model_brier = (
+        model_brier_total / model_score_count if model_score_count else None
+    )
+    avg_model_logloss = (
+        model_logloss_total / model_score_count if model_score_count else None
+    )
+    avg_market_brier = (
+        market_brier_total / market_score_count if market_score_count else None
+    )
+    avg_market_logloss = (
+        market_logloss_total / market_score_count if market_score_count else None
+    )
+    delta_brier = (
+        avg_model_brier - avg_market_brier
+        if avg_model_brier is not None and avg_market_brier is not None
+        else None
+    )
+    delta_logloss = (
+        avg_model_logloss - avg_market_logloss
+        if avg_model_logloss is not None and avg_market_logloss is not None
+        else None
+    )
 
     return {
         "total": total,
         "settled": settled,
         "unsettled": unsettled,
-        "avg_brier": avg_brier,
-        "avg_logloss": avg_logloss,
+        "avg_model_brier": avg_model_brier,
+        "avg_model_logloss": avg_model_logloss,
+        "avg_market_brier": avg_market_brier,
+        "avg_market_logloss": avg_market_logloss,
+        "delta_brier": delta_brier,
+        "delta_logloss": delta_logloss,
+        "model_scored": model_score_count,
+        "market_scored": market_score_count,
+        # Backward compatible aliases.
+        "avg_brier": avg_model_brier,
+        "avg_logloss": avg_model_logloss,
         "pnl_total": pnl_total,
         "by_day": by_day,
         "buckets": buckets,
@@ -178,12 +256,27 @@ async def _run() -> int:
             unsettled=report["unsettled"],
         )
     )
-    avg_brier = report["avg_brier"]
-    avg_logloss = report["avg_logloss"]
+    avg_brier = report["avg_model_brier"]
+    avg_logloss = report["avg_model_logloss"]
+    avg_market_brier = report["avg_market_brier"]
+    avg_market_logloss = report["avg_market_logloss"]
+    delta_brier = report["delta_brier"]
+    delta_logloss = report["delta_logloss"]
     print(
-        "avg_brier={brier} avg_logloss={logloss} realized_pnl={pnl}".format(
+        "avg_brier={brier} avg_logloss={logloss} "
+        "market_avg_brier={mbrier} market_avg_logloss={mlogloss} "
+        "delta_brier={dbrier} delta_logloss={dlogloss} "
+        "realized_pnl={pnl}".format(
             brier=f"{avg_brier:.6f}" if avg_brier is not None else "NA",
             logloss=f"{avg_logloss:.6f}" if avg_logloss is not None else "NA",
+            mbrier=(
+                f"{avg_market_brier:.6f}" if avg_market_brier is not None else "NA"
+            ),
+            mlogloss=(
+                f"{avg_market_logloss:.6f}" if avg_market_logloss is not None else "NA"
+            ),
+            dbrier=f"{delta_brier:.6f}" if delta_brier is not None else "NA",
+            dlogloss=f"{delta_logloss:.6f}" if delta_logloss is not None else "NA",
             pnl=f"{report['pnl_total']:.4f}",
         )
     )

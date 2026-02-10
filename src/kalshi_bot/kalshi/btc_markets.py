@@ -10,7 +10,7 @@ import aiosqlite
 
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 
-BTC_SERIES_TICKERS = ["KXBTC", "KXBTC15M"]
+BTC_SERIES_TICKERS = ["KXBTC", "KXBTC15M", "KXBTCD"]
 
 
 def extract_strike_basic(market: dict[str, Any]) -> float | None:

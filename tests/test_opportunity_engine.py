@@ -36,7 +36,7 @@ def test_build_opportunities_take_yes():
     row = rows[0]
     assert row["side"] == "YES"
     assert row["would_trade"] == 1
-    assert row["ev_raw"] == 0.6 - 0.50
+    assert row["ev_raw"] == 0.6 - 0.50 - 0.02
 
 
 def test_build_opportunities_missing_yes_ask_pass():

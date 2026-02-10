@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from kalshi_bot.kalshi.fees import taker_fee_dollars
 from kalshi_bot.models.probability import EPS
 
 
@@ -47,12 +48,20 @@ def score_snapshot(snapshot_row: dict[str, Any], outcome: int) -> dict[str, Any]
     if yes_ask is None:
         errors.add("missing_yes_ask")
     elif outcome in (0, 1):
-        pnl_take_yes = outcome - (yes_ask / 100.0)
+        yes_fee = taker_fee_dollars(yes_ask, 1)
+        if yes_fee is None:
+            errors.add("invalid_yes_fee")
+        else:
+            pnl_take_yes = outcome - (yes_ask / 100.0) - yes_fee
 
     if no_ask is None:
         errors.add("missing_no_ask")
     elif outcome in (0, 1):
-        pnl_take_no = (1 - outcome) - (no_ask / 100.0)
+        no_fee = taker_fee_dollars(no_ask, 1)
+        if no_fee is None:
+            errors.add("invalid_no_fee")
+        else:
+            pnl_take_no = (1 - outcome) - (no_ask / 100.0) - no_fee
 
     return {
         "pnl_take_yes": pnl_take_yes,

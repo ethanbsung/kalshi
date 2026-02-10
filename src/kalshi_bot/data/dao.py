@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from typing import Any, Mapping
 
 import aiosqlite
@@ -174,7 +176,15 @@ class Dao:
         columns = ", ".join(row.keys())
         placeholders = ", ".join("?" for _ in row)
         sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
-        await self._conn.execute(sql, tuple(row.values()))
+        params = tuple(row.values())
+        for attempt in range(4):
+            try:
+                await self._conn.execute(sql, params)
+                return
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower() or attempt == 3:
+                    raise
+                await asyncio.sleep(0.05 * (attempt + 1))
 
     async def insert_spot_tick(self, row: Mapping[str, Any]) -> None:
         self._validate_columns("spot_ticks", self.SPOT_TICK_COLUMNS, row)

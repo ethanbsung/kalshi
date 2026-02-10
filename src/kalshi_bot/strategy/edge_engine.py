@@ -504,6 +504,7 @@ async def _compute_and_store_sigma(
     effective_max_spot_points = max(1, int(max_spot_points))
     max_auto_points = 200_000
     auto_load_attempts = 0
+    max_auto_load_attempts = 6
 
     raw_timestamps: list[int] = []
     raw_prices: list[float] = []
@@ -565,7 +566,7 @@ async def _compute_and_store_sigma(
         # row cap, fetch more history points and try once more.
         if (
             sigma_reason == "insufficient_history_span"
-            and auto_load_attempts < 2
+            and auto_load_attempts < max_auto_load_attempts
             and len(raw_timestamps) >= effective_max_spot_points
             and effective_max_spot_points < max_auto_points
         ):

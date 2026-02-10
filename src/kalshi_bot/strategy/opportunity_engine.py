@@ -4,6 +4,11 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from kalshi_bot.strategy.edge_math import (
+    ev_take_no as fee_aware_ev_take_no,
+    ev_take_yes as fee_aware_ev_take_yes,
+)
+
 
 @dataclass(frozen=True)
 class OpportunityConfig:
@@ -24,14 +29,6 @@ def _ask_tradable(
     if ask is None:
         return False
     return min_ask <= ask <= max_ask
-
-
-def _ev_take_yes(prob_yes: float, yes_ask: float) -> float:
-    return prob_yes - (yes_ask / 100.0)
-
-
-def _ev_take_no(prob_yes: float, no_ask: float) -> float:
-    return (1.0 - prob_yes) - (no_ask / 100.0)
 
 
 def _spread(
@@ -258,7 +255,7 @@ def build_opportunities_from_snapshots(
                     return None, "missing_yes_ask"
                 ev = _safe_float(ev_take_yes)
                 if ev is None:
-                    ev = _ev_take_yes(prob_yes, yes_ask)
+                    ev = fee_aware_ev_take_yes(prob_yes, yes_ask)
                 row = build_row(side="YES", ev=ev, ask=yes_ask, reason=None)
                 return row, None
             if side == "NO":
@@ -269,7 +266,7 @@ def build_opportunities_from_snapshots(
                     return None, "missing_no_ask"
                 ev = _safe_float(ev_take_no)
                 if ev is None:
-                    ev = _ev_take_no(prob_yes, no_ask)
+                    ev = fee_aware_ev_take_no(prob_yes, no_ask)
                 row = build_row(side="NO", ev=ev, ask=no_ask, reason=None)
                 return row, None
             return None, "invalid_side"

@@ -16,9 +16,9 @@ from kalshi_bot.strategy.edge_snapshot_scoring import score_snapshot
 def test_score_snapshot_pnl_yes():
     snapshot = {"prob_yes": 0.5, "yes_ask": 30.0, "no_ask": 70.0}
     score = score_snapshot(snapshot, outcome=1)
-    assert score["pnl_take_yes"] == 1.0 - 0.30
+    assert score["pnl_take_yes"] == 1.0 - 0.30 - 0.02
     score = score_snapshot(snapshot, outcome=0)
-    assert score["pnl_take_yes"] == -0.30
+    assert score["pnl_take_yes"] == -0.30 - 0.02
 
 
 def test_score_snapshot_logloss_clamped():

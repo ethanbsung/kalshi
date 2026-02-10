@@ -1,4 +1,5 @@
 from kalshi_bot.kalshi.btc_markets import (
+    BTC_SERIES_TICKERS,
     backfill_market_times,
     empty_series_tickers,
     extract_close_ts,
@@ -54,6 +55,10 @@ def test_empty_series_tickers():
         "KXBTC15M": {"markets": [{"ticker": "A"}]},
     }
     assert empty_series_tickers(per_series) == ["KXBTC"]
+
+
+def test_btc_series_tickers_includes_daily_series():
+    assert "KXBTCD" in BTC_SERIES_TICKERS
 
 
 def test_backfill_market_times_updates_close_ts(tmp_path):

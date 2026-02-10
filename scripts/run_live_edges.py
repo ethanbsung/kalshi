@@ -13,6 +13,7 @@ from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
 from kalshi_bot.infra.logging import setup_logger
+from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
 from kalshi_bot.strategy.edge_engine import compute_edges
 
 
@@ -23,8 +24,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--interval-seconds", type=int, default=10)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--product-id", type=str, default="BTC-USD")
-    parser.add_argument("--lookback-seconds", type=int, default=3600)
-    parser.add_argument("--max-spot-points", type=int, default=500)
+    parser.add_argument("--lookback-seconds", type=int, default=3900)
+    parser.add_argument("--max-spot-points", type=int, default=20000)
     parser.add_argument("--ewma-lambda", type=float, default=0.94)
     parser.add_argument("--min-points", type=int, default=10)
     parser.add_argument("--min-sigma-lookback-seconds", type=int, default=3600)
@@ -32,11 +33,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-default", type=float, default=0.6)
     parser.add_argument("--sigma-max", type=float, default=5.0)
     parser.add_argument("--status", type=str, default="active")
-    parser.add_argument("--series", action="append", default=["KXBTC", "KXBTC15M"])
+    parser.add_argument("--series", action="append", default=list(BTC_SERIES_TICKERS))
     parser.add_argument("--pct-band", type=float, default=3.0)
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--freshness-seconds", type=int, default=300)
-    parser.add_argument("--max-horizon-seconds", type=int, default=10 * 24 * 3600)
+    parser.add_argument("--max-horizon-seconds", type=int, default=6 * 3600)
     parser.add_argument("--min-ask-cents", type=float, default=1.0)
     parser.add_argument("--max-ask-cents", type=float, default=99.0)
     parser.add_argument("--contracts", type=int, default=1)

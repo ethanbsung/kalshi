@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from typing import Any, Awaitable, Callable
 
@@ -100,6 +101,8 @@ async def load_market_tickers(
 
 
 class KalshiQuotePoller:
+    _write_backoffs: tuple[float, ...] = (0.2, 0.5, 1.0, 2.0)
+
     def __init__(
         self,
         rest_client: KalshiRestClient,
@@ -111,6 +114,11 @@ class KalshiQuotePoller:
         self._logger = logger
         self._max_concurrency = max_concurrency
         self._fetch_market = fetch_market or self._rest_client.get_market
+
+    @staticmethod
+    def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
+        message = str(exc).lower()
+        return "locked" in message
 
     async def run(
         self,
@@ -291,13 +299,50 @@ class KalshiQuotePoller:
             return summary
 
         dao = Dao(conn)
-        for row in rows:
-            await dao.insert_kalshi_quote(row)
-        await conn.commit()
+        write_backoffs = list(self._write_backoffs)
+        write_error: sqlite3.OperationalError | None = None
+        for attempt in range(len(write_backoffs) + 1):
+            try:
+                for row in rows:
+                    await dao.insert_kalshi_quote(row)
+                await conn.commit()
+                write_error = None
+                break
+            except sqlite3.OperationalError as exc:
+                if not self._is_locked_error(exc):
+                    raise
+                write_error = exc
+                await conn.rollback()
+                if attempt < len(write_backoffs):
+                    await asyncio.sleep(write_backoffs[attempt])
+                    continue
+
+        if write_error is not None:
+            error_counts["unknown"] += len(rows)
+            for row in rows:
+                add_failed_sample(
+                    failed_samples, failed_set, row.get("market_id")
+                )
+            summary = {
+                "successes": max(len(results) - sum(error_counts.values()), 0),
+                "failures": sum(error_counts.values()),
+                "inserted": 0,
+                "error_counts": error_counts,
+                "failed_tickers_sample": failed_samples,
+            }
+            self._logger.warning(
+                "kalshi_quote_db_write_locked",
+                extra={
+                    **summary,
+                    "attempts": len(write_backoffs) + 1,
+                    "error": str(write_error),
+                },
+            )
+            return summary
 
         summary = {
-            "successes": successes,
-            "failures": failures,
+            "successes": max(len(results) - sum(error_counts.values()), 0),
+            "failures": sum(error_counts.values()),
             "inserted": len(rows),
             "error_counts": error_counts,
             "failed_tickers_sample": failed_samples,
