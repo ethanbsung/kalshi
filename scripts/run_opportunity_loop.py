@@ -28,14 +28,23 @@ NOISY_PASS_REASONS = {
     "missing_yes_ask",
     "missing_no_ask",
     "position_open",
+    "position_open_opposite_side",
     "cooldown_active",
     "take_cap",
     "top_n_cutoff",
 }
 
 QUIET_TICK_HEARTBEAT_SECONDS = 60
+PASS_SAMPLE_HEARTBEAT_SECONDS = 600
+MIN_TAU_MINUTES_KXBTC15M = 4.0
+MIN_TAU_MINUTES_KXBTC = 10.0
+MIN_TAU_MINUTES_KXBTCD = 10.0
+TAIL_PRICE_MIN_CENTS = 10.0
+TAIL_PRICE_MAX_CENTS = 90.0
+TAIL_MIN_EV = 0.06
 _LAST_HEARTBEAT_LOG_TS: int | None = None
 _LAST_LOGGED_ASOF_TS: int | None = None
+_LAST_PASS_SAMPLE_LOG_TS: int | None = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -151,6 +160,16 @@ def _fmt_bool(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return "NA"
+
+
+def _min_tau_minutes_for_market(market_id: str) -> float | None:
+    if market_id.startswith("KXBTC15M-"):
+        return MIN_TAU_MINUTES_KXBTC15M
+    if market_id.startswith("KXBTC-"):
+        return MIN_TAU_MINUTES_KXBTC
+    if market_id.startswith("KXBTCD-"):
+        return MIN_TAU_MINUTES_KXBTCD
+    return None
 
 
 def _decision_reason(row: dict[str, Any]) -> str:
@@ -343,7 +362,7 @@ def _write_decision_log(
     pass_reason_limit: int,
     pass_sample_limit: int,
 ) -> None:
-    global _LAST_HEARTBEAT_LOG_TS, _LAST_LOGGED_ASOF_TS
+    global _LAST_HEARTBEAT_LOG_TS, _LAST_LOGGED_ASOF_TS, _LAST_PASS_SAMPLE_LOG_TS
 
     asof_ts = int(summary["asof_ts"])
     take_rows = list(summary.get("take_rows") or [])
@@ -356,6 +375,17 @@ def _write_decision_log(
     pass_samples = _select_pass_samples(
         abnormal_pass_rows, reason_counts, pass_sample_limit
     )
+    if not pass_samples and pass_rows:
+        should_emit_periodic_sample = (
+            _LAST_PASS_SAMPLE_LOG_TS is None
+            or (asof_ts - _LAST_PASS_SAMPLE_LOG_TS) >= PASS_SAMPLE_HEARTBEAT_SECONDS
+        )
+        if should_emit_periodic_sample:
+            pass_samples = _select_pass_samples(
+                pass_rows,
+                _count_pass_reasons(pass_rows),
+                min(max(pass_sample_limit, 0), 1),
+            )
 
     take_rows.sort(key=lambda r: float(r.get("ev_raw") or -1e9), reverse=True)
 
@@ -391,6 +421,8 @@ def _write_decision_log(
 
         for row in pass_samples:
             f.write(_format_decision_line("PASS_SAMPLE", asof_ts, row) + "\n")
+        if pass_samples:
+            _LAST_PASS_SAMPLE_LOG_TS = asof_ts
 
 
 async def run_tick(conn: aiosqlite.Connection, args: argparse.Namespace) -> dict[str, Any]:
@@ -415,15 +447,60 @@ async def run_tick(conn: aiosqlite.Connection, args: argparse.Namespace) -> dict
     pass_rows = [row for row in all_rows if int(row.get("would_trade") or 0) != 1]
     take_rows.sort(key=lambda row: float(row.get("ev_raw") or -1e9), reverse=True)
 
-    open_take_keys, open_qty_before = await _load_open_take_state(conn)
-    open_position_blocked = 0
+    tail_ev_blocked = 0
     if take_rows:
         kept_take_rows: list[dict[str, Any]] = []
         for row in take_rows:
-            key = (str(row.get("market_id") or ""), str(row.get("side") or ""))
+            ask_c = _ask_for_side(row)
+            ev = row.get("ev_raw")
+            if (
+                isinstance(ask_c, (int, float))
+                and isinstance(ev, (int, float))
+                and (float(ask_c) <= TAIL_PRICE_MIN_CENTS or float(ask_c) >= TAIL_PRICE_MAX_CENTS)
+                and float(ev) < TAIL_MIN_EV
+            ):
+                pass_rows.append(_as_pass_row(row, "tail_ev_below_threshold"))
+                tail_ev_blocked += 1
+            else:
+                kept_take_rows.append(row)
+        take_rows = kept_take_rows
+
+    near_expiry_blocked = 0
+    if take_rows:
+        kept_take_rows: list[dict[str, Any]] = []
+        for row in take_rows:
+            market_id = str(row.get("market_id") or "")
+            tau_minutes = row.get("tau")
+            min_tau_minutes = _min_tau_minutes_for_market(market_id)
+            if (
+                min_tau_minutes is not None
+                and isinstance(tau_minutes, (int, float))
+                and float(tau_minutes) < min_tau_minutes
+            ):
+                pass_rows.append(_as_pass_row(row, "near_expiry"))
+                near_expiry_blocked += 1
+            else:
+                kept_take_rows.append(row)
+        take_rows = kept_take_rows
+
+    open_take_keys, open_qty_before = await _load_open_take_state(conn)
+    open_market_sides: dict[str, set[str]] = {}
+    for market_id, side in open_take_keys:
+        open_market_sides.setdefault(market_id, set()).add(side)
+    open_position_blocked = 0
+    open_opposite_side_blocked = 0
+    if take_rows:
+        kept_take_rows: list[dict[str, Any]] = []
+        for row in take_rows:
+            market_id = str(row.get("market_id") or "")
+            side = str(row.get("side") or "")
+            key = (market_id, side)
             if key in open_take_keys:
                 pass_rows.append(_as_pass_row(row, "position_open"))
                 open_position_blocked += 1
+            elif market_id in open_market_sides:
+                pass_rows.append(_as_pass_row(row, "position_open_opposite_side"))
+                open_opposite_side_blocked += 1
             else:
                 kept_take_rows.append(row)
         take_rows = kept_take_rows
@@ -458,6 +535,9 @@ async def run_tick(conn: aiosqlite.Connection, args: argparse.Namespace) -> dict
     open_qty_after = open_qty_before + len(take_rows)
 
     counters["open_position_blocked"] = open_position_blocked
+    counters["open_opposite_side_blocked"] = open_opposite_side_blocked
+    counters["tail_ev_blocked"] = tail_ev_blocked
+    counters["near_expiry_blocked"] = near_expiry_blocked
     counters["cooldown_blocked"] = cooldown_blocked
     counters["take_cap_blocked"] = take_cap_blocked
     counters["takes"] = len(take_rows)
