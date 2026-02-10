@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS kalshi_edge_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_kalshi_edge_snapshots_market_asof
     ON kalshi_edge_snapshots(market_id, asof_ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_kalshi_edge_snapshots_unique_market_asof
+    ON kalshi_edge_snapshots(market_id, asof_ts);
 CREATE INDEX IF NOT EXISTS idx_kalshi_edge_snapshots_asof
     ON kalshi_edge_snapshots(asof_ts);
 CREATE INDEX IF NOT EXISTS idx_kalshi_edge_snapshots_settlement_ts

@@ -227,6 +227,10 @@ def test_schema_tables_exist(tmp_path):
         assert (
             "idx_kalshi_edge_snapshots_settlement_ts" in snapshot_index_names
         ), "kalshi_edge_snapshots missing settlement_ts index"
+        assert (
+            "idx_kalshi_edge_snapshots_unique_market_asof"
+            in snapshot_index_names
+        ), "kalshi_edge_snapshots missing unique market_id,asof_ts index"
 
         score_cols = _table_columns(conn, "kalshi_edge_snapshot_scores")
         required_score_cols = {

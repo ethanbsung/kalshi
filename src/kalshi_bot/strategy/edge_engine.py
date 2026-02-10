@@ -421,7 +421,7 @@ async def _record_sigma(
     method: str,
     lookback_seconds: int | None,
     points: int | None,
-) -> None:
+) -> bool:
     try:
         dao = Dao(conn)
         await dao.insert_sigma_history(
@@ -436,8 +436,217 @@ async def _record_sigma(
                 "points": points,
             }
         )
+        return True
     except sqlite3.OperationalError:
-        return
+        return False
+
+
+async def _compute_and_store_sigma(
+    conn: aiosqlite.Connection,
+    *,
+    product_id: str,
+    lookback_seconds: int,
+    max_spot_points: int,
+    ewma_lambda: float,
+    min_points: int,
+    min_sigma_lookback_seconds: int,
+    resample_seconds: int,
+    sigma_default: float,
+    sigma_max: float,
+    now_ts: int,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    if not isinstance(resample_seconds, int) or resample_seconds <= 0:
+        raise ValueError("resample_seconds must be a positive int")
+    if not math.isfinite(sigma_default) or sigma_default <= 0:
+        raise ValueError("sigma_default must be positive and finite")
+    if not math.isfinite(sigma_max) or sigma_max <= 0:
+        raise ValueError("sigma_max must be positive and finite")
+
+    effective_max_spot_points = max(1, int(max_spot_points))
+    max_auto_points = 200_000
+    auto_load_attempts = 0
+
+    raw_timestamps: list[int] = []
+    raw_prices: list[float] = []
+    resampled_timestamps: list[int] = []
+    resampled_prices: list[float] = []
+    returns: list[float] = []
+    history_span_seconds = 0
+    sigma_reason: str | None = None
+    sigma_raw: float | None = None
+    sigma_persisted: bool | None = None
+
+    while True:
+        history = await get_spot_history(
+            conn, product_id, lookback_seconds, effective_max_spot_points
+        )
+        raw_timestamps = [row[0] for row in history]
+        raw_prices = [row[1] for row in history]
+        (
+            resampled_timestamps,
+            resampled_prices,
+        ) = resample_last_price_series(
+            raw_timestamps, raw_prices, resample_seconds
+        )
+        returns = compute_log_returns(resampled_prices)
+        history_span_seconds = (
+            (resampled_timestamps[-1] - resampled_timestamps[0])
+            if len(resampled_timestamps) >= 2
+            else 0
+        )
+
+        sigma_reason = None
+        sigma_raw = None
+        step_seconds = float(resample_seconds)
+
+        if step_seconds <= 0:
+            sigma_reason = "missing_step"
+        elif step_seconds < 1.0 or step_seconds > 3600.0:
+            sigma_reason = "bad_step_seconds"
+        elif len(resampled_prices) < 2:
+            sigma_reason = "insufficient_points"
+        elif history_span_seconds < min_sigma_lookback_seconds:
+            sigma_reason = "insufficient_history_span"
+        elif len(returns) < min_points:
+            sigma_reason = "insufficient_points"
+        else:
+            vol_step = ewma_volatility(returns, ewma_lambda)
+            if vol_step is None:
+                sigma_reason = "sigma_ewma_missing"
+            else:
+                sigma_raw = annualize_vol(vol_step, step_seconds)
+                if not math.isfinite(sigma_raw):
+                    sigma_reason = "nonfinite_sigma"
+                elif sigma_raw <= 0:
+                    sigma_reason = "nonpositive_sigma"
+                elif sigma_raw > sigma_max:
+                    sigma_reason = "out_of_bounds"
+
+        # If we only failed because the span is too short and we likely hit a
+        # row cap, fetch more history points and try once more.
+        if (
+            sigma_reason == "insufficient_history_span"
+            and auto_load_attempts < 2
+            and len(raw_timestamps) >= effective_max_spot_points
+            and effective_max_spot_points < max_auto_points
+        ):
+            estimated_step = _estimate_step_seconds(raw_timestamps)
+            if estimated_step is None or estimated_step <= 0:
+                estimated_step = 1.0
+            target_span = max(min_sigma_lookback_seconds, resample_seconds * min_points)
+            needed_points = int((target_span / estimated_step) * 1.25) + 5
+            needed_points = max(needed_points, effective_max_spot_points * 2)
+            new_max_points = min(max_auto_points, needed_points)
+            if new_max_points > effective_max_spot_points:
+                effective_max_spot_points = new_max_points
+                auto_load_attempts += 1
+                continue
+
+        break
+
+    raw_points = len(raw_timestamps)
+    resampled_points = len(resampled_timestamps)
+    step_seconds = float(resample_seconds)
+    sigma_points_used = len(returns)
+    sigma_lookback_seconds_used = int(history_span_seconds)
+
+    if sigma_reason is None and sigma_raw is None:
+        sigma_reason = "sigma_missing"
+
+    if sigma_reason is None and sigma_raw is not None:
+        sigma = sigma_raw
+        sigma_source = "ewma"
+        sigma_ok = True
+        persisted = await _record_sigma(
+            conn,
+            product_id=product_id,
+            ts=now_ts,
+            sigma=sigma,
+            method="ewma",
+            lookback_seconds=sigma_lookback_seconds_used,
+            points=sigma_points_used,
+        )
+        sigma_persisted = persisted
+        if not persisted:
+            logger.error(
+                "sigma_persist_failed",
+                extra={
+                    "product_id": product_id,
+                    "sigma_source": sigma_source,
+                    "sigma_reason": sigma_reason,
+                    "raw_points": raw_points,
+                    "resampled_points": resampled_points,
+                    "history_span_seconds": history_span_seconds,
+                    "sigma_value": sigma,
+                },
+            )
+    else:
+        logger.warning(
+            "sigma_compute_failed",
+            extra={
+                "product_id": product_id,
+                "sigma_reason": sigma_reason,
+                "raw_points": raw_points,
+                "resampled_points": resampled_points,
+                "history_span_seconds": history_span_seconds,
+            },
+        )
+        sigma_fallback = await _load_sigma_fallback(conn, product_id)
+        if sigma_fallback is not None:
+            sigma = sigma_fallback
+            sigma_source = "history"
+            sigma_ok = False
+            logger.warning(
+                "sigma_fallback_used",
+                extra={
+                    "product_id": product_id,
+                    "sigma_reason": sigma_reason,
+                    "sigma_fallback": sigma_fallback,
+                    "raw_points": raw_points,
+                    "resampled_points": resampled_points,
+                    "history_span_seconds": history_span_seconds,
+                },
+            )
+            sigma_persisted = False
+        else:
+            sigma = sigma_default
+            sigma_source = "default"
+            sigma_ok = False
+            logger.warning(
+                "sigma_default_used",
+                extra={
+                    "product_id": product_id,
+                    "sigma_reason": sigma_reason,
+                    "sigma_default": sigma_default,
+                    "raw_points": raw_points,
+                    "resampled_points": resampled_points,
+                    "history_span_seconds": history_span_seconds,
+                },
+            )
+            sigma_persisted = False
+
+    if sigma_reason is None:
+        sigma_quality = "ok"
+    elif sigma_source == "history":
+        sigma_quality = "fallback_history"
+    else:
+        sigma_quality = "fallback_default"
+
+    return {
+        "sigma": sigma,
+        "sigma_unclamped": sigma_raw,
+        "sigma_source": sigma_source,
+        "sigma_ok": sigma_ok,
+        "sigma_reason": sigma_reason,
+        "sigma_quality": sigma_quality,
+        "sigma_points_used": sigma_points_used,
+        "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
+        "sigma_persisted": sigma_persisted,
+        "raw_points": raw_points,
+        "resampled_points": resampled_points,
+        "step_seconds": step_seconds,
+    }
 
 
 async def compute_edges(
@@ -484,113 +693,32 @@ async def compute_edges(
         }
     spot_ts, spot_price = latest
 
-    history = await get_spot_history(
-        conn, product_id, lookback_seconds, max_spot_points
+    sigma_state = await _compute_and_store_sigma(
+        conn,
+        product_id=product_id,
+        lookback_seconds=lookback_seconds,
+        max_spot_points=max_spot_points,
+        ewma_lambda=ewma_lambda,
+        min_points=min_points,
+        min_sigma_lookback_seconds=min_sigma_lookback_seconds,
+        resample_seconds=resample_seconds,
+        sigma_default=sigma_default,
+        sigma_max=sigma_max,
+        now_ts=now_ts,
+        logger=logger,
     )
-    if not isinstance(resample_seconds, int) or resample_seconds <= 0:
-        raise ValueError("resample_seconds must be a positive int")
-    raw_timestamps = [row[0] for row in history]
-    raw_prices = [row[1] for row in history]
-    (
-        resampled_timestamps,
-        resampled_prices,
-    ) = resample_last_price_series(
-        raw_timestamps, raw_prices, resample_seconds
-    )
-    raw_points = len(raw_timestamps)
-    resampled_points = len(resampled_timestamps)
-    step_seconds = float(resample_seconds)
-    returns = compute_log_returns(resampled_prices)
-    history_span_seconds = (
-        (resampled_timestamps[-1] - resampled_timestamps[0])
-        if len(resampled_timestamps) >= 2
-        else 0
-    )
-
-    sigma_raw: float | None = None
-    sigma_reason: str | None = None
-    sigma_source = "ewma"
-    sigma_ok = True
-    sigma_points_used = len(returns)
-    sigma_lookback_seconds_used = int(history_span_seconds)
-
-    if not math.isfinite(sigma_default) or sigma_default <= 0:
-        raise ValueError("sigma_default must be positive and finite")
-    if not math.isfinite(sigma_max) or sigma_max <= 0:
-        raise ValueError("sigma_max must be positive and finite")
-
-    if step_seconds is None or step_seconds <= 0:
-        sigma_reason = "missing_step"
-    elif step_seconds < 1.0 or step_seconds > 3600.0:
-        sigma_reason = "bad_step_seconds"
-    elif len(resampled_prices) < 2:
-        sigma_reason = "insufficient_points"
-    elif history_span_seconds < min_sigma_lookback_seconds:
-        sigma_reason = "insufficient_history_span"
-    elif len(returns) < min_points:
-        sigma_reason = "insufficient_points"
-    else:
-        vol_step = ewma_volatility(returns, ewma_lambda)
-        if vol_step is None:
-            sigma_reason = "sigma_ewma_missing"
-        else:
-            sigma_raw = annualize_vol(vol_step, step_seconds)
-            if not math.isfinite(sigma_raw):
-                sigma_reason = "nonfinite_sigma"
-            elif sigma_raw <= 0:
-                sigma_reason = "nonpositive_sigma"
-            elif sigma_raw > sigma_max:
-                sigma_reason = "out_of_bounds"
-
-    if sigma_reason is None and sigma_raw is None:
-        sigma_reason = "sigma_missing"
-
-    if sigma_reason is None:
-        sigma = sigma_raw
-        sigma_source = "ewma"
-        sigma_ok = True
-        await _record_sigma(
-            conn,
-            product_id=product_id,
-            ts=now_ts,
-            sigma=sigma,
-            method="ewma",
-            lookback_seconds=sigma_lookback_seconds_used,
-            points=sigma_points_used,
-        )
-    else:
-        sigma_fallback = await _load_sigma_fallback(conn, product_id)
-        if sigma_fallback is not None:
-            sigma = sigma_fallback
-            sigma_source = "history"
-            sigma_ok = False
-            logger.warning(
-                "sigma_fallback_used",
-                extra={
-                    "product_id": product_id,
-                    "sigma_reason": sigma_reason,
-                    "sigma_fallback": sigma_fallback,
-                },
-            )
-        else:
-            sigma = sigma_default
-            sigma_source = "default"
-            sigma_ok = False
-            logger.warning(
-                "sigma_default_used",
-                extra={
-                    "product_id": product_id,
-                    "sigma_reason": sigma_reason,
-                    "sigma_default": sigma_default,
-                },
-            )
-
-    if sigma_reason is None:
-        sigma_quality = "ok"
-    elif sigma_source == "history":
-        sigma_quality = "fallback_history"
-    else:
-        sigma_quality = "fallback_default"
+    sigma = sigma_state["sigma"]
+    sigma_raw = sigma_state["sigma_unclamped"]
+    sigma_source = sigma_state["sigma_source"]
+    sigma_ok = sigma_state["sigma_ok"]
+    sigma_reason = sigma_state["sigma_reason"]
+    sigma_quality = sigma_state["sigma_quality"]
+    sigma_points_used = sigma_state["sigma_points_used"]
+    sigma_lookback_seconds_used = sigma_state["sigma_lookback_seconds_used"]
+    sigma_persisted = sigma_state["sigma_persisted"]
+    raw_points = sigma_state["raw_points"]
+    resampled_points = sigma_state["resampled_points"]
+    step_seconds = sigma_state["step_seconds"]
 
     relevant_ids, _, selection = await get_relevant_universe(
         conn,
@@ -915,6 +1043,7 @@ async def compute_edges(
         "sigma_quality": sigma_quality,
         "sigma_points_used": sigma_points_used,
         "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
+        "sigma_persisted": sigma_persisted,
         "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
         "resample_seconds": resample_seconds,
         "raw_points": raw_points,

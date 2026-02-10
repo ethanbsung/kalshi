@@ -1,4 +1,5 @@
 import asyncio
+import math
 import time
 
 import aiosqlite
@@ -379,6 +380,87 @@ def test_compute_edges_sigma_ewma_when_span_sufficient(tmp_path):
             assert summary["sigma_source"] == "ewma"
             assert summary["sigma_quality"] == "ok"
             assert summary["sigma_ok"] is True
+
+    asyncio.run(_run())
+
+
+def test_compute_edges_records_sigma_history_with_adaptive_spot_points(tmp_path):
+    db_path = tmp_path / "sigma_history_adaptive.sqlite"
+
+    async def _run() -> None:
+        await init_db(db_path)
+        now = int(time.time())
+        start = now - 2500
+        async with aiosqlite.connect(db_path) as conn:
+            spot_rows = []
+            for idx in range(2501):
+                ts = start + idx
+                price = 30000.0 + (idx * 0.02) + (5.0 * math.sin(idx / 20.0))
+                spot_rows.append((ts, "BTC-USD", price, "{}"))
+            await conn.executemany(
+                "INSERT INTO spot_ticks (ts, product_id, price, raw_json) VALUES (?, ?, ?, ?)",
+                spot_rows,
+            )
+            await conn.execute(
+                "INSERT INTO kalshi_markets (market_id, ts_loaded, status) VALUES (?, ?, ?)",
+                ("KXBTC-SIGMA-HISTORY", now, "active"),
+            )
+            await conn.execute(
+                "INSERT INTO kalshi_contracts (ticker, lower, upper, strike_type, settlement_ts, updated_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("KXBTC-SIGMA-HISTORY", 30000.0, None, "greater", now + 3600, now),
+            )
+            await conn.execute(
+                "INSERT INTO kalshi_quotes (ts, market_id, yes_bid, yes_ask, no_bid, no_ask, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (now, "KXBTC-SIGMA-HISTORY", 45.0, 55.0, 40.0, 60.0, "{}"),
+            )
+            await conn.commit()
+
+            summary = await compute_edges(
+                conn,
+                product_id="BTC-USD",
+                lookback_seconds=3600,
+                max_spot_points=200,
+                ewma_lambda=0.94,
+                min_points=10,
+                min_sigma_lookback_seconds=1800,
+                resample_seconds=5,
+                sigma_default=0.6,
+                sigma_max=5.0,
+                status="active",
+                series=["KXBTC"],
+                pct_band=10.0,
+                top_n=10,
+                freshness_seconds=60,
+                max_horizon_seconds=7 * 24 * 3600,
+                now_ts=now,
+            )
+            assert summary["edges_inserted"] == 1
+            assert summary["sigma_source"] == "ewma"
+            assert summary["sigma_ok"] is True
+            assert summary["sigma_persisted"] is True
+            assert summary["sigma_annualized"] is not None
+            assert summary["sigma_annualized"] > 0
+            assert not math.isclose(
+                summary["sigma_annualized"], 0.6, rel_tol=1e-9, abs_tol=1e-9
+            )
+
+            cursor = await conn.execute(
+                "SELECT product_id, sigma FROM spot_sigma_history ORDER BY ts DESC LIMIT 1"
+            )
+            latest = await cursor.fetchone()
+            assert latest is not None
+            assert latest[0] == "BTC-USD"
+            assert latest[1] is not None
+            assert latest[1] > 0
+
+            cursor = await conn.execute(
+                "SELECT COUNT(*) FROM spot_sigma_history WHERE product_id = ?",
+                ("BTC-USD",),
+            )
+            count = (await cursor.fetchone())[0]
+            assert count >= 1
 
     asyncio.run(_run())
 

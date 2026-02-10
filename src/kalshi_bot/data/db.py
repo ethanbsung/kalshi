@@ -66,6 +66,22 @@ async def _has_quotes_fk(conn: aiosqlite.Connection) -> bool:
     return False
 
 
+async def _has_snapshot_unique_market_asof_index(
+    conn: aiosqlite.Connection,
+) -> bool:
+    try:
+        cursor = await conn.execute("PRAGMA index_list(kalshi_edge_snapshots)")
+    except sqlite3.OperationalError:
+        return False
+    rows = await cursor.fetchall()
+    for row in rows:
+        name = row[1]
+        unique = row[2]
+        if name == "idx_kalshi_edge_snapshots_unique_market_asof" and int(unique) == 1:
+            return True
+    return False
+
+
 async def _get_current_version(conn: aiosqlite.Connection) -> int:
     await conn.execute(
         "CREATE TABLE IF NOT EXISTS schema_version ("
@@ -140,9 +156,74 @@ async def _migration_sql_for_version(
             conn, "kalshi_edge_snapshot_scores"
         )
         contract_cols = await _get_table_columns(conn, "kalshi_contracts")
-        if score_cols and {"settled_ts", "outcome"}.issubset(contract_cols):
+        has_settled_ts = "settled_ts" in contract_cols
+        has_outcome = "outcome" in contract_cols
+        has_score_table = bool(score_cols)
+        has_snapshot_unique = await _has_snapshot_unique_market_asof_index(conn)
+        if (
+            has_score_table
+            and has_settled_ts
+            and has_outcome
+            and has_snapshot_unique
+        ):
             return "BEGIN; COMMIT;"
-        return sql
+        statements: list[str] = ["BEGIN;"]
+        if not has_settled_ts:
+            statements.append(
+                "ALTER TABLE kalshi_contracts ADD COLUMN settled_ts INTEGER;"
+            )
+        if not has_outcome:
+            statements.append("ALTER TABLE kalshi_contracts ADD COLUMN outcome INTEGER;")
+        if not has_snapshot_unique:
+            statements.append(
+                "DELETE FROM kalshi_edge_snapshots "
+                "WHERE id IN ("
+                "    SELECT s.id "
+                "    FROM kalshi_edge_snapshots s "
+                "    JOIN ("
+                "        SELECT market_id, asof_ts, MIN(id) AS keep_id "
+                "        FROM kalshi_edge_snapshots "
+                "        GROUP BY market_id, asof_ts "
+                "        HAVING COUNT(*) > 1"
+                "    ) d "
+                "      ON s.market_id = d.market_id "
+                "     AND s.asof_ts = d.asof_ts "
+                "    WHERE s.id <> d.keep_id"
+                ");"
+            )
+            statements.append(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "idx_kalshi_edge_snapshots_unique_market_asof "
+                "ON kalshi_edge_snapshots(market_id, asof_ts);"
+            )
+        if not has_score_table:
+            statements.append(
+                "CREATE TABLE IF NOT EXISTS kalshi_edge_snapshot_scores ("
+                "    asof_ts INTEGER NOT NULL,"
+                "    market_id TEXT NOT NULL,"
+                "    settled_ts INTEGER,"
+                "    outcome INTEGER,"
+                "    pnl_take_yes REAL,"
+                "    pnl_take_no REAL,"
+                "    brier REAL,"
+                "    logloss REAL,"
+                "    error TEXT,"
+                "    created_ts INTEGER NOT NULL,"
+                "    PRIMARY KEY (market_id, asof_ts),"
+                "    FOREIGN KEY (market_id, asof_ts)"
+                "        REFERENCES kalshi_edge_snapshots(market_id, asof_ts)"
+                ");"
+            )
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS idx_kalshi_edge_snapshot_scores_settled_ts "
+            "ON kalshi_edge_snapshot_scores(settled_ts);"
+        )
+        statements.append(
+            "CREATE INDEX IF NOT EXISTS idx_kalshi_edge_snapshot_scores_created_ts "
+            "ON kalshi_edge_snapshot_scores(created_ts);"
+        )
+        statements.append("COMMIT;")
+        return "\n".join(statements)
     if version == 15:
         contract_cols = await _get_table_columns(conn, "kalshi_contracts")
         if "raw_json" in contract_cols:
@@ -156,6 +237,10 @@ async def _migration_sql_for_version(
         rows = await cursor.fetchall()
         index_names = {row[1] for row in rows}
         if "idx_opportunities_unique" in index_names:
+            return "BEGIN; COMMIT;"
+        return sql
+    if version == 17:
+        if await _has_snapshot_unique_market_asof_index(conn):
             return "BEGIN; COMMIT;"
         return sql
     return sql

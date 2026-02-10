@@ -143,6 +143,78 @@ def test_score_snapshot_integration(tmp_path):
     asyncio.run(_run())
 
 
+def test_score_insert_with_foreign_keys_on_fresh_db(tmp_path):
+    db_path = tmp_path / "fk_scores.sqlite"
+
+    async def _run() -> None:
+        await init_db(db_path)
+        now = int(time.time())
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.execute("PRAGMA foreign_keys = ON;")
+            await conn.execute(
+                "INSERT INTO kalshi_markets (market_id, ts_loaded, status, raw_json) "
+                "VALUES (?, ?, ?, ?)",
+                ("KXBTC-FK", now, "active", "{}"),
+            )
+            await conn.execute(
+                "INSERT INTO kalshi_edge_snapshots (asof_ts, market_id, settlement_ts, spot_ts, spot_price, sigma_annualized, "
+                "prob_yes, prob_yes_raw, horizon_seconds, quote_ts, yes_bid, yes_ask, no_bid, no_ask, "
+                "yes_mid, no_mid, ev_take_yes, ev_take_no, spot_age_seconds, quote_age_seconds, skip_reason, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    now,
+                    "KXBTC-FK",
+                    now + 300,
+                    now,
+                    30000.0,
+                    0.5,
+                    0.55,
+                    0.5501,
+                    300,
+                    now,
+                    45.0,
+                    55.0,
+                    45.0,
+                    55.0,
+                    50.0,
+                    50.0,
+                    0.0,
+                    0.0,
+                    0,
+                    0,
+                    None,
+                    "{}",
+                ),
+            )
+            await conn.commit()
+
+            dao = Dao(conn)
+            await dao.insert_kalshi_edge_snapshot_score(
+                {
+                    "asof_ts": now,
+                    "market_id": "KXBTC-FK",
+                    "settled_ts": now + 301,
+                    "outcome": 1,
+                    "pnl_take_yes": 0.45,
+                    "pnl_take_no": -0.55,
+                    "brier": 0.2025,
+                    "logloss": 0.5978,
+                    "error": None,
+                    "created_ts": now + 302,
+                }
+            )
+            await conn.commit()
+
+            row = await (
+                await conn.execute(
+                    "SELECT market_id, asof_ts FROM kalshi_edge_snapshot_scores"
+                )
+            ).fetchone()
+            assert row == ("KXBTC-FK", now)
+
+    asyncio.run(_run())
+
+
 def test_get_unscored_excludes_scored(tmp_path):
     db_path = tmp_path / "unscored.sqlite"
 
