@@ -251,6 +251,15 @@ async def run_tick(
                         "sigma_source": summary.get("sigma_source"),
                         "sigma_ok": summary.get("sigma_ok"),
                         "sigma_reason": summary.get("sigma_reason"),
+                        "sigma_reason_context": summary.get("sigma_reason_context"),
+                        "sigma_points_used": summary.get("sigma_points_used"),
+                        "min_sigma_points": summary.get("min_sigma_points"),
+                        "sigma_lookback_seconds_used": summary.get(
+                            "sigma_lookback_seconds_used"
+                        ),
+                        "min_sigma_lookback_seconds": summary.get(
+                            "min_sigma_lookback_seconds"
+                        ),
                     }
                 )
                 snapshot_rows.append(
@@ -300,6 +309,7 @@ def _print_debug(summary: dict[str, Any], show_titles: bool) -> None:
     print(
         "sigma_source={sigma_source} sigma_ok={sigma_ok} "
         "sigma_quality={sigma_quality} sigma_reason={sigma_reason} "
+        "sigma_reason_context={sigma_reason_context} "
         "sigma_points_used={sigma_points_used} "
         "sigma_lookback_seconds_used={sigma_lookback_seconds_used} "
         "resample_seconds={resample_seconds} step_seconds={step_seconds}".format(

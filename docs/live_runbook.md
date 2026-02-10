@@ -28,23 +28,35 @@ No order execution is performed.
 ## Start Command
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/run_live_stack.py
+./scripts/live_stack.sh
 ```
 
-Common flags:
+`scripts/live_stack.sh` uses these defaults:
+- `--status active`
+- `--edge-interval-seconds 10`
+- `--opportunity-interval-seconds 10`
+- `--settlements-every-minutes 360`
+- `--scoring-every-minutes 60`
+- `--report-every-minutes 60`
+
+Override defaults by passing extra flags:
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/run_live_stack.py \
-  --status active \
-  --series KXBTC --series KXBTC15M \
-  --edge-interval-seconds 10 \
-  --opportunity-interval-seconds 10 \
+./scripts/live_stack.sh \
   --settlements-every-minutes 10 \
-  --scoring-every-minutes 10 \
-  --report-every-minutes 60
+  --scoring-every-minutes 10
 ```
 
 Stop with `Ctrl+C` (the orchestrator terminates all child processes).
+
+Decision log (trader tape):
+- Default path: `logs/trader_tape.log`
+- Includes: tick summary, all `TAKE` lines, compact `PASS_SUMMARY`, and a few `PASS_SAMPLE` lines.
+- Tune verbosity in `scripts/run_opportunity_loop.py` flags:
+  - `--decision-pass-reason-limit`
+  - `--decision-pass-sample-limit`
+  - `--decision-log-path`
+  - `--disable-decision-log`
 
 ## Minimum Viable Live Test Checklist
 

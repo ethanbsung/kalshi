@@ -279,6 +279,44 @@ def _estimate_step_seconds(timestamps: list[int]) -> float | None:
     return float(mid)
 
 
+def _sigma_reason_context(
+    sigma_reason: str | None,
+    *,
+    history_span_seconds: int,
+    min_sigma_lookback_seconds: int,
+    sigma_points_used: int,
+    min_points: int,
+    sigma_raw: float | None,
+    sigma_max: float,
+    step_seconds: float,
+) -> str | None:
+    if sigma_reason == "insufficient_history_span":
+        return (
+            f"history_span_seconds={history_span_seconds} "
+            f"< min_sigma_lookback_seconds={min_sigma_lookback_seconds}"
+        )
+    if sigma_reason == "insufficient_points":
+        return (
+            f"sigma_points_used={sigma_points_used} "
+            f"< min_points={min_points}"
+        )
+    if sigma_reason == "out_of_bounds":
+        return f"sigma_unclamped={sigma_raw} > sigma_max={sigma_max}"
+    if sigma_reason == "nonfinite_sigma":
+        return f"sigma_unclamped={sigma_raw} is not finite"
+    if sigma_reason == "nonpositive_sigma":
+        return f"sigma_unclamped={sigma_raw} <= 0"
+    if sigma_reason == "sigma_ewma_missing":
+        return "ewma_volatility returned no estimate"
+    if sigma_reason == "bad_step_seconds":
+        return f"step_seconds={step_seconds} outside [1, 3600]"
+    if sigma_reason == "missing_step":
+        return "resample step is missing or invalid"
+    if sigma_reason == "sigma_missing":
+        return "sigma estimate unexpectedly missing"
+    return None
+
+
 async def _load_contracts(
     conn: aiosqlite.Connection, market_ids: list[str]
 ) -> dict[str, dict[str, Any]]:
@@ -582,14 +620,30 @@ async def _compute_and_store_sigma(
                 },
             )
     else:
+        sigma_reason_context = _sigma_reason_context(
+            sigma_reason,
+            history_span_seconds=history_span_seconds,
+            min_sigma_lookback_seconds=min_sigma_lookback_seconds,
+            sigma_points_used=sigma_points_used,
+            min_points=min_points,
+            sigma_raw=sigma_raw,
+            sigma_max=sigma_max,
+            step_seconds=step_seconds,
+        )
         logger.warning(
-            "sigma_compute_failed",
+            "sigma_compute_failed reason=%s context=%s",
+            sigma_reason,
+            sigma_reason_context,
             extra={
                 "product_id": product_id,
                 "sigma_reason": sigma_reason,
+                "sigma_reason_context": sigma_reason_context,
                 "raw_points": raw_points,
                 "resampled_points": resampled_points,
                 "history_span_seconds": history_span_seconds,
+                "sigma_points_used": sigma_points_used,
+                "min_points": min_points,
+                "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
             },
         )
         sigma_fallback = await _load_sigma_fallback(conn, product_id)
@@ -598,14 +652,20 @@ async def _compute_and_store_sigma(
             sigma_source = "history"
             sigma_ok = False
             logger.warning(
-                "sigma_fallback_used",
+                "sigma_fallback_used reason=%s context=%s",
+                sigma_reason,
+                sigma_reason_context,
                 extra={
                     "product_id": product_id,
                     "sigma_reason": sigma_reason,
+                    "sigma_reason_context": sigma_reason_context,
                     "sigma_fallback": sigma_fallback,
                     "raw_points": raw_points,
                     "resampled_points": resampled_points,
                     "history_span_seconds": history_span_seconds,
+                    "sigma_points_used": sigma_points_used,
+                    "min_points": min_points,
+                    "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
                 },
             )
             sigma_persisted = False
@@ -614,17 +674,27 @@ async def _compute_and_store_sigma(
             sigma_source = "default"
             sigma_ok = False
             logger.warning(
-                "sigma_default_used",
+                "sigma_default_used reason=%s context=%s",
+                sigma_reason,
+                sigma_reason_context,
                 extra={
                     "product_id": product_id,
                     "sigma_reason": sigma_reason,
+                    "sigma_reason_context": sigma_reason_context,
                     "sigma_default": sigma_default,
                     "raw_points": raw_points,
                     "resampled_points": resampled_points,
                     "history_span_seconds": history_span_seconds,
+                    "sigma_points_used": sigma_points_used,
+                    "min_points": min_points,
+                    "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
+                    "fallback_history_found": False,
                 },
             )
             sigma_persisted = False
+
+    if sigma_reason is None:
+        sigma_reason_context = None
 
     if sigma_reason is None:
         sigma_quality = "ok"
@@ -639,6 +709,7 @@ async def _compute_and_store_sigma(
         "sigma_source": sigma_source,
         "sigma_ok": sigma_ok,
         "sigma_reason": sigma_reason,
+        "sigma_reason_context": sigma_reason_context,
         "sigma_quality": sigma_quality,
         "sigma_points_used": sigma_points_used,
         "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
@@ -713,6 +784,7 @@ async def compute_edges(
     sigma_ok = sigma_state["sigma_ok"]
     sigma_reason = sigma_state["sigma_reason"]
     sigma_quality = sigma_state["sigma_quality"]
+    sigma_reason_context = sigma_state["sigma_reason_context"]
     sigma_points_used = sigma_state["sigma_points_used"]
     sigma_lookback_seconds_used = sigma_state["sigma_lookback_seconds_used"]
     sigma_persisted = sigma_state["sigma_persisted"]
@@ -1040,10 +1112,12 @@ async def compute_edges(
         "sigma_source": sigma_source,
         "sigma_ok": sigma_ok,
         "sigma_reason": sigma_reason,
+        "sigma_reason_context": sigma_reason_context,
         "sigma_quality": sigma_quality,
         "sigma_points_used": sigma_points_used,
         "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
         "sigma_persisted": sigma_persisted,
+        "min_sigma_points": min_points,
         "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
         "resample_seconds": resample_seconds,
         "raw_points": raw_points,

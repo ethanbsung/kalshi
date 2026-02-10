@@ -39,3 +39,5 @@ htmlcov/
 *.pfx
 *.crt
 *.der
+.vscode/
+.idea/

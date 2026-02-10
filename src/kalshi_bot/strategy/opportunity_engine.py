@@ -42,6 +42,37 @@ def _spread(
     return ask - bid
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_meta(snapshot: dict[str, Any]) -> dict[str, Any]:
+    raw = snapshot.get("raw_json")
+    if not isinstance(raw, str) or not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _add_reason(
+    reasons: list[str], counters: dict[str, int], reason: str
+) -> None:
+    if reason in reasons:
+        return
+    reasons.append(reason)
+    counters[reason] = counters.get(reason, 0) + 1
+
+
 def build_opportunities_from_snapshots(
     snapshots: list[dict[str, Any]],
     config: OpportunityConfig,
@@ -55,6 +86,9 @@ def build_opportunities_from_snapshots(
         "missing_prob": 0,
         "spot_stale": 0,
         "quote_stale": 0,
+        "sigma_not_ready": 0,
+        "sigma_points_short": 0,
+        "sigma_history_short": 0,
         "missing_yes_ask": 0,
         "missing_no_ask": 0,
         "ev_below_threshold": 0,
@@ -76,25 +110,53 @@ def build_opportunities_from_snapshots(
         no_ask = snap.get("no_ask")
         spot_age = snap.get("spot_age_seconds")
         quote_age = snap.get("quote_age_seconds")
+        snapshot_meta = _snapshot_meta(snap)
+        sigma_source = snapshot_meta.get("sigma_source")
+        sigma_ok = snapshot_meta.get("sigma_ok")
+        sigma_reason = snapshot_meta.get("sigma_reason")
+        sigma_reason_context = snapshot_meta.get("sigma_reason_context")
+        sigma_points_used = _safe_int(snapshot_meta.get("sigma_points_used"))
+        min_sigma_points = _safe_int(snapshot_meta.get("min_sigma_points"))
+        sigma_lookback_seconds_used = _safe_int(
+            snapshot_meta.get("sigma_lookback_seconds_used")
+        )
+        min_sigma_lookback_seconds = _safe_int(
+            snapshot_meta.get("min_sigma_lookback_seconds")
+        )
 
         global_reasons: list[str] = []
         if prob_yes is None:
-            global_reasons.append("missing_prob")
-            counters["missing_prob"] += 1
-        if (
-            config.max_spot_age is not None
-            and spot_age is not None
-            and spot_age > config.max_spot_age
+            _add_reason(global_reasons, counters, "missing_prob")
+        if config.max_spot_age is not None and (
+            spot_age is None or spot_age > config.max_spot_age
         ):
-            global_reasons.append("spot_stale")
-            counters["spot_stale"] += 1
-        if (
-            config.max_quote_age is not None
-            and quote_age is not None
-            and quote_age > config.max_quote_age
+            _add_reason(global_reasons, counters, "spot_stale")
+        if config.max_quote_age is not None and (
+            quote_age is None or quote_age > config.max_quote_age
         ):
-            global_reasons.append("quote_stale")
-            counters["quote_stale"] += 1
+            _add_reason(global_reasons, counters, "quote_stale")
+
+        # Gate TAKES unless sigma was actually computed from ready data.
+        sigma_meta_present = (
+            sigma_ok is not None
+            or sigma_source is not None
+            or sigma_reason is not None
+        )
+        if sigma_meta_present:
+            if sigma_ok is not True:
+                _add_reason(global_reasons, counters, "sigma_not_ready")
+            if (
+                sigma_points_used is not None
+                and min_sigma_points is not None
+                and sigma_points_used < min_sigma_points
+            ):
+                _add_reason(global_reasons, counters, "sigma_points_short")
+            if (
+                sigma_lookback_seconds_used is not None
+                and min_sigma_lookback_seconds is not None
+                and sigma_lookback_seconds_used < min_sigma_lookback_seconds
+            ):
+                _add_reason(global_reasons, counters, "sigma_history_short")
 
         def build_row(
             *,
@@ -135,6 +197,14 @@ def build_opportunities_from_snapshots(
                 "price_used_cents": ask,
                 "prob_yes": prob_yes,
                 "prob_yes_raw": snap.get("prob_yes_raw"),
+                "sigma_source": sigma_source,
+                "sigma_ok": sigma_ok,
+                "sigma_reason": sigma_reason,
+                "sigma_reason_context": sigma_reason_context,
+                "sigma_points_used": sigma_points_used,
+                "min_sigma_points": min_sigma_points,
+                "sigma_lookback_seconds_used": sigma_lookback_seconds_used,
+                "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
                 "decision": decision,
                 "decision_reason": reason,
                 "model_version": config.model_version,
