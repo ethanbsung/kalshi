@@ -18,7 +18,7 @@ exec "$PYTHON_BIN" "$ROOT_DIR/scripts/run_live_stack.py" \
   --status active \
   --edge-interval-seconds 10 \
   --opportunity-interval-seconds 10 \
-  --settlements-every-minutes 360 \
+  --settlements-every-minutes 5 \
   --scoring-every-minutes 60 \
   --report-every-minutes 60 \
   "$@"

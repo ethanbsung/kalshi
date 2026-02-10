@@ -1,44 +1,66 @@
-# Kalshi BTC Market Data and Edge Analytics
+# Kalshi BTC Shadow Trading System
 
-A Python 3.11 system that ingests Coinbase BTC-USD spot data and Kalshi market data, computes model-based probabilities and expected value (EV) for BTC threshold contracts, and stores everything in SQLite for analysis. The execution and trading layer is intentionally not implemented yet.
+Python 3.11 event-driven system for ingesting Coinbase + Kalshi data, computing model probabilities and fee-aware expected value, and tracking shadow positions end-to-end in SQLite.
 
-## Project status
+This repo is focused on **research + shadow execution**, not live order placement.
 
-### Implemented
-- Async ingestion from Coinbase WebSocket ticker and Kalshi REST/WS market data.
-- SQLite schema + migrations with structured JSONL logging.
-- Edge engine using GBM (zero drift), EWMA volatility, and fee-aware EV.
-- Edge snapshots, opportunity ledger, and scoring (Brier/logloss, realized PnL).
-- Offline test suite with mock WebSocket inputs and schema checks.
+## What This Project Does
 
-### Not implemented
-- Live or paper order placement (entrypoints are placeholders).
-- Portfolio and risk management (placeholders).
-- Production deployment or monitoring.
+- Streams Coinbase BTC spot data and polls Kalshi quotes.
+- Refreshes Kalshi BTC market/contract metadata across series (`KXBTC`, `KXBTC15M`, `KXBTCD`).
+- Computes probabilities via GBM-style pricing with EWMA volatility.
+- Produces fee-aware TAKE/PASS decisions with explicit gating and reasons.
+- Tracks hypothetical positions, open/unrealized PnL, settled/realized PnL.
+- Scores model quality vs outcomes and compares to market-implied baseline.
 
-## Highlights
-- Clear separation of ingestion, analytics, and execution layers.
-- Deterministic, DB-first pipeline with explicit skip reasons and data-quality checks.
-- Market selection filters by time horizon, strike bounds, and quote freshness.
-- Calibration tooling via snapshot scoring and performance reports.
+## Employer-Relevant Engineering Highlights
 
-## Architecture at a glance
+- Async pipeline with clear stage boundaries (`ingestion -> edges -> opportunities -> settlements -> scoring -> reporting`).
+- Deterministic DB-first architecture (SQLite + migrations + idempotent upserts).
+- Operational hardening for long-running loops:
+  - WAL mode / busy timeouts
+  - retry for transient SQLite lock contention
+  - component restarts in live stack runner
+- Observability:
+  - structured JSON app logs
+  - trader-style decision tape (`TAKE` and abnormal `PASS` reasons)
+  - health snapshots and performance reports
+- Evaluation rigor:
+  - fee-aware decision EV
+  - settled-outcome scoring
+  - model-vs-market Brier/logloss deltas
+  - shadow ledger for realistic paper-trading feedback loops
 
-Coinbase WS + Kalshi REST/WS
--> ingestion
--> SQLite (spot_ticks, quotes, contracts, edges, snapshots, opportunities)
--> edge engine
--> snapshots and scoring
--> reporting
+## Current Scope
 
-## Repository layout
-- `src/kalshi_bot/app`: collector entrypoints (`collector.py`), live/paper placeholders.
-- `src/kalshi_bot/feeds`: Coinbase and Kalshi clients (REST + WS).
-- `src/kalshi_bot/strategy`: edge math, snapshots, and opportunity selection.
-- `src/kalshi_bot/data`: SQLite schema, migrations, and DAOs.
-- `scripts/`: batch jobs and continuous loops.
-- `tests/`: offline pytest suite.
-- `docs/`: design notes and validation rules.
+Implemented:
+- Data ingestion and market metadata refresh.
+- Edge/snapshot/opportunity generation.
+- Shadow position tracking and reporting.
+- Settlements integration and scored outcomes.
+- Offline test suite and migration checks.
+
+Not implemented:
+- Live order routing / broker execution.
+- Full portfolio optimizer and production orchestration stack.
+
+## Architecture
+
+Coinbase WS + Kalshi REST
+-> `spot_ticks` + `kalshi_quotes` + contracts/markets
+-> edge engine (`kalshi_edges`, `kalshi_edge_snapshots`)
+-> opportunity engine (`opportunities`)
+-> settlements + scoring (`kalshi_contracts`, `kalshi_edge_snapshot_scores`)
+-> trader/performance reports
+
+## Repo Layout
+
+- `src/kalshi_bot/strategy`: edge math, volatility, opportunity logic, scoring.
+- `src/kalshi_bot/kalshi`: Kalshi REST/WS clients + parsing/health utilities.
+- `src/kalshi_bot/data`: schema, migrations, DAOs.
+- `src/kalshi_bot/app`: orchestrators and health reporting.
+- `scripts/`: operational entrypoints (live stack, refresh, scoring, reports).
+- `tests/`: offline pytest coverage.
 
 ## Quickstart
 
@@ -49,69 +71,60 @@ pip install -U pip
 pip install -e ".[dev]"
 ```
 
-## Typical pipeline
+## Run The Stack
 
-Ingest spot + market data:
-```bash
-python -m kalshi_bot.app.collector --coinbase --seconds 30
-python -m kalshi_bot.app.collector --kalshi --seconds 60 --debug
-```
-
-Refresh markets and contracts, then poll quotes:
-```bash
-python3 scripts/refresh_btc_markets.py
-python3 scripts/refresh_kalshi_contracts.py --status active
-python3 scripts/poll_kalshi_quotes.py --seconds 60 --interval 5 --status active
-```
-
-Compute edges and snapshots:
-```bash
-python3 scripts/compute_kalshi_edges.py --debug
-python3 scripts/run_live_edges.py --interval-seconds 10
-```
-
-Build opportunities and score snapshots:
-```bash
-python3 scripts/run_opportunity_loop.py --interval-seconds 10
-python3 scripts/refresh_kalshi_settlements.py --status resolved
-python3 scripts/score_edge_snapshots.py
-python3 scripts/report_model_performance.py
-```
-
-## Configuration
-
-Core:
-- `DB_PATH` (default `./data/kalshi.sqlite`)
-- `LOG_PATH` (default `./logs/app.jsonl`)
-- `TRADING_ENABLED` (unused; trading not implemented)
-
-Kalshi:
-- `KALSHI_ENV` = `demo` or `prod`
-- `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`
-- `KALSHI_REST_URL`, `KALSHI_WS_URL`
-- `KALSHI_MARKET_TICKERS` (comma-separated override for WS subscriptions)
-- `KALSHI_EVENT_TICKER`, `KALSHI_SERIES_TICKER` (REST filters)
-
-Coinbase:
-- `COINBASE_WS_URL` (default `wss://advanced-trade-ws.coinbase.com`)
-- `COINBASE_PRODUCT_ID` (default `BTC-USD`)
-- `COINBASE_STALE_SECONDS`, `COLLECTOR_SECONDS`
-
-Defaults target BTC series markets (`KXBTC`, `KXBTC15M`) but are configurable via script flags and environment variables.
-
-## Data conventions
-- Kalshi prices are stored in cents (0-100); EV is stored in dollars.
-- Horizon uses `close_ts` and falls back to `expected_expiration_ts` then `settlement_ts` when needed.
-
-## Testing
+Recommended single-command runner:
 
 ```bash
-pytest
+./scripts/live_stack.sh
 ```
+
+This starts:
+- Coinbase collector
+- Kalshi quote poller
+- edge loop
+- opportunity loop
+- periodic settlements/scoring/performance reporting
+
+## Core Reports
+
+Open + settled shadow positions:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/report_open_shadow_positions.py
+```
+
+Model performance (including model-vs-market baseline):
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/report_model_performance.py --since-seconds 86400
+```
+
+## Configuration Notes
+
+Key env vars:
+- `DB_PATH`, `LOG_PATH`
+- `KALSHI_ENV`, `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`
+- `COINBASE_PRODUCT_ID`, `COINBASE_STALE_SECONDS`
+
+Important runtime defaults (current):
+- `run_live_stack.py --quote-seconds 900` (reloads quote universe every 15m)
+- `run_live_stack.py --settlements-every-minutes 5`
+- `run_live_edges.py --lookback-seconds 3900`
+- `run_live_edges.py --max-horizon-seconds 21600` (6h)
+- `run_opportunity_loop.py --min-ev 0.03`
+
+## Data Conventions
+
+- Contract prices are cents (`0..100`).
+- Probabilities are `0..1`.
+- EV and PnL are dollars per contract (fee-aware on entry for shadow realized).
+- Horizons are based on `close_ts` (fallbacks: `expected_expiration_ts`, `settlement_ts`).
 
 ## Docs
-- `EDGE_VALIDATION.md` describes how edge quality is evaluated.
-- `KALSHI_API_CONTRACT.md` documents the API contract and parsing rules.
+
+- `EDGE_VALIDATION.md`
+- `KALSHI_API_CONTRACT.md`
 
 ## License
 

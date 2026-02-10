@@ -67,14 +67,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--component-debug", action="store_true")
 
     parser.add_argument("--coinbase-seconds", type=int, default=86400)
-    parser.add_argument("--quote-seconds", type=int, default=86400)
+    parser.add_argument("--quote-seconds", type=int, default=900)
     parser.add_argument("--quote-interval", type=float, default=5.0)
     parser.add_argument("--quote-concurrency", type=int, default=5)
     parser.add_argument("--edge-interval-seconds", type=int, default=10)
     parser.add_argument("--max-horizon-seconds", type=int, default=6 * 3600)
     parser.add_argument("--opportunity-interval-seconds", type=int, default=10)
 
-    parser.add_argument("--settlements-every-minutes", type=int, default=10)
+    parser.add_argument("--settlements-every-minutes", type=int, default=5)
     parser.add_argument("--settlements-since-seconds", type=int, default=14 * 24 * 3600)
     parser.add_argument("--scoring-every-minutes", type=int, default=10)
     parser.add_argument("--scoring-limit", type=int, default=2000)

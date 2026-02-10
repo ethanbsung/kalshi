@@ -223,11 +223,16 @@ class Dao:
         self._validate_columns("kalshi_contracts", self.KALSHI_CONTRACT_COLUMNS, row)
         columns = ", ".join(row.keys())
         placeholders = ", ".join("?" for _ in row)
-        updates = ", ".join(
-            f"{col}=excluded.{col}"
-            for col in row.keys()
-            if col != "ticker"
-        )
+        updates_parts: list[str] = []
+        for col in row.keys():
+            if col == "ticker":
+                continue
+            # Preserve settled outcome fields when refresh payloads provide NULL.
+            if col in {"outcome", "settled_ts"}:
+                updates_parts.append(f"{col}=COALESCE(excluded.{col}, {col})")
+            else:
+                updates_parts.append(f"{col}=excluded.{col}")
+        updates = ", ".join(updates_parts)
         sql = (
             f"INSERT INTO kalshi_contracts ({columns}) VALUES ({placeholders}) "
             f"ON CONFLICT(ticker) DO UPDATE SET {updates}"

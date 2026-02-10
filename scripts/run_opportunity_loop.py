@@ -21,6 +21,22 @@ from kalshi_bot.strategy.opportunity_engine import (
     build_opportunities_from_snapshots,
 )
 
+NOISY_PASS_REASONS = {
+    "ev_below_threshold",
+    "quote_stale",
+    "spot_stale",
+    "missing_yes_ask",
+    "missing_no_ask",
+    "position_open",
+    "cooldown_active",
+    "take_cap",
+    "top_n_cutoff",
+}
+
+QUIET_TICK_HEARTBEAT_SECONDS = 60
+_LAST_HEARTBEAT_LOG_TS: int | None = None
+_LAST_LOGGED_ASOF_TS: int | None = None
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -48,13 +64,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--decision-pass-reason-limit",
         type=int,
-        default=6,
+        default=2,
         help="Maximum number of PASS reasons to print per tick.",
     )
     parser.add_argument(
         "--decision-pass-sample-limit",
         type=int,
-        default=3,
+        default=1,
         help="Maximum number of PASS sample lines to print per tick.",
     )
     parser.add_argument(
@@ -196,6 +212,16 @@ def _count_pass_reasons(pass_rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(counts)
 
 
+def _is_abnormal_pass_reason(reason: str) -> bool:
+    return reason not in NOISY_PASS_REASONS
+
+
+def _abnormal_pass_rows(pass_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        row for row in pass_rows if _is_abnormal_pass_reason(_decision_reason(row))
+    ]
+
+
 def _as_pass_row(row: dict[str, Any], reason: str) -> dict[str, Any]:
     updated = dict(row)
     updated["eligible"] = 0
@@ -317,25 +343,44 @@ def _write_decision_log(
     pass_reason_limit: int,
     pass_sample_limit: int,
 ) -> None:
+    global _LAST_HEARTBEAT_LOG_TS, _LAST_LOGGED_ASOF_TS
+
     asof_ts = int(summary["asof_ts"])
     take_rows = list(summary.get("take_rows") or [])
     pass_rows = list(summary.get("pass_rows") or [])
-    reason_counts = _count_pass_reasons(pass_rows)
+    abnormal_pass_rows = _abnormal_pass_rows(pass_rows)
+    reason_counts = _count_pass_reasons(abnormal_pass_rows)
     top_reasons = sorted(reason_counts.items(), key=lambda kv: (-kv[1], kv[0]))[
         : max(pass_reason_limit, 0)
     ]
-    pass_samples = _select_pass_samples(pass_rows, reason_counts, pass_sample_limit)
+    pass_samples = _select_pass_samples(
+        abnormal_pass_rows, reason_counts, pass_sample_limit
+    )
 
     take_rows.sort(key=lambda r: float(r.get("ev_raw") or -1e9), reverse=True)
 
+    should_write_tick = True
+    if int(summary.get("takes") or 0) == 0:
+        if _LAST_LOGGED_ASOF_TS == asof_ts:
+            should_write_tick = False
+        elif (
+            _LAST_HEARTBEAT_LOG_TS is not None
+            and (asof_ts - _LAST_HEARTBEAT_LOG_TS) < QUIET_TICK_HEARTBEAT_SECONDS
+        ):
+            should_write_tick = False
+
     with path.open("a", encoding="utf-8") as f:
-        f.write(
-            f"{_fmt_ts(asof_ts)} TICK "
-            f"asof_ts={asof_ts} snapshots={summary['snapshots']} "
-            f"takes={summary['takes']} passes={summary['passes']} "
-            f"inserted={summary['inserted']} open_positions={summary['open_positions']} "
-            f"min_ev={_fmt_num(min_ev, 4)}\n"
-        )
+        if should_write_tick:
+            f.write(
+                f"{_fmt_ts(asof_ts)} TICK "
+                f"asof_ts={asof_ts} snapshots={summary['snapshots']} "
+                f"takes={summary['takes']} passes={summary['passes']} "
+                f"inserted={summary['inserted']} open_positions={summary['open_positions']} "
+                f"min_ev={_fmt_num(min_ev, 4)}\n"
+            )
+            _LAST_LOGGED_ASOF_TS = asof_ts
+            if int(summary.get("takes") or 0) == 0:
+                _LAST_HEARTBEAT_LOG_TS = asof_ts
 
         if top_reasons:
             reasons_blob = " ".join(f"{reason}={count}" for reason, count in top_reasons)

@@ -85,8 +85,13 @@ async def compute_report(
     cursor = await conn.execute(
         """
         SELECT o.ts_eval, o.market_id, o.side, o.p_model, o.p_market,
-               o.best_yes_ask, o.best_no_ask, o.raw_json, s.outcome, s.settled_ts
+               o.best_yes_ask, o.best_no_ask, o.raw_json,
+               c.outcome AS outcome,
+               COALESCE(c.settled_ts, o.settlement_ts) AS settled_ts,
+               CASE WHEN s.market_id IS NULL THEN 0 ELSE 1 END AS has_snapshot_score
         FROM opportunities o
+        LEFT JOIN kalshi_contracts c
+          ON c.ticker = o.market_id
         LEFT JOIN kalshi_edge_snapshot_scores s
           ON s.market_id = o.market_id AND s.asof_ts = o.ts_eval
         WHERE o.would_trade = 1 AND o.ts_eval >= ?
@@ -105,6 +110,8 @@ async def compute_report(
     market_brier_total = 0.0
     market_logloss_total = 0.0
     market_score_count = 0
+    snapshot_score_matches_total = 0
+    snapshot_score_matches_settled = 0
 
     by_day: dict[str, dict[str, float]] = {}
     buckets: dict[str, dict[str, float]] = {}
@@ -120,14 +127,24 @@ async def compute_report(
         raw_json,
         outcome,
         settled_ts,
+        has_snapshot_score,
     ) in rows:
+        if int(has_snapshot_score or 0) == 1:
+            snapshot_score_matches_total += 1
         if outcome is None:
             continue
         settled += 1
+        if int(has_snapshot_score or 0) == 1:
+            snapshot_score_matches_settled += 1
         try:
             outcome_val = int(outcome)
         except (TypeError, ValueError):
             continue
+        trade_win: int | None = None
+        if side == "YES":
+            trade_win = outcome_val
+        elif side == "NO":
+            trade_win = 1 - outcome_val
         model_brier, model_logloss = _score_prob(_safe_float(p_model), outcome_val)
         if model_brier is not None and model_logloss is not None:
             model_brier_total += model_brier
@@ -172,14 +189,17 @@ async def compute_report(
         bucket = None
         if p_model is not None:
             try:
-                prob_val = float(p_model)
+                model_prob_yes = float(p_model)
+                prob_val = model_prob_yes
+                if side == "NO":
+                    prob_val = 1.0 - model_prob_yes
                 bucket = _bucket(prob_val)
                 info = buckets.setdefault(
                     bucket, {"count": 0, "prob_sum": 0.0, "wins": 0}
                 )
                 info["count"] += 1
                 info["prob_sum"] += prob_val
-                info["wins"] += outcome_val
+                info["wins"] += int(trade_win or 0)
             except (TypeError, ValueError):
                 bucket = None
 
@@ -188,7 +208,7 @@ async def compute_report(
         )
         day_info["count"] += 1
         day_info["pnl"] += _realized_pnl(outcome_val, side, price_used or 0.0)
-        day_info["wins"] += outcome_val
+        day_info["wins"] += int(trade_win or 0)
 
     unsettled = total - settled
     avg_model_brier = (
@@ -213,6 +233,12 @@ async def compute_report(
         if avg_model_logloss is not None and avg_market_logloss is not None
         else None
     )
+    snapshot_score_coverage_total = (
+        snapshot_score_matches_total / total if total > 0 else None
+    )
+    snapshot_score_coverage_settled = (
+        snapshot_score_matches_settled / settled if settled > 0 else None
+    )
 
     return {
         "total": total,
@@ -226,6 +252,10 @@ async def compute_report(
         "delta_logloss": delta_logloss,
         "model_scored": model_score_count,
         "market_scored": market_score_count,
+        "snapshot_score_matches_total": snapshot_score_matches_total,
+        "snapshot_score_matches_settled": snapshot_score_matches_settled,
+        "snapshot_score_coverage_total": snapshot_score_coverage_total,
+        "snapshot_score_coverage_settled": snapshot_score_coverage_settled,
         # Backward compatible aliases.
         "avg_brier": avg_model_brier,
         "avg_logloss": avg_model_logloss,
@@ -278,6 +308,25 @@ async def _run() -> int:
             dbrier=f"{delta_brier:.6f}" if delta_brier is not None else "NA",
             dlogloss=f"{delta_logloss:.6f}" if delta_logloss is not None else "NA",
             pnl=f"{report['pnl_total']:.4f}",
+        )
+    )
+    print(
+        "snapshot_score_matches_total={matches_total} "
+        "snapshot_score_matches_settled={matches_settled} "
+        "snapshot_score_coverage_total={coverage_total} "
+        "snapshot_score_coverage_settled={coverage_settled}".format(
+            matches_total=report["snapshot_score_matches_total"],
+            matches_settled=report["snapshot_score_matches_settled"],
+            coverage_total=(
+                f"{report['snapshot_score_coverage_total']:.3f}"
+                if report["snapshot_score_coverage_total"] is not None
+                else "NA"
+            ),
+            coverage_settled=(
+                f"{report['snapshot_score_coverage_settled']:.3f}"
+                if report["snapshot_score_coverage_settled"] is not None
+                else "NA"
+            ),
         )
     )
 
