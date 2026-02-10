@@ -325,6 +325,7 @@ async def _run() -> int:
         "resolved",
         "--since-seconds",
         str(args.settlements_since_seconds),
+        *series_args,
     ]
     scoring_cmd = [
         args.python_bin,

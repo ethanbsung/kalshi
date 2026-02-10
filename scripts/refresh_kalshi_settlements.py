@@ -16,6 +16,7 @@ from kalshi_bot.data.dao import Dao
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 from kalshi_bot.kalshi.contracts import build_contract_row
+from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
 
 
 def _parse_args() -> argparse.Namespace:
@@ -40,6 +41,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=2000,
         help="Maximum number of markets to fetch.",
+    )
+    parser.add_argument(
+        "--series",
+        action="append",
+        default=list(BTC_SERIES_TICKERS),
+        help="Only process market tickers with these series prefixes.",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -344,6 +351,19 @@ async def _run() -> int:
         max_settled_ts=now_ts,
         max_total=args.limit,
     )
+    series_prefixes = tuple(
+        f"{value}-" for value in args.series if isinstance(value, str) and value
+    )
+    if series_prefixes:
+        markets = [
+            market
+            for market in markets
+            if isinstance(market, dict)
+            and isinstance(market.get("ticker") or market.get("market_id"), str)
+            and (market.get("ticker") or market.get("market_id")).startswith(
+                series_prefixes
+            )
+        ]
 
     tickers = [
         market.get("ticker") or market.get("market_id")

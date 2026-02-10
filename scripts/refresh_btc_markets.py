@@ -20,6 +20,10 @@ from kalshi_bot.kalshi.btc_markets import (
     fetch_btc_markets,
 )
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
+from kalshi_bot.kalshi.rest_client import KalshiRestError
+
+
+RETRY_DELAYS_SECONDS = [5.0, 10.0, 20.0, 30.0]
 
 
 async def _refresh_btc_markets() -> int:
@@ -41,12 +45,50 @@ async def _refresh_btc_markets() -> int:
         logger=logger,
     )
 
-    markets, per_series = await fetch_btc_markets(
-        rest_client,
-        status=settings.kalshi_market_status,
-        limit=settings.kalshi_market_limit,
-        logger=logger,
-    )
+    attempt = 0
+    while True:
+        try:
+            markets, per_series = await fetch_btc_markets(
+                rest_client,
+                status=settings.kalshi_market_status,
+                limit=settings.kalshi_market_limit,
+                logger=logger,
+            )
+            break
+        except KalshiRestError as exc:
+            if not exc.transient or attempt >= len(RETRY_DELAYS_SECONDS):
+                if exc.transient:
+                    print(
+                        "WARNING: refresh_btc_markets rate-limited repeatedly; "
+                        "skipping this run to avoid crash."
+                    )
+                    logger.warning(
+                        "kalshi_refresh_btc_markets_rate_limited_skip",
+                        extra={
+                            "status": exc.status,
+                            "body": exc.body,
+                            "attempts": attempt + 1,
+                        },
+                    )
+                    return 0
+                raise
+            delay = RETRY_DELAYS_SECONDS[attempt]
+            attempt += 1
+            print(
+                f"WARNING: refresh_btc_markets transient error "
+                f"(status={exc.status}); retrying in {delay:.0f}s "
+                f"(attempt {attempt}/{len(RETRY_DELAYS_SECONDS)})"
+            )
+            logger.warning(
+                "kalshi_refresh_btc_markets_retry",
+                extra={
+                    "status": exc.status,
+                    "body": exc.body,
+                    "attempt": attempt,
+                    "delay_seconds": delay,
+                },
+            )
+            await asyncio.sleep(delay)
 
     sample_tickers = [
         market.get("ticker") for market in markets if market.get("ticker")

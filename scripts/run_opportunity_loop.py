@@ -45,6 +45,7 @@ TAIL_MIN_EV = 0.06
 _LAST_HEARTBEAT_LOG_TS: int | None = None
 _LAST_LOGGED_ASOF_TS: int | None = None
 _LAST_PASS_SAMPLE_LOG_TS: int | None = None
+_LAST_PASS_LOG_TS: int | None = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -362,7 +363,7 @@ def _write_decision_log(
     pass_reason_limit: int,
     pass_sample_limit: int,
 ) -> None:
-    global _LAST_HEARTBEAT_LOG_TS, _LAST_LOGGED_ASOF_TS, _LAST_PASS_SAMPLE_LOG_TS
+    global _LAST_HEARTBEAT_LOG_TS, _LAST_LOGGED_ASOF_TS, _LAST_PASS_SAMPLE_LOG_TS, _LAST_PASS_LOG_TS
 
     asof_ts = int(summary["asof_ts"])
     take_rows = list(summary.get("take_rows") or [])
@@ -375,10 +376,20 @@ def _write_decision_log(
     pass_samples = _select_pass_samples(
         abnormal_pass_rows, reason_counts, pass_sample_limit
     )
+    should_emit_pass_logs = (
+        _LAST_PASS_LOG_TS is None
+        or (asof_ts - _LAST_PASS_LOG_TS) >= PASS_SAMPLE_HEARTBEAT_SECONDS
+    )
+    if not should_emit_pass_logs:
+        top_reasons = []
+        pass_samples = []
     if not pass_samples and pass_rows:
         should_emit_periodic_sample = (
+            should_emit_pass_logs
+            and (
             _LAST_PASS_SAMPLE_LOG_TS is None
             or (asof_ts - _LAST_PASS_SAMPLE_LOG_TS) >= PASS_SAMPLE_HEARTBEAT_SECONDS
+            )
         )
         if should_emit_periodic_sample:
             pass_samples = _select_pass_samples(
@@ -423,6 +434,8 @@ def _write_decision_log(
             f.write(_format_decision_line("PASS_SAMPLE", asof_ts, row) + "\n")
         if pass_samples:
             _LAST_PASS_SAMPLE_LOG_TS = asof_ts
+        if top_reasons or pass_samples:
+            _LAST_PASS_LOG_TS = asof_ts
 
 
 async def run_tick(conn: aiosqlite.Connection, args: argparse.Namespace) -> dict[str, Any]:
