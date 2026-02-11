@@ -164,6 +164,30 @@ class Dao:
     def __init__(self, conn: aiosqlite.Connection) -> None:
         self._conn = conn
 
+    async def _execute_with_retry(
+        self, sql: str, params: tuple[Any, ...], attempts: int = 10
+    ) -> aiosqlite.Cursor:
+        for attempt in range(attempts):
+            try:
+                return await self._conn.execute(sql, params)
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower() or attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(min(0.05 * (2**attempt), 1.0))
+        raise RuntimeError("unreachable")
+
+    async def _executemany_with_retry(
+        self, sql: str, values: list[tuple[Any, ...]], attempts: int = 10
+    ) -> None:
+        for attempt in range(attempts):
+            try:
+                await self._conn.executemany(sql, values)
+                return
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower() or attempt == attempts - 1:
+                    raise
+                await asyncio.sleep(min(0.05 * (2**attempt), 1.0))
+
     def _validate_columns(self, table: str, expected: tuple[str, ...], row: Mapping[str, Any]) -> None:
         missing = set(expected) - set(row.keys())
         extra = set(row.keys()) - set(expected)
@@ -176,15 +200,7 @@ class Dao:
         columns = ", ".join(row.keys())
         placeholders = ", ".join("?" for _ in row)
         sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
-        params = tuple(row.values())
-        for attempt in range(4):
-            try:
-                await self._conn.execute(sql, params)
-                return
-            except sqlite3.OperationalError as exc:
-                if "database is locked" not in str(exc).lower() or attempt == 3:
-                    raise
-                await asyncio.sleep(0.05 * (attempt + 1))
+        await self._execute_with_retry(sql, tuple(row.values()))
 
     async def insert_spot_tick(self, row: Mapping[str, Any]) -> None:
         self._validate_columns("spot_ticks", self.SPOT_TICK_COLUMNS, row)
@@ -203,7 +219,7 @@ class Dao:
             f"INSERT INTO kalshi_markets ({columns}) VALUES ({placeholders}) "
             f"ON CONFLICT(market_id) DO UPDATE SET {updates}"
         )
-        await self._conn.execute(sql, tuple(row.values()))
+        await self._execute_with_retry(sql, tuple(row.values()))
 
     async def insert_kalshi_orderbook_snapshot(self, row: Mapping[str, Any]) -> None:
         await self._insert_row("kalshi_orderbook_snapshots", row)
@@ -237,7 +253,7 @@ class Dao:
             f"INSERT INTO kalshi_contracts ({columns}) VALUES ({placeholders}) "
             f"ON CONFLICT(ticker) DO UPDATE SET {updates}"
         )
-        await self._conn.execute(sql, tuple(row.values()))
+        await self._execute_with_retry(sql, tuple(row.values()))
 
     async def update_contract_outcome(
         self,
@@ -249,7 +265,7 @@ class Dao:
         raw_json: str | None,
         force: bool = False,
     ) -> int:
-        cursor = await self._conn.execute(
+        cursor = await self._execute_with_retry(
             "UPDATE kalshi_contracts "
             "SET outcome = CASE "
             "WHEN ? IS NULL THEN outcome "
@@ -306,7 +322,7 @@ class Dao:
             "INSERT OR IGNORE INTO kalshi_edge_snapshot_scores "
             f"({columns}) VALUES ({placeholders})"
         )
-        await self._conn.execute(sql, tuple(row.values()))
+        await self._execute_with_retry(sql, tuple(row.values()))
 
     async def insert_kalshi_edge_snapshot_scores(
         self, rows: list[Mapping[str, Any]]
@@ -443,7 +459,7 @@ class Dao:
         for row in rows:
             self._validate_columns("opportunities", columns, row)
             values.append(tuple(row[col] for col in columns))
-        await self._conn.executemany(sql, values)
+        await self._executemany_with_retry(sql, values)
 
     async def insert_order(self, row: Mapping[str, Any]) -> None:
         await self._insert_row("orders", row)

@@ -14,7 +14,11 @@ from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
+from kalshi_bot.kalshi.market_filters import normalize_series
 from kalshi_bot.strategy.edge_engine import compute_edges
+
+EDGE_SUMMARY_HEARTBEAT_SECONDS = 60
+NO_RELEVANT_HEARTBEAT_SECONDS = 15 * 60
 
 
 def _parse_args() -> argparse.Namespace:
@@ -33,7 +37,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sigma-default", type=float, default=0.6)
     parser.add_argument("--sigma-max", type=float, default=5.0)
     parser.add_argument("--status", type=str, default="active")
-    parser.add_argument("--series", action="append", default=list(BTC_SERIES_TICKERS))
+    parser.add_argument("--series", action="append", default=None)
     parser.add_argument("--pct-band", type=float, default=3.0)
     parser.add_argument("--top-n", type=int, default=40)
     parser.add_argument("--freshness-seconds", type=int, default=300)
@@ -342,6 +346,11 @@ def _print_debug(summary: dict[str, Any], show_titles: bool) -> None:
 
 async def _run() -> int:
     args = _parse_args()
+    args.series = (
+        normalize_series(args.series)
+        if args.series is not None
+        else list(BTC_SERIES_TICKERS)
+    )
     settings = load_settings()
     logger = setup_logger(settings.log_path)
 
@@ -352,27 +361,67 @@ async def _run() -> int:
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA busy_timeout = 5000;")
+        await conn.execute("PRAGMA busy_timeout = 15000;")
         await conn.commit()
 
+        last_edge_log_ts: int | None = None
+        last_no_relevant_log_ts: int | None = None
+        last_no_relevant_signature: tuple[tuple[str, int], ...] | None = None
         while True:
             summary = await run_tick(conn, args)
             if "error" in summary:
-                print(f"ERROR: {summary['error']}")
-                selection = summary.get("selection", {})
-                if selection:
-                    print(f"selection_summary={selection}")
-                if summary.get("skip_reasons"):
-                    print(f"skip_reasons={summary['skip_reasons']}")
-            else:
-                print(
-                    "asof_ts={now_ts} edges_inserted={edges_inserted} "
-                    "snapshots_inserted={snapshots_inserted} "
-                    "max_spot_age_seconds={max_spot_age_seconds} "
-                    "max_quote_age_seconds={max_quote_age_seconds}".format(
-                        **summary
-                    )
+                error = str(summary.get("error") or "unknown")
+                now_ts = int(
+                    summary.get("now_ts")
+                    or (summary.get("selection") or {}).get("now_ts")
+                    or 0
                 )
+                if error == "no_relevant_markets":
+                    skip_reasons = summary.get("skip_reasons") or {}
+                    signature = tuple(sorted(skip_reasons.items()))
+                    should_log = False
+                    if last_no_relevant_log_ts is None:
+                        should_log = True
+                    elif signature != last_no_relevant_signature:
+                        should_log = True
+                    elif now_ts > 0 and (
+                        now_ts - last_no_relevant_log_ts
+                    ) >= NO_RELEVANT_HEARTBEAT_SECONDS:
+                        should_log = True
+                    if should_log:
+                        print(f"ERROR: {error}")
+                        selection = summary.get("selection", {})
+                        if selection:
+                            print(f"selection_summary={selection}")
+                        if skip_reasons:
+                            print(f"skip_reasons={skip_reasons}")
+                        last_no_relevant_log_ts = now_ts if now_ts > 0 else 0
+                        last_no_relevant_signature = signature
+                else:
+                    print(f"ERROR: {error}")
+                    selection = summary.get("selection", {})
+                    if selection:
+                        print(f"selection_summary={selection}")
+                    if summary.get("skip_reasons"):
+                        print(f"skip_reasons={summary['skip_reasons']}")
+            else:
+                now_ts = int(summary.get("now_ts") or 0)
+                should_log_summary = (
+                    last_edge_log_ts is None
+                    or now_ts <= 0
+                    or (now_ts - last_edge_log_ts) >= EDGE_SUMMARY_HEARTBEAT_SECONDS
+                )
+                if should_log_summary:
+                    print(
+                        "asof_ts={now_ts} edges_inserted={edges_inserted} "
+                        "snapshots_inserted={snapshots_inserted} "
+                        "max_spot_age_seconds={max_spot_age_seconds} "
+                        "max_quote_age_seconds={max_quote_age_seconds}".format(
+                            **summary
+                        )
+                    )
+                    if now_ts > 0:
+                        last_edge_log_ts = now_ts
                 if args.debug:
                     _print_debug(summary, args.show_titles)
             if args.once:

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import json
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -14,9 +16,12 @@ from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
 from kalshi_bot.infra.logging import setup_logger
-from kalshi_bot.kalshi.rest_client import KalshiRestClient
+from kalshi_bot.kalshi.rest_client import KalshiRestClient, KalshiRestError
 from kalshi_bot.kalshi.contracts import build_contract_row
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
+from kalshi_bot.kalshi.market_filters import normalize_series
+
+LOCK_PATH = Path("/tmp/kalshi_refresh_kalshi_settlements.lock")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -39,13 +44,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=2000,
+        default=600,
         help="Maximum number of markets to fetch.",
     )
     parser.add_argument(
         "--series",
         action="append",
-        default=list(BTC_SERIES_TICKERS),
+        default=None,
         help="Only process market tickers with these series prefixes.",
     )
     parser.add_argument("--dry-run", action="store_true")
@@ -319,6 +324,14 @@ async def _apply_updates(
 
 
 async def _run() -> int:
+    lock_file = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("refresh_kalshi_settlements already running; skipping.")
+        lock_file.close()
+        return 0
+
     args = _parse_args()
     settings = load_settings()
     logger = setup_logger(settings.log_path)
@@ -343,16 +356,84 @@ async def _run() -> int:
     now_ts = int(time.time())
     since_ts = now_ts - max(args.since_seconds, 0)
     per_page = min(args.limit, 1000) if args.limit else None
-
-    markets = await rest_client.list_markets(
-        limit=per_page,
-        status=status,
-        min_settled_ts=since_ts,
-        max_settled_ts=now_ts,
-        max_total=args.limit,
+    series = (
+        normalize_series(args.series)
+        if args.series is not None
+        else list(BTC_SERIES_TICKERS)
     )
+
+    markets: list[dict[str, Any]] = []
+    if series:
+        per_series_limit = None
+        if args.limit:
+            per_series_limit = max(args.limit // len(series), 1)
+        for series_ticker in series:
+            try:
+                series_markets = await rest_client.list_markets(
+                    limit=per_page,
+                    status=status,
+                    series_ticker=series_ticker,
+                    min_settled_ts=since_ts,
+                    max_settled_ts=now_ts,
+                    max_total=per_series_limit,
+                )
+            except KalshiRestError as exc:
+                if exc.transient:
+                    print(
+                        "WARNING: settlements transient API error; "
+                        f"skipping series={series_ticker} status={exc.status}"
+                    )
+                    logger.warning(
+                        "kalshi_settlements_series_skipped",
+                        extra={
+                            "series_ticker": series_ticker,
+                            "status": exc.status,
+                            "body": exc.body,
+                        },
+                    )
+                    continue
+                raise
+            markets.extend(series_markets)
+    else:
+        try:
+            markets = await rest_client.list_markets(
+                limit=per_page,
+                status=status,
+                min_settled_ts=since_ts,
+                max_settled_ts=now_ts,
+                max_total=args.limit,
+            )
+        except KalshiRestError as exc:
+            if exc.transient:
+                print(
+                    "WARNING: settlements transient API error; skipping this run "
+                    f"(status={exc.status})"
+                )
+                logger.warning(
+                    "kalshi_settlements_run_skipped",
+                    extra={"status": exc.status, "body": exc.body},
+                )
+                lock_file.close()
+                return 0
+            raise
+    markets_fetched_total = len(markets)
+
+    # Guard against duplicate rows if the same ticker appears across pages/calls.
+    deduped_markets: list[dict[str, Any]] = []
+    seen_tickers: set[str] = set()
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        ticker = market.get("ticker") or market.get("market_id")
+        if not isinstance(ticker, str) or not ticker:
+            continue
+        if ticker in seen_tickers:
+            continue
+        seen_tickers.add(ticker)
+        deduped_markets.append(market)
+    markets = deduped_markets
     series_prefixes = tuple(
-        f"{value}-" for value in args.series if isinstance(value, str) and value
+        f"{value}-" for value in series if isinstance(value, str) and value
     )
     if series_prefixes:
         markets = [
@@ -370,14 +451,13 @@ async def _run() -> int:
         for market in markets
         if isinstance(market, dict)
     ]
-    markets_fetched_total = len(markets)
     markets_with_ticker = len([t for t in tickers if isinstance(t, str) and t])
 
     async with aiosqlite.connect(settings.db_path) as conn:
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA busy_timeout = 5000;")
+        await conn.execute("PRAGMA busy_timeout = 15000;")
         await conn.commit()
 
         existing = await _load_existing_contracts(conn, tickers)
@@ -467,6 +547,7 @@ async def _run() -> int:
             )
     if args.debug and updates:
         print(f"sample_update={updates[0]}")
+    lock_file.close()
     return 0
 
 

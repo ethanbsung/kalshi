@@ -36,6 +36,8 @@ from kalshi_bot.models.volatility import (
 from kalshi_bot.strategy.edge_math import ev_take_no, ev_take_yes
 
 FeeFn = Callable[[float | None, int], float | None]
+SIGMA_HISTORY_WARNING_INTERVAL_SECONDS = 15 * 60
+_LAST_SIGMA_HISTORY_WARNING_TS: int | None = None
 
 
 @dataclass(frozen=True)
@@ -315,6 +317,20 @@ def _sigma_reason_context(
     if sigma_reason == "sigma_missing":
         return "sigma estimate unexpectedly missing"
     return None
+
+
+def _should_log_sigma_warning(reason: str | None, now_ts: int) -> bool:
+    global _LAST_SIGMA_HISTORY_WARNING_TS
+    if reason != "insufficient_history_span":
+        return True
+    if (
+        _LAST_SIGMA_HISTORY_WARNING_TS is None
+        or (now_ts - _LAST_SIGMA_HISTORY_WARNING_TS)
+        >= SIGMA_HISTORY_WARNING_INTERVAL_SECONDS
+    ):
+        _LAST_SIGMA_HISTORY_WARNING_TS = now_ts
+        return True
+    return False
 
 
 async def _load_contracts(
@@ -631,67 +647,71 @@ async def _compute_and_store_sigma(
             sigma_max=sigma_max,
             step_seconds=step_seconds,
         )
-        logger.warning(
-            "sigma_compute_failed reason=%s context=%s",
-            sigma_reason,
-            sigma_reason_context,
-            extra={
-                "product_id": product_id,
-                "sigma_reason": sigma_reason,
-                "sigma_reason_context": sigma_reason_context,
-                "raw_points": raw_points,
-                "resampled_points": resampled_points,
-                "history_span_seconds": history_span_seconds,
-                "sigma_points_used": sigma_points_used,
-                "min_points": min_points,
-                "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
-            },
-        )
+        should_log_warning = _should_log_sigma_warning(sigma_reason, now_ts)
+        if should_log_warning and sigma_reason != "insufficient_history_span":
+            logger.warning(
+                "sigma_compute_failed reason=%s context=%s",
+                sigma_reason,
+                sigma_reason_context,
+                extra={
+                    "product_id": product_id,
+                    "sigma_reason": sigma_reason,
+                    "sigma_reason_context": sigma_reason_context,
+                    "raw_points": raw_points,
+                    "resampled_points": resampled_points,
+                    "history_span_seconds": history_span_seconds,
+                    "sigma_points_used": sigma_points_used,
+                    "min_points": min_points,
+                    "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
+                },
+            )
         sigma_fallback = await _load_sigma_fallback(conn, product_id)
         if sigma_fallback is not None:
             sigma = sigma_fallback
             sigma_source = "history"
             sigma_ok = False
-            logger.warning(
-                "sigma_fallback_used reason=%s context=%s",
-                sigma_reason,
-                sigma_reason_context,
-                extra={
-                    "product_id": product_id,
-                    "sigma_reason": sigma_reason,
-                    "sigma_reason_context": sigma_reason_context,
-                    "sigma_fallback": sigma_fallback,
-                    "raw_points": raw_points,
-                    "resampled_points": resampled_points,
-                    "history_span_seconds": history_span_seconds,
-                    "sigma_points_used": sigma_points_used,
-                    "min_points": min_points,
-                    "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
-                },
-            )
+            if should_log_warning:
+                logger.warning(
+                    "sigma_fallback_used reason=%s context=%s",
+                    sigma_reason,
+                    sigma_reason_context,
+                    extra={
+                        "product_id": product_id,
+                        "sigma_reason": sigma_reason,
+                        "sigma_reason_context": sigma_reason_context,
+                        "sigma_fallback": sigma_fallback,
+                        "raw_points": raw_points,
+                        "resampled_points": resampled_points,
+                        "history_span_seconds": history_span_seconds,
+                        "sigma_points_used": sigma_points_used,
+                        "min_points": min_points,
+                        "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
+                    },
+                )
             sigma_persisted = False
         else:
             sigma = sigma_default
             sigma_source = "default"
             sigma_ok = False
-            logger.warning(
-                "sigma_default_used reason=%s context=%s",
-                sigma_reason,
-                sigma_reason_context,
-                extra={
-                    "product_id": product_id,
-                    "sigma_reason": sigma_reason,
-                    "sigma_reason_context": sigma_reason_context,
-                    "sigma_default": sigma_default,
-                    "raw_points": raw_points,
-                    "resampled_points": resampled_points,
-                    "history_span_seconds": history_span_seconds,
-                    "sigma_points_used": sigma_points_used,
-                    "min_points": min_points,
-                    "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
-                    "fallback_history_found": False,
-                },
-            )
+            if should_log_warning:
+                logger.warning(
+                    "sigma_default_used reason=%s context=%s",
+                    sigma_reason,
+                    sigma_reason_context,
+                    extra={
+                        "product_id": product_id,
+                        "sigma_reason": sigma_reason,
+                        "sigma_reason_context": sigma_reason_context,
+                        "sigma_default": sigma_default,
+                        "raw_points": raw_points,
+                        "resampled_points": resampled_points,
+                        "history_span_seconds": history_span_seconds,
+                        "sigma_points_used": sigma_points_used,
+                        "min_points": min_points,
+                        "min_sigma_lookback_seconds": min_sigma_lookback_seconds,
+                        "fallback_history_found": False,
+                    },
+                )
             sigma_persisted = False
 
     if sigma_reason is None:

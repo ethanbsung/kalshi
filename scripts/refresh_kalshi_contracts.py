@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
+from pathlib import Path
 
 import aiosqlite
 
@@ -16,6 +18,8 @@ from kalshi_bot.kalshi.market_filters import (
     normalize_series,
 )
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
+
+LOCK_PATH = Path("/tmp/kalshi_refresh_kalshi_contracts.lock")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -32,6 +36,14 @@ def _parse_args() -> argparse.Namespace:
 
 
 async def _run() -> int:
+    lock_file = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("refresh_kalshi_contracts already running; skipping.")
+        lock_file.close()
+        return 0
+
     args = _parse_args()
     settings = load_settings()
     logger = setup_logger(settings.log_path)
@@ -62,7 +74,7 @@ async def _run() -> int:
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA busy_timeout = 5000;")
+        await conn.execute("PRAGMA busy_timeout = 15000;")
         await conn.commit()
 
         rows = await load_market_rows(conn, args.status, series)
@@ -74,6 +86,7 @@ async def _run() -> int:
                 extra={"status": args.status, "series": series, "status_counts": counts},
             )
             print(f"ERROR: {message}")
+            lock_file.close()
             return 1
 
         summary = await refresher.refresh(
@@ -88,6 +101,7 @@ async def _run() -> int:
             **summary
         )
     )
+    lock_file.close()
     return 0
 
 

@@ -118,12 +118,25 @@ async def backfill_market_times(
     conn: aiosqlite.Connection, logger: logging.Logger | None
 ) -> int:
     cursor = await conn.execute(
-        "SELECT market_id, settlement_ts, close_ts, expected_expiration_ts, raw_json "
-        "FROM kalshi_markets"
+        "SELECT market_id, settlement_ts, close_ts, expected_expiration_ts, "
+        "expiration_ts, raw_json "
+        "FROM kalshi_markets "
+        "WHERE settlement_ts IS NULL "
+        "   OR close_ts IS NULL "
+        "   OR expected_expiration_ts IS NULL "
+        "   OR expiration_ts IS NULL"
     )
     rows = await cursor.fetchall()
     updated = 0
-    for market_id, settlement_ts, close_ts_db, expected_expiration_db, raw_json in rows:
+    updated_market_ids: list[str] = []
+    for (
+        market_id,
+        settlement_ts,
+        close_ts_db,
+        expected_expiration_db,
+        expiration_ts_db,
+        raw_json,
+    ) in rows:
         if not raw_json:
             continue
         try:
@@ -139,11 +152,27 @@ async def backfill_market_times(
         )
         expiration_ts = extract_expiration_ts(market, logger=logger)
         new_settlement = close_ts if close_ts is not None else settlement_ts
+        new_close = close_ts if close_ts is not None else close_ts_db
+        new_expected = (
+            expected_expiration_ts
+            if expected_expiration_ts is not None
+            else expected_expiration_db
+        )
+        new_expiration = (
+            expiration_ts if expiration_ts is not None else expiration_ts_db
+        )
         if (
             new_settlement is None
-            and close_ts is None
-            and expected_expiration_ts is None
-            and expiration_ts is None
+            and new_close is None
+            and new_expected is None
+            and new_expiration is None
+        ):
+            continue
+        if (
+            new_settlement == settlement_ts
+            and new_close == close_ts_db
+            and new_expected == expected_expiration_db
+            and new_expiration == expiration_ts_db
         ):
             continue
         await conn.execute(
@@ -162,15 +191,22 @@ async def backfill_market_times(
             ),
         )
         updated += 1
+        updated_market_ids.append(market_id)
 
-    await conn.execute(
-        "UPDATE kalshi_contracts "
-        "SET settlement_ts = (SELECT settlement_ts FROM kalshi_markets WHERE market_id = ticker), "
-        "close_ts = (SELECT close_ts FROM kalshi_markets WHERE market_id = ticker), "
-        "expected_expiration_ts = (SELECT expected_expiration_ts FROM kalshi_markets WHERE market_id = ticker), "
-        "expiration_ts = (SELECT expiration_ts FROM kalshi_markets WHERE market_id = ticker) "
-        "WHERE ticker IN (SELECT market_id FROM kalshi_markets)"
-    )
+    if updated_market_ids:
+        chunk_size = 400
+        for idx in range(0, len(updated_market_ids), chunk_size):
+            chunk = updated_market_ids[idx : idx + chunk_size]
+            placeholders = ", ".join("?" for _ in chunk)
+            await conn.execute(
+                "UPDATE kalshi_contracts "
+                "SET settlement_ts = (SELECT settlement_ts FROM kalshi_markets WHERE market_id = ticker), "
+                "close_ts = (SELECT close_ts FROM kalshi_markets WHERE market_id = ticker), "
+                "expected_expiration_ts = (SELECT expected_expiration_ts FROM kalshi_markets WHERE market_id = ticker), "
+                "expiration_ts = (SELECT expiration_ts FROM kalshi_markets WHERE market_id = ticker) "
+                f"WHERE ticker IN ({placeholders})",
+                chunk,
+            )
     return updated
 
 

@@ -10,12 +10,14 @@ def normalize_series(series: list[str] | None) -> list[str]:
     if not series:
         return []
     cleaned: list[str] = []
+    seen: set[str] = set()
     for item in series:
         if not item:
             continue
         for part in item.split(","):
             part = part.strip()
-            if part:
+            if part and part not in seen:
+                seen.add(part)
                 cleaned.append(part)
     return cleaned
 

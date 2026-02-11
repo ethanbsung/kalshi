@@ -15,6 +15,7 @@ from kalshi_bot.app.live_stack_health import collect_live_health, format_live_he
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
+from kalshi_bot.kalshi.market_filters import normalize_series
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--python-bin", type=str, default=sys.executable)
     parser.add_argument("--status", type=str, default="active")
-    parser.add_argument("--series", action="append", default=list(BTC_SERIES_TICKERS))
+    parser.add_argument("--series", action="append", default=None)
     parser.add_argument("--product-id", type=str, default=None)
     parser.add_argument("--component-debug", action="store_true")
 
@@ -76,13 +77,14 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--settlements-every-minutes", type=int, default=15)
     parser.add_argument("--settlements-since-seconds", type=int, default=2 * 24 * 3600)
+    parser.add_argument("--settlements-limit", type=int, default=600)
     parser.add_argument("--scoring-every-minutes", type=int, default=10)
     parser.add_argument("--scoring-limit", type=int, default=2000)
     parser.add_argument("--report-every-minutes", type=int, default=60)
     parser.add_argument("--report-since-seconds", type=int, default=7 * 24 * 3600)
     parser.add_argument("--disable-report", action="store_true")
 
-    parser.add_argument("--health-every-seconds", type=int, default=60)
+    parser.add_argument("--health-every-seconds", type=int, default=300)
     parser.add_argument("--health-window-minutes", type=int, default=10)
     return parser.parse_args()
 
@@ -254,6 +256,11 @@ async def _run_health_loop(
 
 async def _run() -> int:
     args = _parse_args()
+    args.series = (
+        normalize_series(args.series)
+        if args.series is not None
+        else list(BTC_SERIES_TICKERS)
+    )
     settings = load_settings()
     product_id = args.product_id or settings.coinbase_product_id
 
@@ -318,15 +325,6 @@ async def _run() -> int:
     if args.component_debug:
         opportunities_cmd.append("--debug")
 
-    settlements_cmd = [
-        args.python_bin,
-        str(repo_root / "scripts" / "refresh_kalshi_settlements.py"),
-        "--status",
-        "resolved",
-        "--since-seconds",
-        str(args.settlements_since_seconds),
-        *series_args,
-    ]
     scoring_cmd = [
         args.python_bin,
         str(repo_root / "scripts" / "score_edge_snapshots.py"),
@@ -347,10 +345,6 @@ async def _run() -> int:
         Component("opportunities", opportunities_cmd),
     ]
     periodic = [
-        (
-            Component("settlements", settlements_cmd),
-            args.settlements_every_minutes * 60,
-        ),
         (
             Component("scoring", scoring_cmd),
             args.scoring_every_minutes * 60,

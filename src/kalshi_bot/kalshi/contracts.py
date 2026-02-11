@@ -273,6 +273,9 @@ class KalshiContractRefresher:
             row = build_contract_row(ticker, settlement_ts, market, self._logger)
             await dao.upsert_kalshi_contract(row)
             upserted += 1
+            # Release writer lock periodically to reduce SQLite contention.
+            if upserted % 100 == 0:
+                await conn.commit()
 
         await conn.commit()
 

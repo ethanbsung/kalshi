@@ -34,8 +34,9 @@ NOISY_PASS_REASONS = {
     "top_n_cutoff",
 }
 
-QUIET_TICK_HEARTBEAT_SECONDS = 60
+QUIET_TICK_HEARTBEAT_SECONDS = 600
 PASS_SAMPLE_HEARTBEAT_SECONDS = 600
+OPPORTUNITY_STDOUT_HEARTBEAT_SECONDS = 60
 MIN_TAU_MINUTES_KXBTC15M = 4.0
 MIN_TAU_MINUTES_KXBTC = 10.0
 MIN_TAU_MINUTES_KXBTCD = 10.0
@@ -607,10 +608,12 @@ async def _run_loop() -> int:
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA busy_timeout = 5000;")
+        await conn.execute("PRAGMA busy_timeout = 15000;")
         await conn.commit()
 
         backoff = [0.2, 0.5, 1.0]
+        last_stdout_asof_ts: int | None = None
+        last_stdout_log_ts: int | None = None
         while True:
             try:
                 summary = await run_tick(conn, args)
@@ -635,13 +638,30 @@ async def _run_loop() -> int:
                 )
                 print(f"tick_error={summary['error']}")
             else:
-                print(
-                    "opportunity_tick ts={asof_ts} snapshots={snapshots} "
-                    "takes={takes} passes={passes} inserted={inserted} "
-                    "open_positions={open_positions}".format(
-                        **summary
+                asof_ts = int(summary.get("asof_ts") or 0)
+                takes = int(summary.get("takes") or 0)
+                inserted = int(summary.get("inserted") or 0)
+                should_print_tick = takes > 0 or inserted > 0
+                if not should_print_tick:
+                    if last_stdout_asof_ts == asof_ts:
+                        should_print_tick = False
+                    elif (
+                        last_stdout_log_ts is None
+                        or (asof_ts - last_stdout_log_ts)
+                        >= OPPORTUNITY_STDOUT_HEARTBEAT_SECONDS
+                    ):
+                        should_print_tick = True
+                if should_print_tick:
+                    print(
+                        "opportunity_tick ts={asof_ts} snapshots={snapshots} "
+                        "takes={takes} passes={passes} inserted={inserted} "
+                        "open_positions={open_positions}".format(
+                            **summary
+                        )
                     )
-                )
+                    last_stdout_asof_ts = asof_ts
+                    if asof_ts > 0:
+                        last_stdout_log_ts = asof_ts
                 if not args.disable_decision_log:
                     try:
                         _write_decision_log(

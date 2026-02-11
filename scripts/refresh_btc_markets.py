@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import time
+from pathlib import Path
 
 import aiosqlite
 
@@ -24,9 +26,18 @@ from kalshi_bot.kalshi.rest_client import KalshiRestError
 
 
 RETRY_DELAYS_SECONDS = [5.0, 10.0, 20.0, 30.0]
+LOCK_PATH = Path("/tmp/kalshi_refresh_btc_markets.lock")
 
 
 async def _refresh_btc_markets() -> int:
+    lock_file = LOCK_PATH.open("w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("refresh_btc_markets already running; skipping.")
+        lock_file.close()
+        return 0
+
     settings = load_settings()
     logger = setup_logger(settings.log_path)
 
@@ -108,7 +119,7 @@ async def _refresh_btc_markets() -> int:
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA busy_timeout = 5000;")
+        await conn.execute("PRAGMA busy_timeout = 15000;")
         await conn.commit()
 
         dao = Dao(conn)
@@ -139,6 +150,9 @@ async def _refresh_btc_markets() -> int:
             }
             await dao.upsert_kalshi_market(row)
             upserted += 1
+            # Reduce long write-lock windows during large refreshes.
+            if upserted % 100 == 0:
+                await conn.commit()
 
         backfilled = await backfill_market_times(conn, logger)
         await conn.commit()
@@ -167,8 +181,10 @@ async def _refresh_btc_markets() -> int:
                 },
             )
         print(f"ERROR: No markets returned for series {empty_series}")
+        lock_file.close()
         return 1
 
+    lock_file.close()
     return 0
 
 

@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,8 +30,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--settled-limit",
         type=int,
-        default=100,
+        default=30,
         help="Maximum number of settled positions to print.",
+    )
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Colorize output (default: auto).",
     )
     return parser.parse_args()
 
@@ -80,6 +88,31 @@ def _fmt_pnl(value: float | None) -> str:
     if value is None:
         return "NA"
     return f"{value:.4f}"
+
+
+def _use_color(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _paint(text: str, code: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"\x1b[{code}m{text}\x1b[0m"
+
+
+def _paint_pnl(value: float | None, enabled: bool, width: int = 8) -> str:
+    text = _fmt_pnl(value).rjust(width)
+    if value is None or not enabled:
+        return text
+    if value > 0:
+        return _paint(text, "32", True)
+    if value < 0:
+        return _paint(text, "31", True)
+    return _paint(text, "33", True)
 
 
 async def _load_open_rows(conn: aiosqlite.Connection) -> list[tuple[Any, ...]]:
@@ -134,6 +167,7 @@ async def _load_settled_rows(conn: aiosqlite.Connection) -> list[tuple[Any, ...]
 async def _run() -> int:
     args = _parse_args()
     settings = load_settings()
+    color = _use_color(args.color)
 
     print(f"DB path: {settings.db_path}")
     db_path = Path(settings.db_path).resolve()
@@ -282,16 +316,28 @@ async def _run() -> int:
     def _print_open_section(title: str, items: list[dict[str, Any]]) -> None:
         if not items:
             return
-        print(f"{title}:")
+        print(_paint(f"{title}:", "1", color))
+        print(
+            "  {market:<31} {side:<4} {qty:>3} {upnl:>8} {entry:>7} {liq:>7} {qage:>5} {age:>6} {opened:<20} {settle:<20}".format(
+                market="market",
+                side="side",
+                qty="qty",
+                upnl="uPnL",
+                entry="entryC",
+                liq="liqC",
+                qage="qAge",
+                age="age_m",
+                opened="opened",
+                settle="settle",
+            )
+        )
         for row in items:
             print(
-                "  market={market} side={side} qty={qty} uPnL_total={upnl} "
-                "avg_entry_c={avg_entry} liq_c={liq} quote_age_s={quote_age} "
-                "opened={opened} age_m={age_m} settle={settle}".format(
-                    market=row["market_id"],
-                    side=row["side"],
+                "  {market:<31} {side:<4} {qty:>3} {upnl} {avg_entry:>7} {liq:>7} {quote_age:>5} {age_m:>6} {opened:<20} {settle:<20}".format(
+                    market=str(row["market_id"])[:31],
+                    side=str(row["side"]),
                     qty=int(row["qty"]),
-                    upnl=_fmt_pnl(_safe_float(row.get("u_pnl_total"))),
+                    upnl=_paint_pnl(_safe_float(row.get("u_pnl_total")), color),
                     avg_entry=_fmt_cents(_safe_float(row.get("avg_entry_c"))),
                     liq=_fmt_cents(_safe_float(row.get("liq_c"))),
                     quote_age=(
@@ -301,9 +347,9 @@ async def _run() -> int:
                     ),
                     opened=_fmt_ts(row.get("first_ts")),
                     age_m=(
-                        f"{float(row['age_m']):.1f}"
+                        f"{float(row['age_m']):.1f}".rjust(6)
                         if row.get("age_m") is not None
-                        else "NA"
+                        else "NA".rjust(6)
                     ),
                     settle=_fmt_ts(row.get("settlement_ts")),
                 )
@@ -382,6 +428,7 @@ async def _run() -> int:
         key=lambda row: row.get("settled_ts") or row.get("settlement_ts") or 0,
         reverse=True,
     )
+    total_settled_positions = len(settled_positions)
     if args.settled_limit > 0:
         settled_positions = settled_positions[: args.settled_limit]
 
@@ -390,6 +437,18 @@ async def _run() -> int:
     settled_realized_count = 0
     print(
         f"settled_positions={len(settled_positions)} settled_contracts={settled_total_qty}"
+    )
+    print(
+        "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {entry:>7} {realized:>8} {opened:<20} {settled:<20}".format(
+            market="market",
+            side="side",
+            qty="qty",
+            outcome="outcome",
+            entry="entryC",
+            realized="realized",
+            opened="opened",
+            settled="settled",
+        )
     )
     for row in settled_positions:
         qty = int(row["qty"])
@@ -405,14 +464,15 @@ async def _run() -> int:
             settled_realized_total += float(realized_total)
             settled_realized_count += 1
         print(
-            "market={market} side={side} qty={qty} outcome={outcome} avg_entry_c={avg_entry} "
-            "realized_total={realized} opened={opened} settled={settled}".format(
-                market=row["market_id"],
-                side=row["side"],
+            "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {avg_entry:>7} {realized} {opened:<20} {settled:<20}".format(
+                market=str(row["market_id"])[:31],
+                side=str(row["side"]),
                 qty=qty,
                 outcome=row.get("outcome"),
-                avg_entry=f"{avg_entry:.2f}" if avg_entry is not None else "NA",
-                realized=f"{realized_total:.4f}" if realized_total is not None else "NA",
+                avg_entry=(
+                    f"{avg_entry:.2f}" if avg_entry is not None else "NA"
+                ),
+                realized=_paint_pnl(realized_total, color),
                 opened=_fmt_ts(row.get("first_ts")),
                 settled=_fmt_ts(row.get("settled_ts") or row.get("settlement_ts")),
             )
@@ -423,6 +483,14 @@ async def _run() -> int:
         )
     else:
         print("settled_marked_positions=0 settled_realized_total=NA")
+    if args.settled_limit > 0 and total_settled_positions > len(settled_positions):
+        print(
+            "settled_output_truncated=true shown={shown} total={total} "
+            "hint='use --settled-limit 0 for all or a larger number'".format(
+                shown=len(settled_positions),
+                total=total_settled_positions,
+            )
+        )
 
     return 0
 
