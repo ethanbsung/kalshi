@@ -15,7 +15,11 @@ from kalshi_bot.kalshi.error_utils import (
     classify_exception,
     init_error_counts,
 )
-from kalshi_bot.kalshi.market_filters import build_series_clause, normalize_series
+from kalshi_bot.kalshi.market_filters import (
+    build_series_clause,
+    normalize_db_status,
+    normalize_series,
+)
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 from kalshi_bot.kalshi.validation import validate_quote_row
 
@@ -46,15 +50,20 @@ def _mid(bid: float | None, ask: float | None) -> float | None:
     return (bid + ask) / 2.0
 
 
-def build_quote_row(market: dict[str, Any], ts: int) -> dict[str, Any]:
-    market_id = market.get("ticker") or market.get("market_id")
+def build_quote_row_from_topbook(
+    *,
+    market_id: str,
+    ts: int,
+    yes_bid: float | None,
+    yes_ask: float | None,
+    no_bid: float | None,
+    no_ask: float | None,
+    volume: int | None,
+    open_interest: int | None,
+    raw_json: str,
+) -> dict[str, Any]:
     if not market_id:
         raise ValueError("missing market_id")
-
-    yes_bid = _parse_float(market.get("yes_bid"))
-    yes_ask = _parse_float(market.get("yes_ask"))
-    no_bid = _parse_float(market.get("no_bid"))
-    no_ask = _parse_float(market.get("no_ask"))
 
     yes_mid = _mid(yes_bid, yes_ask)
     no_mid = _mid(no_bid, no_ask)
@@ -70,31 +79,81 @@ def build_quote_row(market: dict[str, Any], ts: int) -> dict[str, Any]:
         "yes_mid": yes_mid,
         "no_mid": no_mid,
         "p_mid": p_mid,
-        "volume": _parse_int(market.get("volume")),
-        "volume_24h": _parse_int(market.get("volume_24h")),
-        "open_interest": _parse_int(market.get("open_interest")),
-        "raw_json": json.dumps(market),
+        "volume": volume,
+        "volume_24h": None,
+        "open_interest": open_interest,
+        "raw_json": raw_json,
     }
+
+
+def build_quote_row(market: dict[str, Any], ts: int) -> dict[str, Any]:
+    market_id = market.get("ticker") or market.get("market_id")
+    if not market_id:
+        raise ValueError("missing market_id")
+
+    yes_bid = _parse_float(market.get("yes_bid"))
+    yes_ask = _parse_float(market.get("yes_ask"))
+    no_bid = _parse_float(market.get("no_bid"))
+    no_ask = _parse_float(market.get("no_ask"))
+
+    row = build_quote_row_from_topbook(
+        market_id=market_id,
+        ts=ts,
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        no_bid=no_bid,
+        no_ask=no_ask,
+        volume=_parse_int(market.get("volume")),
+        open_interest=_parse_int(market.get("open_interest")),
+        raw_json=json.dumps(market),
+    )
+    row["volume_24h"] = _parse_int(market.get("volume_24h"))
+    return row
 
 
 async def load_market_tickers(
     conn: aiosqlite.Connection,
     status: str | None,
     series: list[str] | None,
+    *,
+    now_ts: int | None = None,
+    max_horizon_seconds: int | None = None,
+    grace_seconds: int = 3600,
 ) -> list[str]:
+    status = normalize_db_status(status)
     where: list[str] = []
     params: list[Any] = []
     if status is not None:
-        where.append("status = ?")
+        where.append("m.status = ?")
         params.append(status)
-    series_clause, series_params = build_series_clause(series)
+    series_clause, series_params = build_series_clause(
+        series, column="m.market_id"
+    )
     if series_clause:
         where.append(series_clause)
         params.extend(series_params)
-    sql = "SELECT market_id FROM kalshi_markets"
+    close_expr = (
+        "COALESCE(c.close_ts, m.close_ts, "
+        "c.expected_expiration_ts, m.expected_expiration_ts, "
+        "c.settlement_ts, m.settlement_ts)"
+    )
+    if now_ts is not None:
+        where.append(f"{close_expr} IS NOT NULL")
+        where.append(f"{close_expr} >= ?")
+        params.append(int(now_ts) - 5)
+        if max_horizon_seconds is not None and max_horizon_seconds > 0:
+            horizon_cap = int(now_ts) + int(max_horizon_seconds) + int(
+                max(grace_seconds, 0)
+            )
+            where.append(f"{close_expr} <= ?")
+            params.append(horizon_cap)
+    sql = (
+        "SELECT m.market_id FROM kalshi_markets m "
+        "LEFT JOIN kalshi_contracts c ON c.ticker = m.market_id"
+    )
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY market_id"
+    sql += " ORDER BY " + close_expr + ", m.market_id"
     cursor = await conn.execute(sql, params)
     rows = await cursor.fetchall()
     return [row[0] for row in rows if row and row[0]]
@@ -128,10 +187,17 @@ class KalshiQuotePoller:
         status: str | None = None,
         series: list[str] | None = None,
         tickers: list[str] | None = None,
+        max_horizon_seconds: int | None = None,
     ) -> dict[str, Any]:
         normalized_series = normalize_series(series)
         if tickers is None:
-            tickers = await load_market_tickers(conn, status, normalized_series)
+            tickers = await load_market_tickers(
+                conn,
+                status,
+                normalized_series,
+                now_ts=int(time.time()),
+                max_horizon_seconds=max_horizon_seconds,
+            )
         self._logger.info(
             "kalshi_quotes_load_markets",
             extra={

@@ -1,5 +1,6 @@
 PYTHONPATH=src .venv/bin/python scripts/refresh_btc_markets.py --status active --series KXBTC --series KXBTC15M --series KXBTCD
 PYTHONPATH=src .venv/bin/python scripts/refresh_kalshi_contracts.py --status active --series KXBTC --series KXBTC15M --series KXBTCD
+PYTHONPATH=src .venv/bin/python scripts/refresh_kalshi_settlements.py --status resolved --since-seconds 86400
 ./scripts/live_stack.sh
 tail -f logs/trader_tape.log
 PYTHONPATH=src .venv/bin/python scripts/report_open_shadow_positions.py

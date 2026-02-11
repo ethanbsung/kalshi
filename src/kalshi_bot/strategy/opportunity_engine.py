@@ -9,6 +9,8 @@ from kalshi_bot.strategy.edge_math import (
     ev_take_yes as fee_aware_ev_take_yes,
 )
 
+EV_INVARIANT_TOLERANCE = 1e-6
+
 
 @dataclass(frozen=True)
 class OpportunityConfig:
@@ -82,7 +84,7 @@ def _add_reason(
 def build_opportunities_from_snapshots(
     snapshots: list[dict[str, Any]],
     config: OpportunityConfig,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     counters = {
         "snapshots_total": len(snapshots),
@@ -99,6 +101,8 @@ def build_opportunities_from_snapshots(
         "missing_no_ask": 0,
         "ev_below_threshold": 0,
         "top_n_cutoff": 0,
+        "ev_invariant_failed": 0,
+        "ev_invariant_max_diff": 0.0,
     }
 
     take_rows: list[dict[str, Any]] = []
@@ -131,6 +135,10 @@ def build_opportunities_from_snapshots(
         min_sigma_lookback_seconds = _safe_int(
             snapshot_meta.get("min_sigma_lookback_seconds")
         )
+        # Edge-time inputs used when ev_take_yes/no were computed.
+        edge_prob_yes = _safe_float(snapshot_meta.get("edge_prob_yes"))
+        edge_yes_ask = _safe_float(snapshot_meta.get("edge_yes_ask"))
+        edge_no_ask = _safe_float(snapshot_meta.get("edge_no_ask"))
 
         global_reasons: list[str] = []
         if prob_yes is None:
@@ -172,6 +180,12 @@ def build_opportunities_from_snapshots(
             ev: float | None,
             ask: float | None,
             reason: str | None,
+            ev_snapshot: float | None = None,
+            ev_recomputed: float | None = None,
+            ev_recomputed_invariant: float | None = None,
+            ev_invariant_failed: bool = False,
+            ev_invariant_diff: float | None = None,
+            ev_invariant_basis: str = "edge_inputs",
         ) -> dict[str, Any]:
             strike = snap.get("strike")
             settlement_ts = snap.get("settlement_ts")
@@ -216,6 +230,12 @@ def build_opportunities_from_snapshots(
                 "decision": decision,
                 "decision_reason": reason,
                 "model_version": config.model_version,
+                "ev_snapshot": ev_snapshot,
+                "ev_recomputed": ev_recomputed,
+                "ev_recomputed_invariant": ev_recomputed_invariant,
+                "ev_invariant_failed": ev_invariant_failed,
+                "ev_invariant_diff": ev_invariant_diff,
+                "ev_invariant_basis": ev_invariant_basis,
             }
             return {
                 "ts_eval": asof_ts,
@@ -253,10 +273,50 @@ def build_opportunities_from_snapshots(
                 ):
                     counters["missing_yes_ask"] += 1
                     return None, "missing_yes_ask"
-                ev = _safe_float(ev_take_yes)
-                if ev is None:
-                    ev = fee_aware_ev_take_yes(prob_yes, yes_ask)
-                row = build_row(side="YES", ev=ev, ask=yes_ask, reason=None)
+                ev_snapshot = _safe_float(ev_take_yes)
+                # Decision EV should always reflect current snapshot inputs.
+                ev_recomputed = fee_aware_ev_take_yes(prob_yes, yes_ask)
+                ev = ev_recomputed if ev_recomputed is not None else ev_snapshot
+                # Invariant should compare with the exact inputs used by edge engine.
+                ev_recomputed_invariant = fee_aware_ev_take_yes(
+                    edge_prob_yes,
+                    edge_yes_ask,
+                )
+                invariant_basis = (
+                    "edge_inputs"
+                    if edge_prob_yes is not None and edge_yes_ask is not None
+                    else "unavailable"
+                )
+                invariant_failed = (
+                    ev_snapshot is not None
+                    and ev_recomputed_invariant is not None
+                    and abs(ev_snapshot - ev_recomputed_invariant)
+                    > EV_INVARIANT_TOLERANCE
+                )
+                invariant_diff = (
+                    abs(ev_snapshot - ev_recomputed_invariant)
+                    if ev_snapshot is not None and ev_recomputed_invariant is not None
+                    else None
+                )
+                if invariant_failed:
+                    counters["ev_invariant_failed"] += 1
+                    if invariant_diff is not None:
+                        counters["ev_invariant_max_diff"] = max(
+                            float(counters["ev_invariant_max_diff"]),
+                            invariant_diff,
+                        )
+                row = build_row(
+                    side="YES",
+                    ev=ev,
+                    ask=yes_ask,
+                    reason=None,
+                    ev_snapshot=ev_snapshot,
+                    ev_recomputed=ev_recomputed,
+                    ev_recomputed_invariant=ev_recomputed_invariant,
+                    ev_invariant_failed=invariant_failed,
+                    ev_invariant_diff=invariant_diff,
+                    ev_invariant_basis=invariant_basis,
+                )
                 return row, None
             if side == "NO":
                 if not _ask_tradable(
@@ -264,10 +324,50 @@ def build_opportunities_from_snapshots(
                 ):
                     counters["missing_no_ask"] += 1
                     return None, "missing_no_ask"
-                ev = _safe_float(ev_take_no)
-                if ev is None:
-                    ev = fee_aware_ev_take_no(prob_yes, no_ask)
-                row = build_row(side="NO", ev=ev, ask=no_ask, reason=None)
+                ev_snapshot = _safe_float(ev_take_no)
+                # Decision EV should always reflect current snapshot inputs.
+                ev_recomputed = fee_aware_ev_take_no(prob_yes, no_ask)
+                ev = ev_recomputed if ev_recomputed is not None else ev_snapshot
+                # Invariant should compare with the exact inputs used by edge engine.
+                ev_recomputed_invariant = fee_aware_ev_take_no(
+                    edge_prob_yes,
+                    edge_no_ask,
+                )
+                invariant_basis = (
+                    "edge_inputs"
+                    if edge_prob_yes is not None and edge_no_ask is not None
+                    else "unavailable"
+                )
+                invariant_failed = (
+                    ev_snapshot is not None
+                    and ev_recomputed_invariant is not None
+                    and abs(ev_snapshot - ev_recomputed_invariant)
+                    > EV_INVARIANT_TOLERANCE
+                )
+                invariant_diff = (
+                    abs(ev_snapshot - ev_recomputed_invariant)
+                    if ev_snapshot is not None and ev_recomputed_invariant is not None
+                    else None
+                )
+                if invariant_failed:
+                    counters["ev_invariant_failed"] += 1
+                    if invariant_diff is not None:
+                        counters["ev_invariant_max_diff"] = max(
+                            float(counters["ev_invariant_max_diff"]),
+                            invariant_diff,
+                        )
+                row = build_row(
+                    side="NO",
+                    ev=ev,
+                    ask=no_ask,
+                    reason=None,
+                    ev_snapshot=ev_snapshot,
+                    ev_recomputed=ev_recomputed,
+                    ev_recomputed_invariant=ev_recomputed_invariant,
+                    ev_invariant_failed=invariant_failed,
+                    ev_invariant_diff=invariant_diff,
+                    ev_invariant_basis=invariant_basis,
+                )
                 return row, None
             return None, "invalid_side"
 

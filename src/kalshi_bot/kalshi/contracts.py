@@ -21,7 +21,11 @@ from kalshi_bot.kalshi.btc_markets import (
     extract_expected_expiration_ts,
     extract_expiration_ts,
 )
-from kalshi_bot.kalshi.market_filters import build_series_clause, normalize_series
+from kalshi_bot.kalshi.market_filters import (
+    build_series_clause,
+    normalize_db_status,
+    normalize_series,
+)
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 
 _STRIKE_PATTERN = re.compile(r"-(?P<side>[AB])(?P<strike>\d+(?:\.\d+)?)$")
@@ -149,24 +153,53 @@ def build_contract_row(
 
 
 async def load_market_rows(
-    conn: aiosqlite.Connection, status: str | None, series: list[str] | None
+    conn: aiosqlite.Connection,
+    status: str | None,
+    series: list[str] | None,
+    *,
+    now_ts: int | None = None,
+    include_closed: bool = True,
+    refresh_age_seconds: int | None = None,
+    limit: int | None = None,
 ) -> list[tuple[str, int | None]]:
+    status = normalize_db_status(status)
     where: list[str] = []
     params: list[Any] = []
     if status is not None:
-        where.append("status = ?")
+        where.append("m.status = ?")
         params.append(status)
-    series_clause, series_params = build_series_clause(series)
+    series_clause, series_params = build_series_clause(series, column="m.market_id")
     if series_clause:
         where.append(series_clause)
         params.extend(series_params)
+    if not include_closed and now_ts is not None:
+        where.append(
+            "COALESCE(m.close_ts, m.expected_expiration_ts, m.settlement_ts) >= ?"
+        )
+        params.append(now_ts)
+    if refresh_age_seconds is not None and refresh_age_seconds >= 0 and now_ts is not None:
+        refresh_before_ts = now_ts - int(refresh_age_seconds)
+        where.append(
+            "("
+            "c.ticker IS NULL "
+            "OR c.updated_ts IS NULL "
+            "OR c.updated_ts <= ? "
+            "OR (c.lower IS NULL AND c.upper IS NULL) "
+            "OR c.close_ts IS NULL "
+            "OR c.expected_expiration_ts IS NULL"
+            ")"
+        )
+        params.append(refresh_before_ts)
     sql = (
-        "SELECT market_id, COALESCE(close_ts, expected_expiration_ts) "
-        "FROM kalshi_markets"
+        "SELECT m.market_id, COALESCE(m.close_ts, m.expected_expiration_ts) "
+        "FROM kalshi_markets m "
+        "LEFT JOIN kalshi_contracts c ON c.ticker = m.market_id"
     )
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY market_id"
+    sql += " ORDER BY COALESCE(m.close_ts, m.expected_expiration_ts, m.settlement_ts), m.market_id"
+    if limit is not None and limit > 0:
+        sql += f" LIMIT {int(limit)}"
     cursor = await conn.execute(sql, params)
     rows = await cursor.fetchall()
     return [(row[0], row[1]) for row in rows if row and row[0]]

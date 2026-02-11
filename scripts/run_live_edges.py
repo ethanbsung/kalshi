@@ -14,7 +14,7 @@ from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
-from kalshi_bot.kalshi.market_filters import normalize_series
+from kalshi_bot.kalshi.market_filters import normalize_db_status, normalize_series
 from kalshi_bot.strategy.edge_engine import compute_edges
 
 EDGE_SUMMARY_HEARTBEAT_SECONDS = 60
@@ -253,6 +253,12 @@ async def run_tick(
                 snapshot_meta.update(
                     {
                         "snapshot_version": 1,
+                        # Preserve edge-time inputs so downstream invariant checks
+                        # can compare apples-to-apples.
+                        "edge_quote_ts": edge_meta.get("quote_ts"),
+                        "edge_prob_yes": edge.get("prob_yes"),
+                        "edge_yes_ask": edge.get("yes_ask"),
+                        "edge_no_ask": edge.get("no_ask"),
                         "sigma_source": summary.get("sigma_source"),
                         "sigma_ok": summary.get("sigma_ok"),
                         "sigma_reason": summary.get("sigma_reason"),
@@ -346,6 +352,7 @@ def _print_debug(summary: dict[str, Any], show_titles: bool) -> None:
 
 async def _run() -> int:
     args = _parse_args()
+    args.status = normalize_db_status(args.status)
     args.series = (
         normalize_series(args.series)
         if args.series is not None

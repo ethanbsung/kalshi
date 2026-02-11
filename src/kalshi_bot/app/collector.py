@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 from typing import Any, AsyncIterator
 
@@ -60,35 +61,97 @@ async def _run_coinbase(
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA journal_mode = WAL;")
         await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA busy_timeout = 5000;")
+        await conn.execute("PRAGMA busy_timeout = 2000;")
         await conn.commit()
 
-        dao = Dao(conn)
+        spot_columns = Dao.SPOT_TICK_COLUMNS
+        spot_insert_sql = (
+            "INSERT INTO spot_ticks ("
+            + ", ".join(spot_columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in spot_columns)
+            + ")"
+        )
 
         rows_since_commit = 0
         last_commit = time.monotonic()
         total_rows = 0
         total_commits = 0
+        lock_insert_retries = 0
+        dropped_rows_lock = 0
+        commit_failures = 0
+        last_lock_log_ts = 0.0
+
+        def _is_locked(exc: sqlite3.OperationalError) -> bool:
+            return "database is locked" in str(exc).lower()
+
+        async def _commit_with_retry() -> bool:
+            nonlocal total_commits, commit_failures, last_commit
+            backoffs = (0.05, 0.1, 0.2, 0.5, 1.0)
+            for attempt in range(len(backoffs) + 1):
+                try:
+                    await conn.commit()
+                    total_commits += 1
+                    last_commit = time.monotonic()
+                    return True
+                except sqlite3.OperationalError as exc:
+                    if not _is_locked(exc):
+                        raise
+                    commit_failures += 1
+                    await conn.rollback()
+                    if attempt < len(backoffs):
+                        await asyncio.sleep(backoffs[attempt])
+            return False
 
         async def handle_row(row: dict[str, Any]) -> None:
-            nonlocal rows_since_commit, last_commit, total_rows, total_commits
-            await dao.insert_spot_tick(row)
+            nonlocal rows_since_commit, total_rows, lock_insert_retries, dropped_rows_lock, last_lock_log_ts
+            inserted = False
+            backoffs = (0.05, 0.1, 0.2)
+            for attempt in range(len(backoffs) + 1):
+                try:
+                    await conn.execute(
+                        spot_insert_sql,
+                        tuple(row[col] for col in spot_columns),
+                    )
+                    inserted = True
+                    break
+                except sqlite3.OperationalError as exc:
+                    if not _is_locked(exc):
+                        raise
+                    lock_insert_retries += 1
+                    await conn.rollback()
+                    if attempt < len(backoffs):
+                        await asyncio.sleep(backoffs[attempt])
+            if not inserted:
+                dropped_rows_lock += 1
+                now = time.monotonic()
+                if (now - last_lock_log_ts) >= 60.0:
+                    logger.warning(
+                        "coinbase_spot_insert_locked",
+                        extra={
+                            "dropped_rows_lock": dropped_rows_lock,
+                            "lock_insert_retries": lock_insert_retries,
+                        },
+                    )
+                    last_lock_log_ts = now
+                return
+
             rows_since_commit += 1
             total_rows += 1
 
             now = time.monotonic()
             if rows_since_commit >= 50 or (now - last_commit) >= 1.0:
-                await conn.commit()
+                committed = await _commit_with_retry()
+                if not committed:
+                    rows_since_commit = 0
+                    return
                 rows_since_commit = 0
-                last_commit = now
-                total_commits += 1
 
         try:
             await client.run(handle_row, run_seconds=seconds)
         finally:
             if rows_since_commit:
-                await conn.commit()
-                total_commits += 1
+                await _commit_with_retry()
             logger.info(
                 "coinbase_run_summary",
                 extra={
@@ -100,6 +163,9 @@ async def _run_coinbase(
                     "close_count": client.close_count,
                     "total_inserted_rows": total_rows,
                     "total_commits": total_commits,
+                    "lock_insert_retries": lock_insert_retries,
+                    "dropped_rows_lock": dropped_rows_lock,
+                    "commit_failures": commit_failures,
                 },
             )
 

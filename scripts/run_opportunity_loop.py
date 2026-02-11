@@ -47,6 +47,7 @@ _LAST_HEARTBEAT_LOG_TS: int | None = None
 _LAST_LOGGED_ASOF_TS: int | None = None
 _LAST_PASS_SAMPLE_LOG_TS: int | None = None
 _LAST_PASS_LOG_TS: int | None = None
+_LAST_EV_INVARIANT_ASOF_TS: int | None = None
 
 
 def _parse_args() -> argparse.Namespace:
@@ -364,7 +365,7 @@ def _write_decision_log(
     pass_reason_limit: int,
     pass_sample_limit: int,
 ) -> None:
-    global _LAST_HEARTBEAT_LOG_TS, _LAST_LOGGED_ASOF_TS, _LAST_PASS_SAMPLE_LOG_TS, _LAST_PASS_LOG_TS
+    global _LAST_HEARTBEAT_LOG_TS, _LAST_LOGGED_ASOF_TS, _LAST_PASS_SAMPLE_LOG_TS, _LAST_PASS_LOG_TS, _LAST_EV_INVARIANT_ASOF_TS
 
     asof_ts = int(summary["asof_ts"])
     take_rows = list(summary.get("take_rows") or [])
@@ -427,6 +428,20 @@ def _write_decision_log(
         if top_reasons:
             reasons_blob = " ".join(f"{reason}={count}" for reason, count in top_reasons)
             f.write(f"{_fmt_ts(asof_ts)} PASS_SUMMARY {reasons_blob}\n")
+
+        ev_invariant_failed = int(
+            (summary.get("counters") or {}).get("ev_invariant_failed") or 0
+        )
+        ev_invariant_max_diff = float(
+            (summary.get("counters") or {}).get("ev_invariant_max_diff") or 0.0
+        )
+        if ev_invariant_failed > 0 and _LAST_EV_INVARIANT_ASOF_TS != asof_ts:
+            f.write(
+                f"{_fmt_ts(asof_ts)} EV_INVARIANT_FAILED "
+                f"count={ev_invariant_failed} "
+                f"max_diff={_fmt_num(ev_invariant_max_diff, 4)}\n"
+            )
+            _LAST_EV_INVARIANT_ASOF_TS = asof_ts
 
         for row in take_rows:
             f.write(_format_decision_line("TAKE", asof_ts, row) + "\n")
@@ -614,6 +629,7 @@ async def _run_loop() -> int:
         backoff = [0.2, 0.5, 1.0]
         last_stdout_asof_ts: int | None = None
         last_stdout_log_ts: int | None = None
+        last_ev_invariant_warn_asof_ts: int | None = None
         while True:
             try:
                 summary = await run_tick(conn, args)
@@ -641,6 +657,28 @@ async def _run_loop() -> int:
                 asof_ts = int(summary.get("asof_ts") or 0)
                 takes = int(summary.get("takes") or 0)
                 inserted = int(summary.get("inserted") or 0)
+                ev_invariant_failed = int(
+                    (summary.get("counters") or {}).get("ev_invariant_failed") or 0
+                )
+                if (
+                    ev_invariant_failed > 0
+                    and last_ev_invariant_warn_asof_ts != asof_ts
+                ):
+                    logger.warning(
+                        "opportunity_ev_invariant_failed",
+                        extra={
+                            "asof_ts": asof_ts,
+                            "count": ev_invariant_failed,
+                            "max_diff": float(
+                                (summary.get("counters") or {}).get(
+                                    "ev_invariant_max_diff"
+                                )
+                                or 0.0
+                            ),
+                            "snapshots": int(summary.get("snapshots") or 0),
+                        },
+                    )
+                    last_ev_invariant_warn_asof_ts = asof_ts
                 should_print_tick = takes > 0 or inserted > 0
                 if not should_print_tick:
                     if last_stdout_asof_ts == asof_ts:

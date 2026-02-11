@@ -5,7 +5,11 @@ from typing import Any
 
 import aiosqlite
 
-from kalshi_bot.kalshi.market_filters import build_series_clause, normalize_series
+from kalshi_bot.kalshi.market_filters import (
+    build_series_clause,
+    normalize_db_status,
+    normalize_series,
+)
 
 
 def _parse_float(value: Any) -> float | None:
@@ -20,6 +24,7 @@ def _parse_float(value: Any) -> float | None:
 def _market_filters(
     status: str | None, series: list[str] | None, alias: str
 ) -> tuple[str, list[Any]]:
+    status = normalize_db_status(status)
     where: list[str] = []
     params: list[Any] = []
     if status is not None:
@@ -136,6 +141,7 @@ async def get_relevant_universe(
     max_ask_cents: float = 99.0,
     max_spread_cents: float | None = None,
 ) -> tuple[list[str], float | None, dict[str, Any]]:
+    status = normalize_db_status(status)
     now_ts = int(time.time()) if now_ts is None else int(now_ts)
     spot_ts = None
     if spot_price is None:

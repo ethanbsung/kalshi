@@ -37,7 +37,9 @@ from kalshi_bot.strategy.edge_math import ev_take_no, ev_take_yes
 
 FeeFn = Callable[[float | None, int], float | None]
 SIGMA_HISTORY_WARNING_INTERVAL_SECONDS = 15 * 60
-_LAST_SIGMA_HISTORY_WARNING_TS: int | None = None
+_SIGMA_THROTTLED_REASONS = {"insufficient_history_span", "insufficient_points"}
+_LAST_SIGMA_WARNING_TS_BY_REASON: dict[str, int] = {}
+_LAST_SIGMA_PERSIST_WARNING_TS: int | None = None
 
 
 @dataclass(frozen=True)
@@ -320,15 +322,28 @@ def _sigma_reason_context(
 
 
 def _should_log_sigma_warning(reason: str | None, now_ts: int) -> bool:
-    global _LAST_SIGMA_HISTORY_WARNING_TS
-    if reason != "insufficient_history_span":
+    if reason is None:
         return True
+    if reason not in _SIGMA_THROTTLED_REASONS:
+        return True
+    last_ts = _LAST_SIGMA_WARNING_TS_BY_REASON.get(reason)
     if (
-        _LAST_SIGMA_HISTORY_WARNING_TS is None
-        or (now_ts - _LAST_SIGMA_HISTORY_WARNING_TS)
+        last_ts is None
+        or (now_ts - last_ts) >= SIGMA_HISTORY_WARNING_INTERVAL_SECONDS
+    ):
+        _LAST_SIGMA_WARNING_TS_BY_REASON[reason] = now_ts
+        return True
+    return False
+
+
+def _should_log_sigma_persist_warning(now_ts: int) -> bool:
+    global _LAST_SIGMA_PERSIST_WARNING_TS
+    if (
+        _LAST_SIGMA_PERSIST_WARNING_TS is None
+        or (now_ts - _LAST_SIGMA_PERSIST_WARNING_TS)
         >= SIGMA_HISTORY_WARNING_INTERVAL_SECONDS
     ):
-        _LAST_SIGMA_HISTORY_WARNING_TS = now_ts
+        _LAST_SIGMA_PERSIST_WARNING_TS = now_ts
         return True
     return False
 
@@ -623,8 +638,8 @@ async def _compute_and_store_sigma(
             points=sigma_points_used,
         )
         sigma_persisted = persisted
-        if not persisted:
-            logger.error(
+        if not persisted and _should_log_sigma_persist_warning(now_ts):
+            logger.warning(
                 "sigma_persist_failed",
                 extra={
                     "product_id": product_id,
@@ -648,7 +663,7 @@ async def _compute_and_store_sigma(
             step_seconds=step_seconds,
         )
         should_log_warning = _should_log_sigma_warning(sigma_reason, now_ts)
-        if should_log_warning and sigma_reason != "insufficient_history_span":
+        if should_log_warning:
             logger.warning(
                 "sigma_compute_failed reason=%s context=%s",
                 sigma_reason,

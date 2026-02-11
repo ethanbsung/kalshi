@@ -201,6 +201,7 @@ def build_settlement_updates(
         "failures": 0,
         "updated_outcomes_count": 0,
         "already_had_outcome_count": 0,
+        "updates_skipped_no_change": 0,
         "created_contracts": 0,
         "contracts_missing_before_create": 0,
         "conflict_outcome_count": 0,
@@ -229,10 +230,14 @@ def build_settlement_updates(
                 build_contract_row(ticker, settled_ts, market, logger)
             )
             existing_outcome = None
+            # New contract rows are created with settlement/close timestamps,
+            # so only outcome changes should require a follow-up update.
+            existing_settled_ts = settled_ts
             counters["created_contracts"] += 1
             counters["contracts_missing_before_create"] += 1
         else:
             existing_outcome = existing.get("outcome")
+            existing_settled_ts = existing.get("settled_ts")
         if outcome is not None:
             if existing_outcome is None or existing_outcome != outcome:
                 counters["updated_outcomes_count"] += 1
@@ -248,6 +253,26 @@ def build_settlement_updates(
         ):
             counters["conflict_outcome_count"] += 1
             error_set.add("outcome_conflict")
+        conflict_without_force = (
+            outcome is not None
+            and existing_outcome is not None
+            and existing_outcome != outcome
+            and not force
+        )
+        needs_outcome_write = (
+            outcome is not None
+            and (
+                existing_outcome is None
+                or existing_outcome != outcome
+            )
+            and not conflict_without_force
+        )
+        needs_settled_ts_write = (
+            settled_ts is not None and existing_settled_ts != settled_ts
+        )
+        if not needs_outcome_write and not needs_settled_ts_write:
+            counters["updates_skipped_no_change"] += 1
+            continue
 
         raw_json = json.dumps(
             {
@@ -309,7 +334,7 @@ async def _apply_updates(
         return 0
     dao = Dao(conn)
     applied = 0
-    for update in updates:
+    for idx, update in enumerate(updates, start=1):
         rowcount = await dao.update_contract_outcome(
             ticker=update["ticker"],
             outcome=update["outcome"],
@@ -320,6 +345,8 @@ async def _apply_updates(
         )
         if rowcount > 0:
             applied += 1
+        if idx % 100 == 0:
+            await conn.commit()
     return applied
 
 
@@ -467,8 +494,10 @@ async def _run() -> int:
 
         dao = Dao(conn)
         if not args.dry_run and create_rows:
-            for row in create_rows:
+            for idx, row in enumerate(create_rows, start=1):
                 await dao.upsert_kalshi_contract(row)
+                if idx % 100 == 0:
+                    await conn.commit()
             await conn.commit()
 
         applied = await _apply_updates(
@@ -503,6 +532,7 @@ async def _run() -> int:
         "markets_with_ticker={markets_with_ticker} "
         "markets_after_since_filter={markets_after_since_filter} "
         "contracts_missing_before_create={contracts_missing_before_create} "
+        "updates_skipped_no_change={updates_skipped_no_change} "
         "updates_built_total={updates_built_total} "
         "updates_with_outcome={updates_with_outcome} "
         "updates_without_outcome={updates_without_outcome} "
@@ -513,6 +543,7 @@ async def _run() -> int:
             contracts_missing_before_create=counters[
                 "contracts_missing_before_create"
             ],
+            updates_skipped_no_change=counters["updates_skipped_no_change"],
             updates_built_total=counters["updates_built_total"],
             updates_with_outcome=counters["updates_with_outcome"],
             updates_without_outcome=counters["updates_without_outcome"],

@@ -15,7 +15,7 @@ from kalshi_bot.app.live_stack_health import collect_live_health, format_live_he
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
-from kalshi_bot.kalshi.market_filters import normalize_series
+from kalshi_bot.kalshi.market_filters import normalize_db_status, normalize_series
 
 
 @dataclass(frozen=True)
@@ -69,15 +69,18 @@ def _parse_args() -> argparse.Namespace:
 
     parser.add_argument("--coinbase-seconds", type=int, default=86400)
     parser.add_argument("--quote-seconds", type=int, default=900)
+    parser.add_argument(
+        "--quote-source",
+        type=str,
+        choices=["ws", "rest"],
+        default="ws",
+    )
     parser.add_argument("--quote-interval", type=float, default=5.0)
     parser.add_argument("--quote-concurrency", type=int, default=5)
     parser.add_argument("--edge-interval-seconds", type=int, default=10)
     parser.add_argument("--max-horizon-seconds", type=int, default=6 * 3600)
     parser.add_argument("--opportunity-interval-seconds", type=int, default=10)
 
-    parser.add_argument("--settlements-every-minutes", type=int, default=15)
-    parser.add_argument("--settlements-since-seconds", type=int, default=2 * 24 * 3600)
-    parser.add_argument("--settlements-limit", type=int, default=600)
     parser.add_argument("--scoring-every-minutes", type=int, default=10)
     parser.add_argument("--scoring-limit", type=int, default=2000)
     parser.add_argument("--report-every-minutes", type=int, default=60)
@@ -256,6 +259,7 @@ async def _run_health_loop(
 
 async def _run() -> int:
     args = _parse_args()
+    args.status = normalize_db_status(args.status)
     args.series = (
         normalize_series(args.series)
         if args.series is not None
@@ -286,19 +290,35 @@ async def _run() -> int:
     if args.component_debug:
         collector_cmd.append("--debug")
 
-    quotes_cmd = [
-        args.python_bin,
-        str(repo_root / "scripts" / "poll_kalshi_quotes.py"),
-        "--seconds",
-        str(args.quote_seconds),
-        "--interval",
-        str(args.quote_interval),
-        "--concurrency",
-        str(args.quote_concurrency),
-        "--status",
-        args.status,
-        *series_args,
-    ]
+    status_value = args.status if args.status is not None else "all"
+    status_args = ["--status", status_value]
+
+    if args.quote_source == "ws":
+        quotes_cmd = [
+            args.python_bin,
+            str(repo_root / "scripts" / "stream_kalshi_quotes_ws.py"),
+            "--seconds",
+            str(args.quote_seconds),
+            "--max-horizon-seconds",
+            str(args.max_horizon_seconds),
+            *status_args,
+            *series_args,
+        ]
+    else:
+        quotes_cmd = [
+            args.python_bin,
+            str(repo_root / "scripts" / "poll_kalshi_quotes.py"),
+            "--seconds",
+            str(args.quote_seconds),
+            "--interval",
+            str(args.quote_interval),
+            "--concurrency",
+            str(args.quote_concurrency),
+            "--max-horizon-seconds",
+            str(args.max_horizon_seconds),
+            *status_args,
+            *series_args,
+        ]
 
     edges_cmd = [
         args.python_bin,
@@ -307,10 +327,9 @@ async def _run() -> int:
         str(args.edge_interval_seconds),
         "--product-id",
         product_id,
-        "--status",
-        args.status,
         "--max-horizon-seconds",
         str(args.max_horizon_seconds),
+        *status_args,
         *series_args,
     ]
     if args.component_debug:

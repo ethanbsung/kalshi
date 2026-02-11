@@ -175,6 +175,7 @@ class KalshiWsClient:
         auth_query_timestamp: str,
         market_tickers: list[str] | None,
         logger: logging.Logger,
+        channels: list[str] | None = None,
         message_source: AsyncIterator[dict[str, Any]] | None = None,
     ) -> None:
         self._ws_url = ws_url
@@ -187,6 +188,7 @@ class KalshiWsClient:
         self._auth_query_signature = auth_query_signature
         self._auth_query_timestamp = auth_query_timestamp
         self._market_tickers = market_tickers or []
+        self._channels = channels or ["orderbook_delta", "ticker"]
         self._logger = logger
         self._message_source = message_source
         self._signer: KalshiSigner | None = None
@@ -227,7 +229,7 @@ class KalshiWsClient:
         return self._ws_url, headers
 
     def _subscribe_message(self) -> dict[str, Any]:
-        params: dict[str, Any] = {"channels": ["orderbook_delta", "ticker"]}
+        params: dict[str, Any] = {"channels": self._channels}
         if self._market_tickers:
             if len(self._market_tickers) == 1:
                 params["market_ticker"] = self._market_tickers[0]
