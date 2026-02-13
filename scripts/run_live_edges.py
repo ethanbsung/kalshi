@@ -12,6 +12,7 @@ import aiosqlite
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
+from kalshi_bot.events import EdgeSnapshotEvent, EventPublisher
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
 from kalshi_bot.kalshi.market_filters import normalize_db_status, normalize_series
@@ -47,6 +48,23 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--contracts", type=int, default=1)
     parser.add_argument("--debug-market", action="append", default=[])
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--events-jsonl-path",
+        type=str,
+        default=None,
+        help="Optional JSONL file path for shadow event publishing.",
+    )
+    parser.add_argument(
+        "--events-bus",
+        action="store_true",
+        help="Publish edge_snapshot events to JetStream.",
+    )
+    parser.add_argument(
+        "--events-bus-url",
+        type=str,
+        default=None,
+        help="JetStream bus URL override (default BUS_URL).",
+    )
     parser.add_argument(
         "--show-titles",
         action=argparse.BooleanOptionalAction,
@@ -166,7 +184,9 @@ def _parse_edge_metadata(raw_json: str | None) -> dict[str, Any]:
 
 
 async def run_tick(
-    conn: aiosqlite.Connection, args: argparse.Namespace
+    conn: aiosqlite.Connection,
+    args: argparse.Namespace,
+    event_sink: EventPublisher | None = None,
 ) -> dict[str, Any]:
     backoffs = [0.2, 0.5, 1.0]
     attempt = 0
@@ -301,14 +321,60 @@ async def run_tick(
                 )
             await dao.insert_kalshi_edge_snapshots(snapshot_rows)
             await conn.commit()
+            event_publish_failures = 0
+            if event_sink is not None and event_sink.enabled:
+                for row in snapshot_rows:
+                    if (
+                        row.get("prob_yes") is None
+                        or row.get("ev_take_yes") is None
+                        or row.get("ev_take_no") is None
+                        or row.get("sigma_annualized") is None
+                        or row.get("spot_price") is None
+                    ):
+                        continue
+                    try:
+                        await event_sink.publish(
+                            EdgeSnapshotEvent(
+                                source="run_live_edges",
+                                payload={
+                                    "asof_ts": int(row["asof_ts"]),
+                                    "market_id": str(row["market_id"]),
+                                    "prob_yes": float(row["prob_yes"]),
+                                    "ev_take_yes": float(row["ev_take_yes"]),
+                                    "ev_take_no": float(row["ev_take_no"]),
+                                    "sigma_annualized": float(
+                                        row["sigma_annualized"]
+                                    ),
+                                    "spot_price": float(row["spot_price"]),
+                                    "quote_ts": (
+                                        int(row["quote_ts"])
+                                        if row["quote_ts"] is not None
+                                        else None
+                                    ),
+                                    "spot_ts": (
+                                        int(row["spot_ts"])
+                                        if row["spot_ts"] is not None
+                                        else None
+                                    ),
+                                },
+                            )
+                        )
+                    except Exception:
+                        event_publish_failures += 1
 
             summary["snapshots_inserted"] = len(snapshot_rows)
             summary["snapshots_total"] = len(snapshot_rows)
             summary["max_spot_age_seconds"] = max_spot_age
             summary["max_quote_age_seconds"] = max_quote_age
+            summary["event_publish_failures"] = event_publish_failures
             return summary
         except sqlite3.OperationalError as exc:
             message = str(exc).lower()
+            if "database is locked" in message:
+                try:
+                    await conn.rollback()
+                except sqlite3.OperationalError:
+                    pass
             if "database is locked" in message and attempt < len(backoffs):
                 await asyncio.sleep(backoffs[attempt])
                 attempt += 1
@@ -370,70 +436,86 @@ async def _run() -> int:
         await conn.execute("PRAGMA synchronous = NORMAL;")
         await conn.execute("PRAGMA busy_timeout = 15000;")
         await conn.commit()
+        bus_url = (
+            args.events_bus_url
+            if args.events_bus_url
+            else (settings.bus_url if args.events_bus else None)
+        )
+        event_sink = await EventPublisher.create(
+            jsonl_path=args.events_jsonl_path,
+            bus_url=bus_url,
+        )
 
         last_edge_log_ts: int | None = None
         last_no_relevant_log_ts: int | None = None
         last_no_relevant_signature: tuple[tuple[str, int], ...] | None = None
-        while True:
-            summary = await run_tick(conn, args)
-            if "error" in summary:
-                error = str(summary.get("error") or "unknown")
-                now_ts = int(
-                    summary.get("now_ts")
-                    or (summary.get("selection") or {}).get("now_ts")
-                    or 0
-                )
-                if error == "no_relevant_markets":
-                    skip_reasons = summary.get("skip_reasons") or {}
-                    signature = tuple(sorted(skip_reasons.items()))
-                    should_log = False
-                    if last_no_relevant_log_ts is None:
-                        should_log = True
-                    elif signature != last_no_relevant_signature:
-                        should_log = True
-                    elif now_ts > 0 and (
-                        now_ts - last_no_relevant_log_ts
-                    ) >= NO_RELEVANT_HEARTBEAT_SECONDS:
-                        should_log = True
-                    if should_log:
+        try:
+            while True:
+                summary = await run_tick(conn, args, event_sink=event_sink)
+                if "error" in summary:
+                    try:
+                        await conn.rollback()
+                    except sqlite3.OperationalError:
+                        pass
+                    error = str(summary.get("error") or "unknown")
+                    now_ts = int(
+                        summary.get("now_ts")
+                        or (summary.get("selection") or {}).get("now_ts")
+                        or 0
+                    )
+                    if error == "no_relevant_markets":
+                        skip_reasons = summary.get("skip_reasons") or {}
+                        signature = tuple(sorted(skip_reasons.items()))
+                        should_log = False
+                        if last_no_relevant_log_ts is None:
+                            should_log = True
+                        elif signature != last_no_relevant_signature:
+                            should_log = True
+                        elif now_ts > 0 and (
+                            now_ts - last_no_relevant_log_ts
+                        ) >= NO_RELEVANT_HEARTBEAT_SECONDS:
+                            should_log = True
+                        if should_log:
+                            print(f"ERROR: {error}")
+                            selection = summary.get("selection", {})
+                            if selection:
+                                print(f"selection_summary={selection}")
+                            if skip_reasons:
+                                print(f"skip_reasons={skip_reasons}")
+                            last_no_relevant_log_ts = now_ts if now_ts > 0 else 0
+                            last_no_relevant_signature = signature
+                    else:
                         print(f"ERROR: {error}")
                         selection = summary.get("selection", {})
                         if selection:
                             print(f"selection_summary={selection}")
-                        if skip_reasons:
-                            print(f"skip_reasons={skip_reasons}")
-                        last_no_relevant_log_ts = now_ts if now_ts > 0 else 0
-                        last_no_relevant_signature = signature
+                        if summary.get("skip_reasons"):
+                            print(f"skip_reasons={summary['skip_reasons']}")
                 else:
-                    print(f"ERROR: {error}")
-                    selection = summary.get("selection", {})
-                    if selection:
-                        print(f"selection_summary={selection}")
-                    if summary.get("skip_reasons"):
-                        print(f"skip_reasons={summary['skip_reasons']}")
-            else:
-                now_ts = int(summary.get("now_ts") or 0)
-                should_log_summary = (
-                    last_edge_log_ts is None
-                    or now_ts <= 0
-                    or (now_ts - last_edge_log_ts) >= EDGE_SUMMARY_HEARTBEAT_SECONDS
-                )
-                if should_log_summary:
-                    print(
-                        "asof_ts={now_ts} edges_inserted={edges_inserted} "
-                        "snapshots_inserted={snapshots_inserted} "
-                        "max_spot_age_seconds={max_spot_age_seconds} "
-                        "max_quote_age_seconds={max_quote_age_seconds}".format(
-                            **summary
-                        )
+                    now_ts = int(summary.get("now_ts") or 0)
+                    should_log_summary = (
+                        last_edge_log_ts is None
+                        or now_ts <= 0
+                        or (now_ts - last_edge_log_ts) >= EDGE_SUMMARY_HEARTBEAT_SECONDS
                     )
-                    if now_ts > 0:
-                        last_edge_log_ts = now_ts
-                if args.debug:
-                    _print_debug(summary, args.show_titles)
-            if args.once:
-                return 0
-            await asyncio.sleep(args.interval_seconds)
+                    if should_log_summary:
+                        print(
+                            "asof_ts={now_ts} edges_inserted={edges_inserted} "
+                            "snapshots_inserted={snapshots_inserted} "
+                            "max_spot_age_seconds={max_spot_age_seconds} "
+                            "max_quote_age_seconds={max_quote_age_seconds}".format(
+                                **summary
+                            )
+                        )
+                        if now_ts > 0:
+                            last_edge_log_ts = now_ts
+                    if args.debug:
+                        _print_debug(summary, args.show_titles)
+                if args.once:
+                    return 0
+                await asyncio.sleep(args.interval_seconds)
+        finally:
+            await event_sink.close()
 
 
 def main() -> int:

@@ -103,6 +103,7 @@ def parse_ticker_message(
     return {
         "ts": ts,
         "market_id": market_ticker,
+        "seq": _parse_int(message.get("seq")),
         "price": _parse_float(msg.get("price")),
         "best_yes_bid": yes_bid,
         "best_yes_ask": yes_ask,

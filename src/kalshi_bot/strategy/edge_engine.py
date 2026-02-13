@@ -507,6 +507,10 @@ async def _record_sigma(
         )
         return True
     except sqlite3.OperationalError:
+        try:
+            await conn.rollback()
+        except sqlite3.OperationalError:
+            pass
         return False
 
 
@@ -836,6 +840,7 @@ async def compute_edges(
         series=series,
         product_id=product_id,
         spot_price=spot_price,
+        spot_ts=spot_ts,
         now_ts=now_ts,
         freshness_seconds=freshness_seconds,
         max_horizon_seconds=max_horizon_seconds,
@@ -865,6 +870,15 @@ async def compute_edges(
             untradable = selection.get("excluded_untradable")
             if untradable:
                 skip_reasons["missing_both_sides"] = int(untradable)
+        # Ensure we do not leave a pending transaction from sigma persistence
+        # when returning early on an empty universe.
+        try:
+            await conn.commit()
+        except sqlite3.OperationalError:
+            try:
+                await conn.rollback()
+            except sqlite3.OperationalError:
+                pass
         return {
             "error": "no_relevant_markets",
             "edges_inserted": 0,

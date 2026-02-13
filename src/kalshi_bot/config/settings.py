@@ -74,6 +74,21 @@ class Settings(BaseModel):
         default=None, alias="KALSHI_SERIES_TICKER"
     )
 
+    bus_url: str = Field(default="nats://127.0.0.1:4222", alias="BUS_URL")
+    bus_stream_retention_hours: int = Field(
+        default=168, alias="BUS_STREAM_RETENTION_HOURS"
+    )
+    bus_consumer_lag_alert_threshold: int = Field(
+        default=1000, alias="BUS_CONSUMER_LAG_ALERT_THRESHOLD"
+    )
+
+    pg_dsn: str | None = Field(default=None, alias="PG_DSN")
+    pg_pool_min: int = Field(default=2, alias="PG_POOL_MIN")
+    pg_pool_max: int = Field(default=10, alias="PG_POOL_MAX")
+    pg_statement_timeout_ms: int = Field(
+        default=5000, alias="PG_STATEMENT_TIMEOUT_MS"
+    )
+
 
 def load_settings(env_file: str | None = None) -> Settings:
     load_dotenv(env_file)

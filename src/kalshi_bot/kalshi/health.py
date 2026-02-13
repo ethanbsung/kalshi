@@ -130,6 +130,7 @@ async def get_relevant_universe(
     series: list[str] | None,
     product_id: str,
     spot_price: float | None = None,
+    spot_ts: int | None = None,
     *,
     now_ts: int | None = None,
     freshness_seconds: int = 300,
@@ -143,7 +144,6 @@ async def get_relevant_universe(
 ) -> tuple[list[str], float | None, dict[str, Any]]:
     status = normalize_db_status(status)
     now_ts = int(time.time()) if now_ts is None else int(now_ts)
-    spot_ts = None
     if spot_price is None:
         spot = await get_latest_spot_price(conn, product_id)
         spot_price = spot["price"]

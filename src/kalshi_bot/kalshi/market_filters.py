@@ -12,9 +12,6 @@ def normalize_db_status(status: str | None) -> str | None:
     normalized = status.strip().lower()
     if not normalized or normalized == "all":
         return None
-    # Kalshi REST commonly uses "open", while kalshi_markets.status is "active".
-    if normalized == "open":
-        return "active"
     return normalized
 
 

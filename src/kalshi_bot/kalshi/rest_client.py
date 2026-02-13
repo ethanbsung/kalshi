@@ -39,6 +39,18 @@ class KalshiRestClient:
         self._timeout = timeout
         self._signer: KalshiSigner | None = None
 
+    @staticmethod
+    def _normalize_markets_status(status: str | None) -> str | None:
+        if status is None:
+            return None
+        normalized = str(status).strip().lower()
+        if not normalized:
+            return None
+        # Internal DB status uses "active"; Kalshi REST markets endpoint expects "open".
+        if normalized == "active":
+            return "open"
+        return normalized
+
     def _ensure_signer(self) -> KalshiSigner:
         if not self._api_key_id or not self._private_key_path:
             raise RuntimeError("Kalshi API credentials are required for REST calls")
@@ -148,6 +160,7 @@ class KalshiRestClient:
         max_total: int | None = None,
         end_time: float | None = None,
     ) -> list[dict[str, Any]]:
+        status = self._normalize_markets_status(status)
         markets: list[dict[str, Any]] = []
         cursor: str | None = None
         pages = 0
@@ -209,6 +222,7 @@ class KalshiRestClient:
         max_pages: int | None = None,
         end_time: float | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        status = self._normalize_markets_status(status)
         markets: list[dict[str, Any]] = []
         payloads: list[dict[str, Any]] = []
         cursor: str | None = None

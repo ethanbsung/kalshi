@@ -276,7 +276,7 @@ def build_opportunities_from_snapshots(
                 ev_snapshot = _safe_float(ev_take_yes)
                 # Decision EV should always reflect current snapshot inputs.
                 ev_recomputed = fee_aware_ev_take_yes(prob_yes, yes_ask)
-                ev = ev_recomputed if ev_recomputed is not None else ev_snapshot
+                ev = ev_snapshot if ev_snapshot is not None else ev_recomputed
                 # Invariant should compare with the exact inputs used by edge engine.
                 ev_recomputed_invariant = fee_aware_ev_take_yes(
                     edge_prob_yes,
@@ -327,7 +327,7 @@ def build_opportunities_from_snapshots(
                 ev_snapshot = _safe_float(ev_take_no)
                 # Decision EV should always reflect current snapshot inputs.
                 ev_recomputed = fee_aware_ev_take_no(prob_yes, no_ask)
-                ev = ev_recomputed if ev_recomputed is not None else ev_snapshot
+                ev = ev_snapshot if ev_snapshot is not None else ev_recomputed
                 # Invariant should compare with the exact inputs used by edge engine.
                 ev_recomputed_invariant = fee_aware_ev_take_no(
                     edge_prob_yes,

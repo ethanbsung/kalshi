@@ -366,29 +366,44 @@ class KalshiQuotePoller:
 
         dao = Dao(conn)
         write_backoffs = list(self._write_backoffs)
-        write_error: sqlite3.OperationalError | None = None
-        for attempt in range(len(write_backoffs) + 1):
+        inserted_count = 0
+        failed_write_rows: list[dict[str, Any]] = []
+        for row in rows:
             try:
-                for row in rows:
-                    await dao.insert_kalshi_quote(row)
-                await conn.commit()
-                write_error = None
-                break
+                await dao.insert_kalshi_quote(row)
+                inserted_count += 1
             except sqlite3.OperationalError as exc:
                 if not self._is_locked_error(exc):
                     raise
-                write_error = exc
-                await conn.rollback()
-                if attempt < len(write_backoffs):
-                    await asyncio.sleep(write_backoffs[attempt])
-                    continue
+                failed_write_rows.append(row)
 
-        if write_error is not None:
-            error_counts["unknown"] += len(rows)
-            for row in rows:
-                add_failed_sample(
-                    failed_samples, failed_set, row.get("market_id")
-                )
+        commit_error: sqlite3.OperationalError | None = None
+        if inserted_count > 0:
+            for attempt in range(len(write_backoffs) + 1):
+                try:
+                    await conn.commit()
+                    commit_error = None
+                    break
+                except sqlite3.OperationalError as exc:
+                    if not self._is_locked_error(exc):
+                        raise
+                    commit_error = exc
+                    if attempt < len(write_backoffs):
+                        await asyncio.sleep(write_backoffs[attempt])
+            if commit_error is not None:
+                # Clear pending transaction state before next iteration.
+                await conn.rollback()
+
+        write_failures = len(failed_write_rows)
+        if write_failures > 0:
+            error_counts["unknown"] += write_failures
+            for row in failed_write_rows:
+                add_failed_sample(failed_samples, failed_set, row.get("market_id"))
+
+        if commit_error is not None:
+            error_counts["unknown"] += inserted_count
+            for row in rows[:inserted_count]:
+                add_failed_sample(failed_samples, failed_set, row.get("market_id"))
             summary = {
                 "successes": max(len(results) - sum(error_counts.values()), 0),
                 "failures": sum(error_counts.values()),
@@ -401,7 +416,7 @@ class KalshiQuotePoller:
                 extra={
                     **summary,
                     "attempts": len(write_backoffs) + 1,
-                    "error": str(write_error),
+                    "error": str(commit_error),
                 },
             )
             return summary
@@ -409,7 +424,7 @@ class KalshiQuotePoller:
         summary = {
             "successes": max(len(results) - sum(error_counts.values()), 0),
             "failures": sum(error_counts.values()),
-            "inserted": len(rows),
+            "inserted": inserted_count,
             "error_counts": error_counts,
             "failed_tickers_sample": failed_samples,
         }

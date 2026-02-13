@@ -24,6 +24,10 @@ dev = [
   "ruff==0.4.10",
   "mypy==1.10.0",
 ]
+live = [
+  "nats-py==2.8.0",
+  "psycopg[binary]==3.2.1",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

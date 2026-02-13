@@ -5,11 +5,12 @@ import json
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, Protocol
 
 import aiosqlite
 
 from kalshi_bot.data.dao import Dao
+from kalshi_bot.events import ContractUpdateEvent
 from kalshi_bot.kalshi.error_utils import (
     add_failed_sample,
     classify_exception,
@@ -205,6 +206,15 @@ async def load_market_rows(
     return [(row[0], row[1]) for row in rows if row and row[0]]
 
 
+class EventSink(Protocol):
+    @property
+    def enabled(self) -> bool:
+        ...
+
+    async def publish(self, event: ContractUpdateEvent) -> None:
+        ...
+
+
 class KalshiContractRefresher:
     def __init__(
         self,
@@ -218,14 +228,20 @@ class KalshiContractRefresher:
 
     async def refresh(
         self,
-        conn: aiosqlite.Connection,
+        conn: aiosqlite.Connection | None,
         status: str | None = None,
         series: list[str] | None = None,
         rows: list[tuple[str, int | None]] | None = None,
         end_time: float | None = None,
+        event_sink: EventSink | None = None,
+        publish_only: bool = False,
     ) -> dict[str, Any]:
         normalized_series = normalize_series(series)
         if rows is None:
+            if conn is None:
+                raise ValueError(
+                    "conn is required when rows are not provided in refresh()"
+                )
             rows = await load_market_rows(conn, status, normalized_series)
         self._logger.info(
             "kalshi_contracts_load_markets",
@@ -287,13 +303,14 @@ class KalshiContractRefresher:
         tasks = [asyncio.create_task(fetch_market(ticker)) for ticker, _ in rows]
         payloads = await asyncio.gather(*tasks)
 
-        dao = Dao(conn)
+        dao = Dao(conn) if (conn is not None and not publish_only) else None
         successes = 0
         failures = 0
         upserted = 0
         error_counts = init_error_counts()
         failed_samples: list[str] = []
         failed_set: set[str] = set()
+        event_publish_failures = 0
 
         for (ticker, settlement_ts), (_, market, bucket) in zip(rows, payloads):
             if bucket is not None:
@@ -304,13 +321,37 @@ class KalshiContractRefresher:
             else:
                 successes += 1
             row = build_contract_row(ticker, settlement_ts, market, self._logger)
-            await dao.upsert_kalshi_contract(row)
-            upserted += 1
+            if dao is not None:
+                await dao.upsert_kalshi_contract(row)
+                upserted += 1
+            if event_sink is not None and event_sink.enabled:
+                try:
+                    await event_sink.publish(
+                        ContractUpdateEvent(
+                            source="refresh_kalshi_contracts",
+                            payload={
+                                "ticker": str(row["ticker"]),
+                                "lower": row.get("lower"),
+                                "upper": row.get("upper"),
+                                "strike_type": row.get("strike_type"),
+                                "close_ts": row.get("close_ts"),
+                                "expected_expiration_ts": row.get(
+                                    "expected_expiration_ts"
+                                ),
+                                "expiration_ts": row.get("expiration_ts"),
+                                "settled_ts": row.get("settled_ts"),
+                                "outcome": row.get("outcome"),
+                            },
+                        )
+                    )
+                except Exception:
+                    event_publish_failures += 1
             # Release writer lock periodically to reduce SQLite contention.
-            if upserted % 100 == 0:
+            if dao is not None and upserted % 100 == 0:
                 await conn.commit()
 
-        await conn.commit()
+        if dao is not None:
+            await conn.commit()
 
         self._logger.info(
             "kalshi_contracts_refresh_summary",
@@ -320,6 +361,7 @@ class KalshiContractRefresher:
                 "upserted": upserted,
                 "error_counts": error_counts,
                 "failed_tickers_sample": failed_samples,
+                "event_publish_failures": event_publish_failures,
             },
         )
         return {
@@ -328,4 +370,5 @@ class KalshiContractRefresher:
             "upserted": upserted,
             "error_counts": error_counts,
             "failed_tickers_sample": failed_samples,
+            "event_publish_failures": event_publish_failures,
         }

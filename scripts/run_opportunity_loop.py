@@ -15,6 +15,7 @@ import aiosqlite
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
+from kalshi_bot.events import EventPublisher, OpportunityDecisionEvent
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.strategy.opportunity_engine import (
     OpportunityConfig,
@@ -64,6 +65,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-ask-cents", type=float, default=99.0)
     parser.add_argument("--max-spot-age", type=int, default=None)
     parser.add_argument("--max-quote-age", type=int, default=None)
+    parser.add_argument(
+        "--max-snapshot-age-seconds",
+        type=int,
+        default=60,
+        help="If latest snapshot is older than this, skip opportunity generation.",
+    )
     parser.add_argument("--paper", action="store_true", default=True)
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -101,6 +108,23 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Maximum TAKE signals to keep per tick after gating.",
+    )
+    parser.add_argument(
+        "--events-jsonl-path",
+        type=str,
+        default=None,
+        help="Optional JSONL file path for shadow event publishing.",
+    )
+    parser.add_argument(
+        "--events-bus",
+        action="store_true",
+        help="Publish opportunity_decision events to JetStream.",
+    )
+    parser.add_argument(
+        "--events-bus-url",
+        type=str,
+        default=None,
+        help="JetStream bus URL override (default BUS_URL).",
     )
     return parser.parse_args()
 
@@ -458,6 +482,17 @@ async def run_tick(conn: aiosqlite.Connection, args: argparse.Namespace) -> dict
     asof_ts = await _load_latest_asof_ts(conn)
     if asof_ts is None:
         return {"error": "no_edge_snapshots"}
+    max_snapshot_age_seconds = max(int(args.max_snapshot_age_seconds or 0), 0)
+    if max_snapshot_age_seconds > 0:
+        now_ts = int(time.time())
+        snapshot_age_seconds = max(0, now_ts - asof_ts)
+        if snapshot_age_seconds > max_snapshot_age_seconds:
+            return {
+                "error": "stale_edge_snapshots",
+                "asof_ts": asof_ts,
+                "snapshot_age_seconds": snapshot_age_seconds,
+                "max_snapshot_age_seconds": max_snapshot_age_seconds,
+            }
     snapshots = await _load_snapshots(conn, asof_ts)
     config = OpportunityConfig(
         min_ev=args.min_ev,
@@ -625,104 +660,192 @@ async def _run_loop() -> int:
         await conn.execute("PRAGMA synchronous = NORMAL;")
         await conn.execute("PRAGMA busy_timeout = 15000;")
         await conn.commit()
+        bus_url = (
+            args.events_bus_url
+            if args.events_bus_url
+            else (settings.bus_url if args.events_bus else None)
+        )
+        event_sink = await EventPublisher.create(
+            jsonl_path=args.events_jsonl_path,
+            bus_url=bus_url,
+        )
+        event_publish_failures_total = 0
 
         backoff = [0.2, 0.5, 1.0]
         last_stdout_asof_ts: int | None = None
         last_stdout_log_ts: int | None = None
         last_ev_invariant_warn_asof_ts: int | None = None
-        while True:
-            try:
-                summary = await run_tick(conn, args)
-            except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower():
-                    raise
-                for delay in backoff:
-                    await asyncio.sleep(delay)
-                    try:
-                        summary = await run_tick(conn, args)
-                        break
-                    except sqlite3.OperationalError as retry_exc:
-                        if "locked" not in str(retry_exc).lower():
-                            raise
-                else:
-                    summary = {"error": "db_locked"}
+        last_stale_snapshot_log_ts: int | None = None
+        try:
+            while True:
+                try:
+                    summary = await run_tick(conn, args)
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc).lower():
+                        raise
+                    for delay in backoff:
+                        await asyncio.sleep(delay)
+                        try:
+                            summary = await run_tick(conn, args)
+                            break
+                        except sqlite3.OperationalError as retry_exc:
+                            if "locked" not in str(retry_exc).lower():
+                                raise
+                    else:
+                        summary = {"error": "db_locked"}
 
-            if "error" in summary:
-                logger.warning(
-                    "opportunity_tick_error",
-                    extra={"error": summary["error"]},
-                )
-                print(f"tick_error={summary['error']}")
-            else:
-                asof_ts = int(summary.get("asof_ts") or 0)
-                takes = int(summary.get("takes") or 0)
-                inserted = int(summary.get("inserted") or 0)
-                ev_invariant_failed = int(
-                    (summary.get("counters") or {}).get("ev_invariant_failed") or 0
-                )
-                if (
-                    ev_invariant_failed > 0
-                    and last_ev_invariant_warn_asof_ts != asof_ts
-                ):
-                    logger.warning(
-                        "opportunity_ev_invariant_failed",
-                        extra={
-                            "asof_ts": asof_ts,
-                            "count": ev_invariant_failed,
-                            "max_diff": float(
-                                (summary.get("counters") or {}).get(
-                                    "ev_invariant_max_diff"
+                if "error" in summary:
+                    error = str(summary.get("error") or "unknown")
+                    if error == "stale_edge_snapshots":
+                        now_ts = int(time.time())
+                        should_log = (
+                            last_stale_snapshot_log_ts is None
+                            or (now_ts - last_stale_snapshot_log_ts) >= 60
+                        )
+                        if should_log:
+                            logger.warning(
+                                "opportunity_tick_error",
+                                extra={
+                                    "error": error,
+                                    "asof_ts": summary.get("asof_ts"),
+                                    "snapshot_age_seconds": summary.get(
+                                        "snapshot_age_seconds"
+                                    ),
+                                    "max_snapshot_age_seconds": summary.get(
+                                        "max_snapshot_age_seconds"
+                                    ),
+                                },
+                            )
+                            print(
+                                "tick_error={error} asof_ts={asof_ts} "
+                                "snapshot_age_s={snapshot_age_s} max_snapshot_age_s={max_age}".format(
+                                    error=error,
+                                    asof_ts=summary.get("asof_ts"),
+                                    snapshot_age_s=summary.get("snapshot_age_seconds"),
+                                    max_age=summary.get("max_snapshot_age_seconds"),
                                 )
-                                or 0.0
-                            ),
-                            "snapshots": int(summary.get("snapshots") or 0),
-                        },
-                    )
-                    last_ev_invariant_warn_asof_ts = asof_ts
-                should_print_tick = takes > 0 or inserted > 0
-                if not should_print_tick:
-                    if last_stdout_asof_ts == asof_ts:
-                        should_print_tick = False
-                    elif (
-                        last_stdout_log_ts is None
-                        or (asof_ts - last_stdout_log_ts)
-                        >= OPPORTUNITY_STDOUT_HEARTBEAT_SECONDS
-                    ):
-                        should_print_tick = True
-                if should_print_tick:
-                    print(
-                        "opportunity_tick ts={asof_ts} snapshots={snapshots} "
-                        "takes={takes} passes={passes} inserted={inserted} "
-                        "open_positions={open_positions}".format(
-                            **summary
-                        )
-                    )
-                    last_stdout_asof_ts = asof_ts
-                    if asof_ts > 0:
-                        last_stdout_log_ts = asof_ts
-                if not args.disable_decision_log:
-                    try:
-                        _write_decision_log(
-                            path=decision_log_path,
-                            summary=summary,
-                            min_ev=args.min_ev,
-                            pass_reason_limit=args.decision_pass_reason_limit,
-                            pass_sample_limit=args.decision_pass_sample_limit,
-                        )
-                    except OSError as exc:
+                            )
+                            last_stale_snapshot_log_ts = now_ts
+                    else:
                         logger.warning(
-                            "decision_log_write_failed",
+                            "opportunity_tick_error",
+                            extra={"error": error},
+                        )
+                        print(f"tick_error={error}")
+                else:
+                    asof_ts = int(summary.get("asof_ts") or 0)
+                    takes = int(summary.get("takes") or 0)
+                    inserted = int(summary.get("inserted") or 0)
+                    if event_sink.enabled:
+                        for row in summary.get("take_rows") or []:
+                            try:
+                                await event_sink.publish(
+                                    OpportunityDecisionEvent(
+                                        source="run_opportunity_loop",
+                                        payload={
+                                            "ts_eval": int(row.get("ts_eval") or asof_ts),
+                                            "market_id": str(row.get("market_id") or ""),
+                                            "eligible": bool(
+                                                int(row.get("eligible") or 0) == 1
+                                            ),
+                                            "would_trade": bool(
+                                                int(row.get("would_trade") or 0) == 1
+                                            ),
+                                            "side": (
+                                                str(row.get("side"))
+                                                if row.get("side") is not None
+                                                else None
+                                            ),
+                                            "reason_not_eligible": (
+                                                str(row.get("reason_not_eligible"))
+                                                if row.get("reason_not_eligible")
+                                                is not None
+                                                else None
+                                            ),
+                                            "ev_raw": (
+                                                float(row.get("ev_raw"))
+                                                if row.get("ev_raw") is not None
+                                                else None
+                                            ),
+                                            "ev_net": (
+                                                float(row.get("ev_net"))
+                                                if row.get("ev_net") is not None
+                                                else None
+                                            ),
+                                        },
+                                    )
+                                )
+                            except Exception:
+                                event_publish_failures_total += 1
+                    ev_invariant_failed = int(
+                        (summary.get("counters") or {}).get("ev_invariant_failed") or 0
+                    )
+                    if (
+                        ev_invariant_failed > 0
+                        and last_ev_invariant_warn_asof_ts != asof_ts
+                    ):
+                        logger.warning(
+                            "opportunity_ev_invariant_failed",
                             extra={
-                                "path": str(decision_log_path),
-                                "error": str(exc),
+                                "asof_ts": asof_ts,
+                                "count": ev_invariant_failed,
+                                "max_diff": float(
+                                    (summary.get("counters") or {}).get(
+                                        "ev_invariant_max_diff"
+                                    )
+                                    or 0.0
+                                ),
+                                "snapshots": int(summary.get("snapshots") or 0),
                             },
                         )
-                if args.debug:
-                    print(f"counters={summary['counters']}")
+                        last_ev_invariant_warn_asof_ts = asof_ts
+                    should_print_tick = takes > 0 or inserted > 0
+                    if not should_print_tick:
+                        if last_stdout_asof_ts == asof_ts:
+                            should_print_tick = False
+                        elif (
+                            last_stdout_log_ts is None
+                            or (asof_ts - last_stdout_log_ts)
+                            >= OPPORTUNITY_STDOUT_HEARTBEAT_SECONDS
+                        ):
+                            should_print_tick = True
+                    if should_print_tick:
+                        print(
+                            "opportunity_tick ts={asof_ts} snapshots={snapshots} "
+                            "takes={takes} passes={passes} inserted={inserted} "
+                            "open_positions={open_positions} event_publish_failures_total={event_failures}".format(
+                                event_failures=event_publish_failures_total,
+                                **summary,
+                            )
+                        )
+                        last_stdout_asof_ts = asof_ts
+                        if asof_ts > 0:
+                            last_stdout_log_ts = asof_ts
+                    if not args.disable_decision_log:
+                        try:
+                            _write_decision_log(
+                                path=decision_log_path,
+                                summary=summary,
+                                min_ev=args.min_ev,
+                                pass_reason_limit=args.decision_pass_reason_limit,
+                                pass_sample_limit=args.decision_pass_sample_limit,
+                            )
+                        except OSError as exc:
+                            logger.warning(
+                                "decision_log_write_failed",
+                                extra={
+                                    "path": str(decision_log_path),
+                                    "error": str(exc),
+                                },
+                            )
+                    if args.debug:
+                        print(f"counters={summary['counters']}")
 
-            if args.once:
-                break
-            await asyncio.sleep(args.interval_seconds)
+                if args.once:
+                    break
+                await asyncio.sleep(args.interval_seconds)
+        finally:
+            await event_sink.close()
 
     return 0
 

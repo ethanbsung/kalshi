@@ -164,6 +164,10 @@ class Dao:
     def __init__(self, conn: aiosqlite.Connection) -> None:
         self._conn = conn
 
+    @staticmethod
+    def _is_locked_error(exc: sqlite3.OperationalError) -> bool:
+        return "locked" in str(exc).lower()
+
     async def _execute_with_retry(
         self, sql: str, params: tuple[Any, ...], attempts: int = 10
     ) -> aiosqlite.Cursor:
@@ -171,7 +175,9 @@ class Dao:
             try:
                 return await self._conn.execute(sql, params)
             except sqlite3.OperationalError as exc:
-                if "database is locked" not in str(exc).lower() or attempt == attempts - 1:
+                if not self._is_locked_error(exc):
+                    raise
+                if attempt == attempts - 1:
                     raise
                 await asyncio.sleep(min(0.05 * (2**attempt), 1.0))
         raise RuntimeError("unreachable")
@@ -184,7 +190,9 @@ class Dao:
                 await self._conn.executemany(sql, values)
                 return
             except sqlite3.OperationalError as exc:
-                if "database is locked" not in str(exc).lower() or attempt == attempts - 1:
+                if not self._is_locked_error(exc):
+                    raise
+                if attempt == attempts - 1:
                     raise
                 await asyncio.sleep(min(0.05 * (2**attempt), 1.0))
 
