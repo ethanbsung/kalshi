@@ -171,6 +171,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--edge-interval-seconds", type=int, default=10)
     parser.add_argument("--max-horizon-seconds", type=int, default=6 * 3600)
     parser.add_argument("--opportunity-interval-seconds", type=int, default=10)
+    parser.add_argument(
+        "--opportunity-cost-buffer",
+        type=float,
+        default=0.01,
+        help="Fixed per-contract EV haircut passed to run_opportunity_loop.",
+    )
     parser.add_argument("--execution-interval-seconds", type=float, default=1.0)
     parser.add_argument("--execution-log-every-seconds", type=float, default=10.0)
     parser.add_argument("--execution-max-open-positions", type=int, default=None)
@@ -778,7 +784,8 @@ async def _run() -> int:
     if args.quote_source == "ws":
         quotes_cmd = [
             args.python_bin,
-            str(repo_root / "scripts" / "stream_kalshi_quotes_ws.py"),
+            "-m",
+            "kalshi_bot.app.stream_kalshi_quotes_ws",
             "--seconds",
             str(args.quote_seconds),
             "--max-horizon-seconds",
@@ -866,6 +873,8 @@ async def _run() -> int:
         str(repo_root / "scripts" / "run_opportunity_loop.py"),
         "--interval-seconds",
         str(args.opportunity_interval_seconds),
+        "--cost-buffer",
+        str(args.opportunity_cost_buffer),
         "--max-snapshot-age-seconds",
         str(args.health_max_snapshot_age_seconds),
         "--state-source",
@@ -953,12 +962,14 @@ async def _run() -> int:
     ]
     refresh_markets_cmd = [
         args.python_bin,
-        str(repo_root / "scripts" / "refresh_btc_markets.py"),
+        "-m",
+        "kalshi_bot.app.refresh_btc_markets",
         *status_args,
     ]
     refresh_contracts_cmd = [
         args.python_bin,
-        str(repo_root / "scripts" / "refresh_kalshi_contracts.py"),
+        "-m",
+        "kalshi_bot.app.refresh_kalshi_contracts",
         *status_args,
         *series_args,
         "--refresh-age-seconds",
@@ -966,7 +977,8 @@ async def _run() -> int:
     ]
     refresh_settlements_cmd = [
         args.python_bin,
-        str(repo_root / "scripts" / "refresh_kalshi_settlements.py"),
+        "-m",
+        "kalshi_bot.app.refresh_kalshi_settlements",
         "--status",
         "resolved",
         "--since-seconds",

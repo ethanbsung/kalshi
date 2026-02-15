@@ -24,11 +24,11 @@ As of 2026-02-13:
     - `scripts/run_persistence_service.py`
   - Shadow event emission wired for current runtime producers:
     - spot ticks (`collector.py`)
-    - quote updates (`stream_kalshi_quotes_ws.py`)
+    - quote updates (`kalshi_bot.app.stream_kalshi_quotes_ws`)
     - edge snapshots (`run_live_edges.py`)
     - opportunity decisions (`run_opportunity_loop.py`)
-    - market lifecycle (`refresh_btc_markets.py`)
-    - contract updates (`refresh_kalshi_contracts.py`)
+    - market lifecycle (`kalshi_bot.app.refresh_btc_markets`)
+    - contract updates (`kalshi_bot.app.refresh_kalshi_contracts`)
     - live stack wiring (`run_live_stack.py`) for event shadow files
     - optional JetStream producer mode across all core emitters
       (`--events-bus`, `--events-bus-url`) and stack-level pass-through
@@ -42,7 +42,7 @@ As of 2026-02-13:
     - `scripts/phase_a_infra_down.sh`
   - Phase B ingest controls:
     - `collector.py` supports `--coinbase-publish-only`
-    - `stream_kalshi_quotes_ws.py` supports `--publish-only`
+    - `kalshi_bot.app.stream_kalshi_quotes_ws` supports `--publish-only`
     - `run_live_stack.py` supports component disable flags for ingest-only soaks
     - `docs/PHASE_B_VALIDATION.md`
   - Phase C state/edge cutover foundations:

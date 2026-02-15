@@ -74,6 +74,12 @@ def _parse_args() -> argparse.Namespace:
         help="Read snapshots from SQLite tables (legacy) or event bus (Phase D).",
     )
     parser.add_argument("--min-ev", type=float, default=0.03)
+    parser.add_argument(
+        "--cost-buffer",
+        type=float,
+        default=0.01,
+        help="Fixed per-contract EV haircut (dollars) applied as ev_net = ev_raw - cost_buffer.",
+    )
     parser.add_argument("--top-n", type=int, default=None)
     parser.add_argument("--emit-passes", action="store_true")
     parser.add_argument("--both-sides", action="store_true")
@@ -285,7 +291,10 @@ def _format_decision_line(label: str, asof_ts: int, row: dict[str, Any]) -> str:
         f"market={row.get('market_id') or 'NA'} "
         f"side={row.get('side') or 'NA'} "
         f"reason={_decision_reason(row)} "
-        f"ev={_fmt_num(row.get('ev_raw'), 4)} "
+        f"ev={_fmt_num(row.get('ev_net'), 4)} "
+        f"ev_raw={_fmt_num(row.get('ev_raw'), 4)} "
+        f"ev_net={_fmt_num(row.get('ev_net'), 4)} "
+        f"cost_buffer={_fmt_num(row.get('cost_buffer'), 4)} "
         f"p_model={_fmt_num(row.get('p_model'), 4)} "
         f"p_market={_fmt_num(row.get('p_market'), 4)} "
         f"sigma={_fmt_num(row.get('sigma'), 4)} "
@@ -419,9 +428,9 @@ def _select_pass_samples(
     near_miss = [
         row
         for row in pass_rows
-        if _decision_reason(row) == "ev_below_threshold" and row.get("ev_raw") is not None
+        if _decision_reason(row) == "ev_below_threshold" and row.get("ev_net") is not None
     ]
-    near_miss.sort(key=lambda r: float(r.get("ev_raw") or -1e9), reverse=True)
+    near_miss.sort(key=lambda r: float(r.get("ev_net") or -1e9), reverse=True)
     for row in near_miss:
         add_row(row)
         if len(samples) >= limit:
@@ -432,7 +441,7 @@ def _select_pass_samples(
         reason_rows = [row for row in pass_rows if _decision_reason(row) == reason]
         reason_rows.sort(
             key=lambda r: (
-                float(r.get("ev_raw") or -1e9),
+                float(r.get("ev_net") or -1e9),
                 str(r.get("market_id") or ""),
             ),
             reverse=True,
@@ -450,6 +459,7 @@ def _write_decision_log(
     path: Path,
     summary: dict[str, Any],
     min_ev: float,
+    cost_buffer: float,
     pass_reason_limit: int,
     pass_sample_limit: int,
 ) -> None:
@@ -488,7 +498,7 @@ def _write_decision_log(
                 min(max(pass_sample_limit, 0), 1),
             )
 
-    take_rows.sort(key=lambda r: float(r.get("ev_raw") or -1e9), reverse=True)
+    take_rows.sort(key=lambda r: float(r.get("ev_net") or -1e9), reverse=True)
 
     should_write_tick = True
     if int(summary.get("takes") or 0) == 0:
@@ -507,7 +517,7 @@ def _write_decision_log(
                 f"asof_ts={asof_ts} snapshots={summary['snapshots']} "
                 f"takes={summary['takes']} passes={summary['passes']} "
                 f"inserted={summary['inserted']} open_positions={summary['open_positions']} "
-                f"min_ev={_fmt_num(min_ev, 4)}\n"
+                f"min_ev={_fmt_num(min_ev, 4)} cost_buffer={_fmt_num(cost_buffer, 4)}\n"
             )
             _LAST_LOGGED_ASOF_TS = asof_ts
             if int(summary.get("takes") or 0) == 0:
@@ -553,6 +563,7 @@ def _build_summary_from_snapshots(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     config = OpportunityConfig(
         min_ev=args.min_ev,
+        cost_buffer=max(float(args.cost_buffer or 0.0), 0.0),
         min_ask_cents=args.min_ask_cents,
         max_ask_cents=args.max_ask_cents,
         max_spot_age=args.max_spot_age,
@@ -564,14 +575,14 @@ def _build_summary_from_snapshots(
     all_rows, counters = build_opportunities_from_snapshots(snapshots, config)
     take_rows = [row for row in all_rows if int(row.get("would_trade") or 0) == 1]
     pass_rows = [row for row in all_rows if int(row.get("would_trade") or 0) != 1]
-    take_rows.sort(key=lambda row: float(row.get("ev_raw") or -1e9), reverse=True)
+    take_rows.sort(key=lambda row: float(row.get("ev_net") or -1e9), reverse=True)
 
     tail_ev_blocked = 0
     if take_rows:
         kept_take_rows: list[dict[str, Any]] = []
         for row in take_rows:
             ask_c = _ask_for_side(row)
-            ev = row.get("ev_raw")
+            ev = row.get("ev_net")
             if (
                 isinstance(ask_c, (int, float))
                 and isinstance(ev, (int, float))
@@ -1054,6 +1065,7 @@ async def _run_sqlite_mode(
                                 path=decision_log_path,
                                 summary=summary,
                                 min_ev=args.min_ev,
+                                cost_buffer=args.cost_buffer,
                                 pass_reason_limit=args.decision_pass_reason_limit,
                                 pass_sample_limit=args.decision_pass_sample_limit,
                             )
@@ -1281,6 +1293,7 @@ async def _run_events_mode(
                             path=decision_log_path,
                             summary=summary,
                             min_ev=args.min_ev,
+                            cost_buffer=args.cost_buffer,
                             pass_reason_limit=args.decision_pass_reason_limit,
                             pass_sample_limit=args.decision_pass_sample_limit,
                         )

@@ -15,6 +15,7 @@ EV_INVARIANT_TOLERANCE = 1e-6
 @dataclass(frozen=True)
 class OpportunityConfig:
     min_ev: float = 0.03
+    cost_buffer: float = 0.01
     min_ask_cents: float = 1.0
     max_ask_cents: float = 99.0
     max_spot_age: int | None = None
@@ -115,6 +116,7 @@ def build_opportunities_from_snapshots(
 
     take_rows: list[dict[str, Any]] = []
     pass_rows: list[dict[str, Any]] = []
+    cost_buffer = max(float(config.cost_buffer), 0.0)
 
     for snap in snapshots:
         asof_ts = snap.get("asof_ts")
@@ -228,7 +230,9 @@ def build_opportunities_from_snapshots(
                 spread = _spread(snap.get("no_bid"), snap.get("no_ask"))
 
             eligible = 1 if reason is None else 0
-            would_trade = 1 if ev is not None and ev >= config.min_ev else 0
+            ev_raw = ev
+            ev_net = (ev_raw - cost_buffer) if ev_raw is not None else None
+            would_trade = 1 if ev_net is not None and ev_net >= config.min_ev else 0
             decision = "TAKE" if would_trade == 1 else "PASS"
             if reason is None and would_trade == 0:
                 reason = "ev_below_threshold"
@@ -260,6 +264,8 @@ def build_opportunities_from_snapshots(
                 "ev_invariant_failed": ev_invariant_failed,
                 "ev_invariant_diff": ev_invariant_diff,
                 "ev_invariant_basis": ev_invariant_basis,
+                "cost_buffer": cost_buffer,
+                "ev_net": ev_net,
             }
             return {
                 "ts_eval": asof_ts,
@@ -280,9 +286,9 @@ def build_opportunities_from_snapshots(
                 "reason_not_eligible": reason,
                 "would_trade": would_trade,
                 "side": side,
-                "ev_raw": ev,
-                "ev_net": ev,
-                "cost_buffer": None,
+                "ev_raw": ev_raw,
+                "ev_net": ev_net,
+                "cost_buffer": cost_buffer,
                 "raw_json": json.dumps(metadata),
             }
 
@@ -411,7 +417,7 @@ def build_opportunities_from_snapshots(
                         best_reason = reason
                         best_side = side
                     continue
-                ev_val = row["ev_raw"]
+                ev_val = row["ev_net"]
                 if best_row is None or (ev_val is not None and ev_val > best_ev):
                     best_row = row
                     best_ev = ev_val
@@ -424,7 +430,7 @@ def build_opportunities_from_snapshots(
                     pass_rows.append(
                         build_row(
                             side=best_side or "YES",
-                            ev=best_ev,
+                            ev=_safe_float(best_row.get("ev_raw")),
                             ask=best_row.get(
                                 "best_yes_ask"
                                 if best_side == "YES"
@@ -445,8 +451,8 @@ def build_opportunities_from_snapshots(
                     )
         else:
             for row, reason, side in evaluated:
-                if row is not None and row["ev_raw"] is not None:
-                    if row["ev_raw"] >= config.min_ev:
+                if row is not None and row["ev_net"] is not None:
+                    if row["ev_net"] is not None and row["ev_net"] >= config.min_ev:
                         take_rows.append(row)
                     elif config.emit_passes:
                         row["eligible"] = 1
@@ -471,7 +477,7 @@ def build_opportunities_from_snapshots(
                     )
 
     if config.top_n is not None and config.top_n > 0:
-        take_rows.sort(key=lambda r: r.get("ev_raw") or 0.0, reverse=True)
+        take_rows.sort(key=lambda r: r.get("ev_net") or 0.0, reverse=True)
         kept = take_rows[: config.top_n]
         dropped = take_rows[config.top_n :]
         take_rows = kept

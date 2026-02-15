@@ -10,8 +10,8 @@ EDGE_ARGS=(
   --sigma-resample-seconds 5
 )
 
-python3 scripts/refresh_btc_markets.py
-python3 scripts/refresh_kalshi_contracts.py --status active
+python3 -m kalshi_bot.app.refresh_btc_markets
+python3 -m kalshi_bot.app.refresh_kalshi_contracts --status active
 
 if [[ "$FAST" == "1" ]]; then
   COINBASE_SECONDS=390

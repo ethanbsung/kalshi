@@ -176,7 +176,7 @@ async def _load_latest_quotes(
     if not market_ids:
         return {}
     placeholders = ",".join("?" for _ in market_ids)
-    sql = f"""  # nosec B608
+    sql = f"""
         WITH latest AS (
             SELECT market_id, MAX(ts) AS max_ts
             FROM kalshi_quotes
@@ -188,6 +188,7 @@ async def _load_latest_quotes(
         FROM kalshi_quotes q
         JOIN latest l ON q.market_id = l.market_id AND q.ts = l.max_ts
         """
+    # nosec B608: placeholders are generated from the market id list length.
     cursor = await conn.execute(
         sql,
         [asof_ts, *market_ids],

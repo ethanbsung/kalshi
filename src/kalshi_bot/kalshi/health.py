@@ -330,7 +330,7 @@ async def get_relevant_universe(
         threshold = now_ts - freshness_seconds
         quote_rows: list[tuple[Any, ...]] = []
         if candidate_ids:
-            quote_sql = f"""  # nosec B608
+            quote_sql = f"""
                 WITH latest AS (
                     SELECT market_id, MAX(ts) AS max_ts
                     FROM kalshi_quotes
@@ -341,6 +341,7 @@ async def get_relevant_universe(
                 FROM kalshi_quotes q
                 JOIN latest l ON q.market_id = l.market_id AND q.ts = l.max_ts
                 """
+            # nosec B608: placeholders are generated from the market id list length.
             cursor = await conn.execute(
                 quote_sql,
                 [threshold, *candidate_ids],

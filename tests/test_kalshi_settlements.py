@@ -1,8 +1,7 @@
 import asyncio
 import time
-import importlib.util
+import importlib
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -12,18 +11,9 @@ from kalshi_bot.data.dao import Dao
 
 
 def _load_settlements_module() -> object:
-    script_path = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "refresh_kalshi_settlements.py"
+    return importlib.import_module(
+        "kalshi_bot.app.refresh_kalshi_settlements"
     )
-    spec = importlib.util.spec_from_file_location(
-        "refresh_kalshi_settlements", script_path
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(module)
-    return module
 
 
 def _iso_ts(ts: int) -> str:

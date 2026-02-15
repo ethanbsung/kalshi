@@ -38,11 +38,11 @@ Run the bot 24/7 in **shadow mode** (no order submission), compute edges continu
 ## Live Run Checklist (Shadow Mode)
 - Set env vars: `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`, `DB_PATH`, `LOG_PATH`.
 - Start pipeline:
-  1) `python3 scripts/refresh_btc_markets.py`
-  2) `python3 scripts/refresh_kalshi_contracts.py --status active`
+  1) `python3 -m kalshi_bot.app.refresh_btc_markets`
+  2) `python3 -m kalshi_bot.app.refresh_kalshi_contracts --status active`
   3) `python3 scripts/poll_kalshi_quotes.py --seconds 0 --interval 5 --status active`
   4) `python3 scripts/run_live_edges.py --interval-seconds 10`
-  5) `python3 scripts/refresh_kalshi_settlements.py --since-seconds 86400`
+  5) `python3 -m kalshi_bot.app.refresh_kalshi_settlements --since-seconds 86400`
   6) `python3 scripts/score_edge_snapshots.py`
 - Confirm:
   - `kalshi_quotes` is updating every few seconds.
