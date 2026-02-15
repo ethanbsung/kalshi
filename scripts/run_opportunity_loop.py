@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 from collections import Counter, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -206,12 +206,15 @@ async def _load_snapshots(
     return snapshots
 
 
+EST = timezone(timedelta(hours=-5), name="EST")
+
+
 def _fmt_ts(ts: Any) -> str:
     try:
         if ts is None:
             return "NA"
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
+        return datetime.fromtimestamp(int(ts), tz=EST).strftime(
+            "%Y-%m-%dT%H:%M:%S EST"
         )
     except (TypeError, ValueError, OSError):
         return "NA"

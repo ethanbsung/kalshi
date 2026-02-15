@@ -7,7 +7,7 @@ import os
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,11 +49,14 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+EST = timezone(timedelta(hours=-5), name="EST")
+
+
 def _fmt_ts(ts: int | None) -> str:
     if ts is None:
         return "NA"
     try:
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.fromtimestamp(ts, tz=EST).strftime("%Y-%m-%dT%H:%M:%S EST")
     except (TypeError, ValueError, OSError):
         return "NA"
 
@@ -419,7 +422,7 @@ async def _run() -> int:
             return
         print(_paint(f"{title}:", "1", color))
         print(
-            "  {market:<31} {side:<4} {qty:>3} {upnl:>8} {entry:>7} {liq:>7} {qage:>5} {age:>6} {opened:<20} {settle:<20}".format(
+            "  {market:<31} {side:<4} {qty:>3} {upnl:>8} {entry:>7} {liq:>7} {qage:>5} {age:>6} {opened:<23} {settle:<23}".format(
                 market="market",
                 side="side",
                 qty="qty",
@@ -434,7 +437,7 @@ async def _run() -> int:
         )
         for row in items:
             print(
-                "  {market:<31} {side:<4} {qty:>3} {upnl} {avg_entry:>7} {liq:>7} {quote_age:>5} {age_m:>6} {opened:<20} {settle:<20}".format(
+                "  {market:<31} {side:<4} {qty:>3} {upnl} {avg_entry:>7} {liq:>7} {quote_age:>5} {age_m:>6} {opened:<23} {settle:<23}".format(
                     market=str(row["market_id"])[:31],
                     side=str(row["side"]),
                     qty=int(row["qty"]),
@@ -540,7 +543,7 @@ async def _run() -> int:
         f"settled_positions={len(settled_positions)} settled_contracts={settled_total_qty}"
     )
     print(
-        "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {entry:>7} {realized:>8} {opened:<20} {settled:<20}".format(
+        "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {entry:>7} {realized:>8} {opened:<23} {settled:<23}".format(
             market="market",
             side="side",
             qty="qty",
@@ -565,7 +568,7 @@ async def _run() -> int:
             settled_realized_total += float(realized_total)
             settled_realized_count += 1
         print(
-            "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {avg_entry:>7} {realized} {opened:<20} {settled:<20}".format(
+            "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {avg_entry:>7} {realized} {opened:<23} {settled:<23}".format(
                 market=str(row["market_id"])[:31],
                 side=str(row["side"]),
                 qty=qty,

@@ -30,6 +30,14 @@ def _parse_args() -> argparse.Namespace:
         help="Number of worst slippage fills to print.",
     )
     parser.add_argument(
+        "--analytics-details",
+        action="store_true",
+        help=(
+            "Print extended analytics sections "
+            "(worst markets/hour buckets, entry bands, fill quality, risk counters)."
+        ),
+    )
+    parser.add_argument(
         "--pg-dsn",
         type=str,
         default=None,
@@ -564,6 +572,7 @@ def compute_risk_counters_postgres(conn: Any, *, since_ts: int) -> dict[str, Any
 def _print_report(
     report: dict[str, Any],
     *,
+    analytics_details: bool = False,
     fill_quality: dict[str, Any] | None = None,
     risk_counters: dict[str, Any] | None = None,
 ) -> None:
@@ -632,126 +641,131 @@ def _print_report(
                 f"  {bucket} count={count} avg_prob={avg_prob:.3f} "
                 f"win_rate={win_rate:.3f}"
             )
-    worst_markets = report.get("worst_markets") or []
-    if worst_markets:
-        print("worst_markets:")
-        for row in worst_markets[:10]:
-            print(
-                "  {market} side={side} trades={count} pnl={pnl:.4f} avg={avg:.4f}".format(
-                    market=row["market_id"],
-                    side=row["side"],
-                    count=row["count"],
-                    pnl=row["pnl"],
-                    avg=row["avg_pnl"],
-                )
-            )
-    worst_hour = report.get("worst_hour_buckets") or []
-    if worst_hour:
-        print("worst_hour_buckets:")
-        for row in worst_hour[:10]:
-            print(
-                "  {hour} series={series} side={side} trades={count} pnl={pnl:.4f} avg={avg:.4f}".format(
-                    hour=row["hour_utc"],
-                    series=row["series"],
-                    side=row["side"],
-                    count=row["count"],
-                    pnl=row["pnl"],
-                    avg=row["avg_pnl"],
-                )
-            )
-    entry_bands = report.get("entry_band_attribution") or []
-    if entry_bands:
-        print("entry_band_attribution:")
-        for row in entry_bands:
-            print(
-                "  {band} trades={count} pnl={pnl:.4f} avg={avg:.4f}".format(
-                    band=row["entry_band_cents"],
-                    count=row["count"],
-                    pnl=row["pnl"],
-                    avg=row["avg_pnl"],
-                )
-            )
-    if fill_quality:
-        summary = fill_quality.get("summary", {})
-        print(
-            "fill_quality orders_total={orders} accepted={accepted} rejected={rejected} "
-            "filled={filled} avg_slippage_cents={avg} p50_slippage_cents={p50} "
-            "p95_slippage_cents={p95} adverse_fill_rate={adverse}".format(
-                orders=summary.get("orders_total", 0),
-                accepted=summary.get("accepted_total", 0),
-                rejected=summary.get("rejected_total", 0),
-                filled=summary.get("filled_total", 0),
-                avg=(
-                    f"{summary['avg_slippage_cents']:.3f}"
-                    if summary.get("avg_slippage_cents") is not None
-                    else "NA"
-                ),
-                p50=(
-                    f"{summary['p50_slippage_cents']:.3f}"
-                    if summary.get("p50_slippage_cents") is not None
-                    else "NA"
-                ),
-                p95=(
-                    f"{summary['p95_slippage_cents']:.3f}"
-                    if summary.get("p95_slippage_cents") is not None
-                    else "NA"
-                ),
-                adverse=(
-                    f"{summary['adverse_fill_rate']:.3f}"
-                    if summary.get("adverse_fill_rate") is not None
-                    else "NA"
-                ),
-            )
-        )
-        worst_slippage = fill_quality.get("worst_slippage_fills") or []
-        if worst_slippage:
-            print("worst_slippage_fills:")
-            for row in worst_slippage:
+    if analytics_details:
+        worst_markets = report.get("worst_markets") or []
+        if worst_markets:
+            print("worst_markets:")
+            for row in worst_markets[:10]:
                 print(
-                    "  order_id={order_id} market={market} side={side} "
-                    "order_c={order_c} fill_c={fill_c} slippage_c={slip} "
-                    "ts_order={ts_order} ts_fill={ts_fill}".format(
-                        order_id=row.get("order_id"),
-                        market=row.get("market_id"),
-                        side=row.get("side"),
-                        order_c=(
-                            f"{row['order_price_cents']:.2f}"
-                            if row.get("order_price_cents") is not None
-                            else "NA"
-                        ),
-                        fill_c=(
-                            f"{row['fill_price_cents']:.2f}"
-                            if row.get("fill_price_cents") is not None
-                            else "NA"
-                        ),
-                        slip=(
-                            f"{row['slippage_cents']:.2f}"
-                            if row.get("slippage_cents") is not None
-                            else "NA"
-                        ),
-                        ts_order=row.get("ts_order"),
-                        ts_fill=row.get("ts_fill"),
+                    "  {market} side={side} trades={count} pnl={pnl:.4f} avg={avg:.4f}".format(
+                        market=row["market_id"],
+                        side=row["side"],
+                        count=row["count"],
+                        pnl=row["pnl"],
+                        avg=row["avg_pnl"],
                     )
                 )
-    if risk_counters:
-        worst_reject_rate = risk_counters.get("worst_reject_rate")
-        print(
-            "risk_counters worst_hourly_reject_rate={rate}".format(
-                rate=f"{worst_reject_rate:.3f}" if worst_reject_rate is not None else "NA"
-            )
-        )
-        hourly = risk_counters.get("hourly_order_reject") or []
-        if hourly:
-            print("hourly_order_reject:")
-            for row in hourly[-12:]:
+        worst_hour = report.get("worst_hour_buckets") or []
+        if worst_hour:
+            print("worst_hour_buckets:")
+            for row in worst_hour[:10]:
                 print(
-                    "  {hour} orders={orders} rejected={rejected} reject_rate={rate:.3f}".format(
+                    "  {hour} series={series} side={side} trades={count} pnl={pnl:.4f} avg={avg:.4f}".format(
                         hour=row["hour_utc"],
-                        orders=row["orders_total"],
-                        rejected=row["rejected_total"],
-                        rate=row["reject_rate"],
+                        series=row["series"],
+                        side=row["side"],
+                        count=row["count"],
+                        pnl=row["pnl"],
+                        avg=row["avg_pnl"],
                     )
                 )
+        entry_bands = report.get("entry_band_attribution") or []
+        if entry_bands:
+            print("entry_band_attribution:")
+            for row in entry_bands:
+                print(
+                    "  {band} trades={count} pnl={pnl:.4f} avg={avg:.4f}".format(
+                        band=row["entry_band_cents"],
+                        count=row["count"],
+                        pnl=row["pnl"],
+                        avg=row["avg_pnl"],
+                    )
+                )
+        if fill_quality:
+            summary = fill_quality.get("summary", {})
+            print(
+                "fill_quality orders_total={orders} accepted={accepted} rejected={rejected} "
+                "filled={filled} avg_slippage_cents={avg} p50_slippage_cents={p50} "
+                "p95_slippage_cents={p95} adverse_fill_rate={adverse}".format(
+                    orders=summary.get("orders_total", 0),
+                    accepted=summary.get("accepted_total", 0),
+                    rejected=summary.get("rejected_total", 0),
+                    filled=summary.get("filled_total", 0),
+                    avg=(
+                        f"{summary['avg_slippage_cents']:.3f}"
+                        if summary.get("avg_slippage_cents") is not None
+                        else "NA"
+                    ),
+                    p50=(
+                        f"{summary['p50_slippage_cents']:.3f}"
+                        if summary.get("p50_slippage_cents") is not None
+                        else "NA"
+                    ),
+                    p95=(
+                        f"{summary['p95_slippage_cents']:.3f}"
+                        if summary.get("p95_slippage_cents") is not None
+                        else "NA"
+                    ),
+                    adverse=(
+                        f"{summary['adverse_fill_rate']:.3f}"
+                        if summary.get("adverse_fill_rate") is not None
+                        else "NA"
+                    ),
+                )
+            )
+            worst_slippage = fill_quality.get("worst_slippage_fills") or []
+            if worst_slippage:
+                print("worst_slippage_fills:")
+                for row in worst_slippage:
+                    print(
+                        "  order_id={order_id} market={market} side={side} "
+                        "order_c={order_c} fill_c={fill_c} slippage_c={slip} "
+                        "ts_order={ts_order} ts_fill={ts_fill}".format(
+                            order_id=row.get("order_id"),
+                            market=row.get("market_id"),
+                            side=row.get("side"),
+                            order_c=(
+                                f"{row['order_price_cents']:.2f}"
+                                if row.get("order_price_cents") is not None
+                                else "NA"
+                            ),
+                            fill_c=(
+                                f"{row['fill_price_cents']:.2f}"
+                                if row.get("fill_price_cents") is not None
+                                else "NA"
+                            ),
+                            slip=(
+                                f"{row['slippage_cents']:.2f}"
+                                if row.get("slippage_cents") is not None
+                                else "NA"
+                            ),
+                            ts_order=row.get("ts_order"),
+                            ts_fill=row.get("ts_fill"),
+                        )
+                    )
+        if risk_counters:
+            worst_reject_rate = risk_counters.get("worst_reject_rate")
+            print(
+                "risk_counters worst_hourly_reject_rate={rate}".format(
+                    rate=(
+                        f"{worst_reject_rate:.3f}"
+                        if worst_reject_rate is not None
+                        else "NA"
+                    )
+                )
+            )
+            hourly = risk_counters.get("hourly_order_reject") or []
+            if hourly:
+                print("hourly_order_reject:")
+                for row in hourly[-12:]:
+                    print(
+                        "  {hour} orders={orders} rejected={rejected} reject_rate={rate:.3f}".format(
+                            hour=row["hour_utc"],
+                            orders=row["orders_total"],
+                            rejected=row["rejected_total"],
+                            rate=row["reject_rate"],
+                        )
+                    )
 
 
 async def _run_sqlite(*, settings: Any, since_ts: int) -> int:
@@ -765,7 +779,13 @@ async def _run_sqlite(*, settings: Any, since_ts: int) -> int:
     return 0
 
 
-async def _run_postgres(*, pg_dsn: str, since_ts: int, fill_quality_limit: int) -> int:
+async def _run_postgres(
+    *,
+    pg_dsn: str,
+    since_ts: int,
+    fill_quality_limit: int,
+    analytics_details: bool,
+) -> int:
     print("backend=postgres")
     repo = PostgresEventRepository(pg_dsn)
     repo.ensure_schema()
@@ -779,11 +799,19 @@ async def _run_postgres(*, pg_dsn: str, since_ts: int, fill_quality_limit: int) 
         ) from exc
     with psycopg.connect(pg_dsn) as conn:
         report = compute_report_postgres(conn, since_ts)
-        fill_quality = compute_fill_quality_postgres(
-            conn, since_ts=since_ts, limit=max(fill_quality_limit, 0)
-        )
-        risk_counters = compute_risk_counters_postgres(conn, since_ts=since_ts)
-    _print_report(report, fill_quality=fill_quality, risk_counters=risk_counters)
+        fill_quality = None
+        risk_counters = None
+        if analytics_details:
+            fill_quality = compute_fill_quality_postgres(
+                conn, since_ts=since_ts, limit=max(fill_quality_limit, 0)
+            )
+            risk_counters = compute_risk_counters_postgres(conn, since_ts=since_ts)
+    _print_report(
+        report,
+        analytics_details=analytics_details,
+        fill_quality=fill_quality,
+        risk_counters=risk_counters,
+    )
     return 0
 
 
@@ -797,6 +825,7 @@ async def _run() -> int:
             pg_dsn=pg_dsn,
             since_ts=since_ts,
             fill_quality_limit=args.fill_quality_limit,
+            analytics_details=args.analytics_details,
         )
     return await _run_sqlite(settings=settings, since_ts=since_ts)
 

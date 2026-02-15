@@ -1,0 +1,19 @@
+[Unit]
+Description=Kalshi Live Stack
+After=kalshi-persistence.service
+Requires=kalshi-persistence.service
+
+[Service]
+Type=simple
+User=ethanbsung
+WorkingDirectory=/home/ethanbsung/kalshi
+EnvironmentFile=/home/ethanbsung/kalshi/.env
+Environment=PYTHONPATH=/home/ethanbsung/kalshi/src
+ExecStart=/usr/bin/bash -lc 'exec ./scripts/live_stack.sh --status open --enable-event-bus --event-bus-url "$BUS_URL" --edge-state-source events --opportunity-state-source events --edges-events-consumer-durable svc_edges_live --enable-execution --execution-max-open-positions 1000000 --execution-take-cooldown-seconds 0 --coinbase-publish-only --quotes-publish-only --refresh-markets-publish-only --refresh-contracts-publish-only --quote-source ws --quotes-reload-markets-align-period-seconds 900 --quotes-reload-markets-align-offset-seconds 0 --refresh-markets-align-period-seconds 900 --refresh-markets-align-offset-seconds 5 --refresh-contracts-every-minutes 15 --refresh-contracts-align-period-seconds 900 --refresh-contracts-align-offset-seconds 12 --scoring-every-minutes 10 --report-every-minutes 10'
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

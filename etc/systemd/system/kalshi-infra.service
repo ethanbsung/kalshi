@@ -1,0 +1,17 @@
+[Unit]
+Description=Kalshi Infra (Postgres + NATS)
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=ethanbsung
+WorkingDirectory=/home/ethanbsung/kalshi
+ExecStart=/usr/bin/docker compose -f infra/docker-compose.phase-a.yml up -d
+ExecStop=/usr/bin/docker compose -f infra/docker-compose.phase-a.yml down
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

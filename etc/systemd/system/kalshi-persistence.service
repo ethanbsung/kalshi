@@ -1,0 +1,24 @@
+[Unit]
+Description=Kalshi Persistence Service
+After=kalshi-infra.service
+Requires=kalshi-infra.service
+
+[Service]
+Type=simple
+User=ethanbsung
+WorkingDirectory=/home/ethanbsung/kalshi
+EnvironmentFile=/home/ethanbsung/kalshi/.env
+Environment=PYTHONPATH=/home/ethanbsung/kalshi/src
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/mkdir -p /home/ethanbsung/kalshi/logs/persistence
+ExecStart=/home/ethanbsung/kalshi/.venv/bin/python /home/ethanbsung/kalshi/scripts/run_persistence_service.py --bus-url ${BUS_URL} --pg-dsn ${PG_DSN} --durable-prefix svc_persistence --metrics-log-path /home/ethanbsung/kalshi/logs/persistence/metrics.log --error-log-path /home/ethanbsung/kalshi/logs/persistence/errors.jsonl
+StandardOutput=append:/home/ethanbsung/kalshi/logs/persistence/service.log
+StandardError=append:/home/ethanbsung/kalshi/logs/persistence/service.log
+SyslogIdentifier=kalshi-persistence
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
