@@ -141,6 +141,7 @@ async def _load_open_rows(conn: aiosqlite.Connection) -> list[tuple[Any, ...]]:
         )
         SELECT o.market_id, o.side, o.ts_eval, o.settlement_ts,
                o.best_yes_ask, o.best_no_ask, o.raw_json,
+               o.ev_raw, o.p_model, o.p_market,
                c.outcome, c.settled_ts,
                lq.quote_ts, lq.yes_bid, lq.yes_ask, lq.no_bid, lq.no_ask,
                lq.yes_mid, lq.no_mid
@@ -162,6 +163,7 @@ async def _load_settled_rows(conn: aiosqlite.Connection) -> list[tuple[Any, ...]
         """
         SELECT o.market_id, o.side, o.ts_eval, o.settlement_ts,
                o.best_yes_ask, o.best_no_ask, o.raw_json,
+               o.ev_raw, o.p_model, o.p_market,
                c.outcome, c.settled_ts
         FROM opportunities o
         LEFT JOIN kalshi_contracts c
@@ -181,6 +183,7 @@ def _load_open_rows_postgres(conn: Any) -> list[tuple[Any, ...]]:
             WITH latest_fill AS (
                 SELECT DISTINCT ON (f.market_id)
                     f.market_id,
+                    f.order_id,
                     f.side,
                     f.ts_fill,
                     f.price_cents,
@@ -197,6 +200,9 @@ def _load_open_rows_postgres(conn: Any) -> list[tuple[Any, ...]]:
                 CASE WHEN lf.side = 'YES' THEN lf.price_cents ELSE NULL END AS best_yes_ask,
                 CASE WHEN lf.side = 'NO' THEN lf.price_cents ELSE NULL END AS best_no_ask,
                 NULL::TEXT AS raw_json,
+                NULLIF(er.payload_json->>'ev_raw', '')::DOUBLE PRECISION AS ev_raw,
+                NULLIF(er.payload_json->>'p_model', '')::DOUBLE PRECISION AS p_model,
+                NULLIF(er.payload_json->>'p_market', '')::DOUBLE PRECISION AS p_market,
                 c.outcome,
                 c.settled_ts,
                 q.ts AS quote_ts,
@@ -207,6 +213,11 @@ def _load_open_rows_postgres(conn: Any) -> list[tuple[Any, ...]]:
                 q.yes_mid,
                 q.no_mid
             FROM latest_fill lf
+            LEFT JOIN event_store.execution_order_latest eo
+              ON eo.order_id = lf.order_id
+            LEFT JOIN event_store.events_raw er
+              ON er.event_type = 'opportunity_decision'
+             AND er.idempotency_key = eo.opportunity_idempotency_key
             LEFT JOIN event_store.state_contract_latest c
               ON c.ticker = lf.market_id
             LEFT JOIN event_store.state_quote_latest q
@@ -231,9 +242,17 @@ def _load_settled_rows_postgres(conn: Any) -> list[tuple[Any, ...]]:
                 CASE WHEN f.side = 'YES' THEN f.price_cents ELSE NULL END AS best_yes_ask,
                 CASE WHEN f.side = 'NO' THEN f.price_cents ELSE NULL END AS best_no_ask,
                 NULL::TEXT AS raw_json,
+                NULLIF(er.payload_json->>'ev_raw', '')::DOUBLE PRECISION AS ev_raw,
+                NULLIF(er.payload_json->>'p_model', '')::DOUBLE PRECISION AS p_model,
+                NULLIF(er.payload_json->>'p_market', '')::DOUBLE PRECISION AS p_market,
                 c.outcome,
                 c.settled_ts
             FROM event_store.execution_fill_latest f
+            LEFT JOIN event_store.execution_order_latest eo
+              ON eo.order_id = f.order_id
+            LEFT JOIN event_store.events_raw er
+              ON er.event_type = 'opportunity_decision'
+             AND er.idempotency_key = eo.opportunity_idempotency_key
             JOIN event_store.state_contract_latest c
               ON c.ticker = f.market_id
             WHERE f.paper = TRUE
@@ -297,6 +316,9 @@ async def _run() -> int:
         best_yes_ask,
         best_no_ask,
         raw_json,
+        ev_raw,
+        p_model,
+        p_market,
         _outcome,
         _settled_ts,
         quote_ts,
@@ -325,6 +347,12 @@ async def _run() -> int:
                 "qty": 0,
                 "entry_sum_cents": 0.0,
                 "entry_count": 0,
+                "ev_sum": 0.0,
+                "ev_count": 0,
+                "p_model_sum": 0.0,
+                "p_model_count": 0,
+                "p_market_sum": 0.0,
+                "p_market_count": 0,
                 "first_ts": None,
                 "last_ts": None,
                 "settlement_ts": settlement_ts,
@@ -342,6 +370,18 @@ async def _run() -> int:
         if entry_price is not None:
             state["entry_sum_cents"] += float(entry_price)
             state["entry_count"] += 1
+        ev_entry = _safe_float(ev_raw)
+        if ev_entry is not None:
+            state["ev_sum"] += float(ev_entry)
+            state["ev_count"] += 1
+        p_model_entry = _safe_float(p_model)
+        if p_model_entry is not None:
+            state["p_model_sum"] += float(p_model_entry)
+            state["p_model_count"] += 1
+        p_market_entry = _safe_float(p_market)
+        if p_market_entry is not None:
+            state["p_market_sum"] += float(p_market_entry)
+            state["p_market_count"] += 1
         eval_ts = int(ts_eval) if ts_eval is not None else None
         if eval_ts is not None:
             state["first_ts"] = eval_ts if state["first_ts"] is None else min(state["first_ts"], eval_ts)
@@ -361,6 +401,19 @@ async def _run() -> int:
         avg_entry = (
             row["entry_sum_cents"] / row["entry_count"]
             if row["entry_count"] > 0
+            else None
+        )
+        ev_entry = (
+            row["ev_sum"] / row["ev_count"] if row.get("ev_count", 0) > 0 else None
+        )
+        p_model_entry = (
+            row["p_model_sum"] / row["p_model_count"]
+            if row.get("p_model_count", 0) > 0
+            else None
+        )
+        p_market_entry = (
+            row["p_market_sum"] / row["p_market_count"]
+            if row.get("p_market_count", 0) > 0
             else None
         )
         if row["side"] == "YES":
@@ -389,6 +442,9 @@ async def _run() -> int:
             {
                 **row,
                 "avg_entry_c": avg_entry,
+                "ev_entry": ev_entry,
+                "p_model_entry": p_model_entry,
+                "p_market_entry": p_market_entry,
                 "liq_c": liq_price,
                 "u_pnl_total": unrealized_total,
                 "quote_age_s": quote_age,
@@ -422,13 +478,16 @@ async def _run() -> int:
             return
         print(_paint(f"{title}:", "1", color))
         print(
-            "  {market:<31} {side:<4} {qty:>3} {upnl:>8} {entry:>7} {liq:>7} {qage:>5} {age:>6} {opened:<23} {settle:<23}".format(
+            "  {market:<31} {side:<4} {qty:>3} {upnl:>8} {entry:>7} {liq:>7} {ev:>8} {p_model:>8} {p_market:>8} {qage:>5} {age:>6} {opened:<23} {settle:<23}".format(
                 market="market",
                 side="side",
                 qty="qty",
                 upnl="uPnL",
                 entry="entryC",
                 liq="liqC",
+                ev="evEnt",
+                p_model="pModel",
+                p_market="pMkt",
                 qage="qAge",
                 age="age_m",
                 opened="opened",
@@ -437,13 +496,28 @@ async def _run() -> int:
         )
         for row in items:
             print(
-                "  {market:<31} {side:<4} {qty:>3} {upnl} {avg_entry:>7} {liq:>7} {quote_age:>5} {age_m:>6} {opened:<23} {settle:<23}".format(
+                "  {market:<31} {side:<4} {qty:>3} {upnl} {avg_entry:>7} {liq:>7} {ev_entry:>8} {p_model_entry:>8} {p_market_entry:>8} {quote_age:>5} {age_m:>6} {opened:<23} {settle:<23}".format(
                     market=str(row["market_id"])[:31],
                     side=str(row["side"]),
                     qty=int(row["qty"]),
                     upnl=_paint_pnl(_safe_float(row.get("u_pnl_total")), color),
                     avg_entry=_fmt_cents(_safe_float(row.get("avg_entry_c"))),
                     liq=_fmt_cents(_safe_float(row.get("liq_c"))),
+                    ev_entry=(
+                        f"{float(row['ev_entry']):.4f}"
+                        if row.get("ev_entry") is not None
+                        else "NA"
+                    ),
+                    p_model_entry=(
+                        f"{float(row['p_model_entry']):.4f}"
+                        if row.get("p_model_entry") is not None
+                        else "NA"
+                    ),
+                    p_market_entry=(
+                        f"{float(row['p_market_entry']):.4f}"
+                        if row.get("p_market_entry") is not None
+                        else "NA"
+                    ),
                     quote_age=(
                         str(int(row["quote_age_s"]))
                         if row.get("quote_age_s") is not None
@@ -472,6 +546,9 @@ async def _run() -> int:
         best_yes_ask,
         best_no_ask,
         raw_json,
+        ev_raw,
+        p_model,
+        p_market,
         outcome,
         settled_ts,
     ) in settled_rows:
@@ -504,6 +581,12 @@ async def _run() -> int:
                 "qty": 0,
                 "entry_sum_cents": 0.0,
                 "entry_count": 0,
+                "ev_sum": 0.0,
+                "ev_count": 0,
+                "p_model_sum": 0.0,
+                "p_model_count": 0,
+                "p_market_sum": 0.0,
+                "p_market_count": 0,
                 "realized_total": 0.0,
                 "realized_count": 0,
                 "first_ts": None,
@@ -517,6 +600,18 @@ async def _run() -> int:
         if entry_price is not None:
             state["entry_sum_cents"] += float(entry_price)
             state["entry_count"] += 1
+        ev_entry = _safe_float(ev_raw)
+        if ev_entry is not None:
+            state["ev_sum"] += float(ev_entry)
+            state["ev_count"] += 1
+        p_model_entry = _safe_float(p_model)
+        if p_model_entry is not None:
+            state["p_model_sum"] += float(p_model_entry)
+            state["p_model_count"] += 1
+        p_market_entry = _safe_float(p_market)
+        if p_market_entry is not None:
+            state["p_market_sum"] += float(p_market_entry)
+            state["p_market_count"] += 1
         if realized is not None:
             state["realized_total"] += float(realized)
             state["realized_count"] += 1
@@ -543,12 +638,15 @@ async def _run() -> int:
         f"settled_positions={len(settled_positions)} settled_contracts={settled_total_qty}"
     )
     print(
-        "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {entry:>7} {realized:>8} {opened:<23} {settled:<23}".format(
+        "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {entry:>7} {ev:>8} {p_model:>8} {p_market:>8} {realized:>8} {opened:<23} {settled:<23}".format(
             market="market",
             side="side",
             qty="qty",
             outcome="outcome",
             entry="entryC",
+            ev="evEnt",
+            p_model="pModel",
+            p_market="pMkt",
             realized="realized",
             opened="opened",
             settled="settled",
@@ -561,6 +659,19 @@ async def _run() -> int:
             if row["entry_count"] > 0
             else None
         )
+        ev_entry = (
+            row["ev_sum"] / row["ev_count"] if row.get("ev_count", 0) > 0 else None
+        )
+        p_model_entry = (
+            row["p_model_sum"] / row["p_model_count"]
+            if row.get("p_model_count", 0) > 0
+            else None
+        )
+        p_market_entry = (
+            row["p_market_sum"] / row["p_market_count"]
+            if row.get("p_market_count", 0) > 0
+            else None
+        )
         realized_total = (
             row["realized_total"] if row["realized_count"] > 0 else None
         )
@@ -568,13 +679,20 @@ async def _run() -> int:
             settled_realized_total += float(realized_total)
             settled_realized_count += 1
         print(
-            "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {avg_entry:>7} {realized} {opened:<23} {settled:<23}".format(
+            "  {market:<31} {side:<4} {qty:>3} {outcome:>7} {avg_entry:>7} {ev_entry:>8} {p_model_entry:>8} {p_market_entry:>8} {realized} {opened:<23} {settled:<23}".format(
                 market=str(row["market_id"])[:31],
                 side=str(row["side"]),
                 qty=qty,
                 outcome=row.get("outcome"),
                 avg_entry=(
                     f"{avg_entry:.2f}" if avg_entry is not None else "NA"
+                ),
+                ev_entry=(f"{ev_entry:.4f}" if ev_entry is not None else "NA"),
+                p_model_entry=(
+                    f"{p_model_entry:.4f}" if p_model_entry is not None else "NA"
+                ),
+                p_market_entry=(
+                    f"{p_market_entry:.4f}" if p_market_entry is not None else "NA"
                 ),
                 realized=_paint_pnl(realized_total, color),
                 opened=_fmt_ts(row.get("first_ts")),
