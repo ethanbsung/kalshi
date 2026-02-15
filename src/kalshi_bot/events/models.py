@@ -5,7 +5,7 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
-from kalshi_bot.events.contracts import (
+from kalshi_bot.events.event_contracts import (
     build_idempotency_key,
     schema_version_for_event,
 )

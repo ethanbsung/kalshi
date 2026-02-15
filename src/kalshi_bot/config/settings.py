@@ -82,7 +82,9 @@ class Settings(BaseModel):
         default=1000, alias="BUS_CONSUMER_LAG_ALERT_THRESHOLD"
     )
 
-    pg_dsn: str | None = Field(default=None, alias="PG_DSN")
+    pg_dsn: str | None = Field(
+        default="postgresql://kalshi:kalshi@127.0.0.1:5432/kalshi", alias="PG_DSN"
+    )
     pg_pool_min: int = Field(default=2, alias="PG_POOL_MIN")
     pg_pool_max: int = Field(default=10, alias="PG_POOL_MAX")
     pg_statement_timeout_ms: int = Field(

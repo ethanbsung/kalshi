@@ -93,7 +93,7 @@ def _parse_args() -> argparse.Namespace:
         "--edge-state-source",
         type=str,
         choices=["sqlite", "events"],
-        default="sqlite",
+        default="events",
         help="Edge runner state source: legacy SQLite or JetStream market events.",
     )
     parser.add_argument(

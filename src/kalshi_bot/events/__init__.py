@@ -1,5 +1,5 @@
 from kalshi_bot.events.bus import EventBus, InMemoryEventBus
-from kalshi_bot.events.contracts import (
+from kalshi_bot.events.event_contracts import (
     DLQ_SUBJECT_PREFIX,
     EVENT_SCHEMA_VERSIONS,
     EVENT_SUBJECTS,

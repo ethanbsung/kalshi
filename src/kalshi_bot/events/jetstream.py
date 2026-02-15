@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from kalshi_bot.events.contracts import JetStreamStreamSpec, default_stream_specs
+from kalshi_bot.events.event_contracts import JetStreamStreamSpec, default_stream_specs
 
 
 @dataclass(slots=True)

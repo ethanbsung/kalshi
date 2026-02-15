@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from kalshi_bot.events.contracts import subject_for_event
+from kalshi_bot.events.event_contracts import subject_for_event
 from kalshi_bot.events.models import EventBase, parse_event_dict
 
 
