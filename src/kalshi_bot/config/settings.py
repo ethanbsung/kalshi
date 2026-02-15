@@ -92,11 +92,11 @@ class Settings(BaseModel):
 
 def load_settings(env_file: str | None = None) -> Settings:
     load_dotenv(env_file)
-    raw = {}
+    raw: dict[str, str] = {}
     for field in Settings.model_fields.values():
         if field.alias is None:
             continue
         value = os.getenv(field.alias)
         if value is not None:
             raw[field.alias] = value
-    return Settings(**raw)
+    return Settings.model_validate(raw)

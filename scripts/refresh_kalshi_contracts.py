@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import logging
+import tempfile
 import time
 from pathlib import Path
 
@@ -21,7 +23,7 @@ from kalshi_bot.kalshi.contracts import KalshiContractRefresher, load_market_row
 from kalshi_bot.kalshi.market_filters import normalize_db_status, normalize_series
 from kalshi_bot.kalshi.rest_client import KalshiRestClient
 
-LOCK_PATH = Path("/tmp/kalshi_refresh_kalshi_contracts.lock")
+LOCK_PATH = Path(tempfile.gettempdir()) / "kalshi_refresh_kalshi_contracts.lock"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -82,7 +84,7 @@ async def _load_market_rows_from_rest(
     status: str | None,
     series: list[str],
     limit: int | None,
-    logger: object,
+    logger: logging.Logger | None,
 ) -> list[tuple[str, int | None]]:
     rows: list[tuple[str, int | None]] = []
     seen: set[str] = set()

@@ -23,9 +23,12 @@ async def _scan() -> int:
         limit=settings.kalshi_market_limit,
         logger=logger,
     )
-    tickers = [market.get("ticker") for market in markets if market.get("ticker")][
-        :10
-    ]
+    tickers = [
+        ticker
+        for market in markets
+        for ticker in [market.get("ticker")]
+        if isinstance(ticker, str) and ticker
+    ][:10]
     print(
         f"FOUND {len(markets)} BTC markets "
         f"(series counts: "

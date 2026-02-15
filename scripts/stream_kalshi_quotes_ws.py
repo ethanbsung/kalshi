@@ -11,7 +11,7 @@ import aiosqlite
 from kalshi_bot.config import load_settings
 from kalshi_bot.data.dao import Dao
 from kalshi_bot.data.db import init_db
-from kalshi_bot.events import EventPublisher, QuoteUpdateEvent
+from kalshi_bot.events import EventPublisher, QuoteUpdateEvent, QuoteUpdatePayload
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi import KalshiRestClient, KalshiWsClient
 from kalshi_bot.kalshi.btc_markets import (
@@ -118,11 +118,50 @@ async def _load_market_tickers_from_rest(
     )
 
 
+def _seconds_until_next_alignment(
+    *,
+    now_ts: float,
+    period_seconds: int,
+    offset_seconds: float,
+) -> float:
+    period = max(int(period_seconds), 1)
+    offset = float(offset_seconds) % period
+    base = int((now_ts - offset) // period) * period + offset
+    next_ts = base + period
+    if next_ts <= now_ts:
+        next_ts += period
+    return max(next_ts - now_ts, 0.0)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stream Kalshi quote snapshots via WS")
     parser.add_argument("--seconds", type=int, default=900)
     parser.add_argument("--status", type=str, default=None)
     parser.add_argument("--max-horizon-seconds", type=int, default=6 * 3600)
+    parser.add_argument(
+        "--reload-markets-every-seconds",
+        type=int,
+        default=120,
+        help=(
+            "Reload market tickers from REST and reconnect WS at this cadence. "
+            "Set <=0 to disable periodic reload."
+        ),
+    )
+    parser.add_argument(
+        "--reload-markets-align-period-seconds",
+        type=int,
+        default=0,
+        help=(
+            "If >0, use wall-clock aligned reload boundaries "
+            "(for example 900 for 00/15/30/45)."
+        ),
+    )
+    parser.add_argument(
+        "--reload-markets-align-offset-seconds",
+        type=float,
+        default=0.0,
+        help="Offset seconds after each aligned boundary.",
+    )
     parser.add_argument(
         "--series",
         action="append",
@@ -190,6 +229,11 @@ async def _run() -> int:
     no_markets_log_every_seconds = 60.0
     run_window_seconds = max(int(args.seconds), 1)
     end_time = time.monotonic() + run_window_seconds
+    reload_markets_every_seconds = max(int(args.reload_markets_every_seconds), 0)
+    reload_markets_align_period_seconds = max(
+        int(args.reload_markets_align_period_seconds), 0
+    )
+    reload_markets_align_offset_seconds = float(args.reload_markets_align_offset_seconds)
 
     if args.publish_only:
         rest_client = KalshiRestClient(
@@ -199,87 +243,14 @@ async def _run() -> int:
             logger=logger,
         )
 
-        tickers: list[str] = []
-        last_no_market_log = 0.0
-        zero_market_wait_seconds = 0.0
-        zero_market_retries = 0
-        while True:
-            tickers = await _load_market_tickers_from_rest(
-                rest_client=rest_client,
-                status=status,
-                series=series,
-                max_horizon_seconds=args.max_horizon_seconds,
-                logger=logger,
-            )
-            if tickers:
-                break
-            zero_market_retries += 1
-            now_mono = time.monotonic()
-            if (now_mono - last_no_market_log) >= no_markets_log_every_seconds:
-                logger.warning(
-                    "kalshi_ws_quotes_no_markets_retrying_publish_only",
-                    extra={
-                        "status": status,
-                        "series": series,
-                        "retry_seconds": no_markets_retry_seconds,
-                        "max_horizon_seconds": args.max_horizon_seconds,
-                    },
-                )
-                print(
-                    "WARNING: No markets matched REST filter "
-                    f"status={status} series={series}; retrying in {int(no_markets_retry_seconds)}s"
-                )
-                last_no_market_log = now_mono
-            sleep_for = no_markets_retry_seconds
-            await asyncio.sleep(sleep_for)
-            zero_market_wait_seconds += sleep_for
-            if time.monotonic() >= end_time:
-                end_time = time.monotonic() + run_window_seconds
-
-        if zero_market_retries > 0:
-            logger.info(
-                "kalshi_ws_quotes_zero_market_wait_publish_only",
-                extra={
-                    "wait_seconds": int(zero_market_wait_seconds),
-                    "retries": zero_market_retries,
-                    "market_count": len(tickers),
-                    "status": status,
-                    "series": series,
-                    "max_horizon_seconds": args.max_horizon_seconds,
-                },
-            )
-            print(
-                "WS zero-market wait: wait_s={wait_s} retries={retries} markets={markets}".format(
-                    wait_s=int(zero_market_wait_seconds),
-                    retries=zero_market_retries,
-                    markets=len(tickers),
-                )
-            )
-            end_time = time.monotonic() + run_window_seconds
-
-        client = KalshiWsClient(
-            ws_url=settings.kalshi_ws_url,
-            api_key_id=settings.kalshi_api_key_id,
-            private_key_path=(
-                str(settings.kalshi_private_key_path)
-                if settings.kalshi_private_key_path
-                else None
-            ),
-            auth_mode=settings.kalshi_ws_auth_mode,
-            auth_query_key=settings.kalshi_ws_auth_query_key,
-            auth_query_signature=settings.kalshi_ws_auth_query_signature,
-            auth_query_timestamp=settings.kalshi_ws_auth_query_timestamp,
-            market_tickers=tickers,
-            logger=logger,
-            channels=["ticker"],
-        )
-
         inserted = 0
         invalid = 0
         write_errors = 0
         throttled = 0
         last_throttle_log = 0.0
         last_written_ts_by_market: dict[str, int] = {}
+        subscription_refreshes = 0
+        market_count = 0
         bus_url = (
             args.events_bus_url
             if args.events_bus_url
@@ -344,50 +315,52 @@ async def _run() -> int:
                 await event_sink.publish(
                     QuoteUpdateEvent(
                         source="stream_kalshi_quotes_ws",
-                        payload={
-                            "ts": int(quote_row["ts"]),
-                            "market_id": str(quote_row["market_id"]),
-                            "source_msg_id": (
-                                str(row.get("seq"))
-                                if row.get("seq") is not None
-                                else None
-                            ),
-                            "yes_bid": (
-                                float(quote_row["yes_bid"])
-                                if quote_row["yes_bid"] is not None
-                                else None
-                            ),
-                            "yes_ask": (
-                                float(quote_row["yes_ask"])
-                                if quote_row["yes_ask"] is not None
-                                else None
-                            ),
-                            "no_bid": (
-                                float(quote_row["no_bid"])
-                                if quote_row["no_bid"] is not None
-                                else None
-                            ),
-                            "no_ask": (
-                                float(quote_row["no_ask"])
-                                if quote_row["no_ask"] is not None
-                                else None
-                            ),
-                            "yes_mid": (
-                                float(quote_row["yes_mid"])
-                                if quote_row["yes_mid"] is not None
-                                else None
-                            ),
-                            "no_mid": (
-                                float(quote_row["no_mid"])
-                                if quote_row["no_mid"] is not None
-                                else None
-                            ),
-                            "p_mid": (
-                                float(quote_row["p_mid"])
-                                if quote_row["p_mid"] is not None
-                                else None
-                            ),
-                        },
+                        payload=QuoteUpdatePayload.model_validate(
+                            {
+                                "ts": int(quote_row["ts"]),
+                                "market_id": str(quote_row["market_id"]),
+                                "source_msg_id": (
+                                    str(row.get("seq"))
+                                    if row.get("seq") is not None
+                                    else None
+                                ),
+                                "yes_bid": (
+                                    float(quote_row["yes_bid"])
+                                    if quote_row["yes_bid"] is not None
+                                    else None
+                                ),
+                                "yes_ask": (
+                                    float(quote_row["yes_ask"])
+                                    if quote_row["yes_ask"] is not None
+                                    else None
+                                ),
+                                "no_bid": (
+                                    float(quote_row["no_bid"])
+                                    if quote_row["no_bid"] is not None
+                                    else None
+                                ),
+                                "no_ask": (
+                                    float(quote_row["no_ask"])
+                                    if quote_row["no_ask"] is not None
+                                    else None
+                                ),
+                                "yes_mid": (
+                                    float(quote_row["yes_mid"])
+                                    if quote_row["yes_mid"] is not None
+                                    else None
+                                ),
+                                "no_mid": (
+                                    float(quote_row["no_mid"])
+                                    if quote_row["no_mid"] is not None
+                                    else None
+                                ),
+                                "p_mid": (
+                                    float(quote_row["p_mid"])
+                                    if quote_row["p_mid"] is not None
+                                    else None
+                                ),
+                            }
+                        ),
                     )
                 )
             except Exception:
@@ -400,13 +373,130 @@ async def _run() -> int:
             return
 
         try:
-            run_seconds = max(int(end_time - time.monotonic()), 1)
-            await client.run(
-                on_ticker,
-                on_snapshot,
-                on_delta,
-                run_seconds=run_seconds,
-            )
+            last_no_market_log = 0.0
+            while True:
+                remaining = int(end_time - time.monotonic())
+                if remaining <= 0:
+                    break
+
+                tickers: list[str] = []
+                zero_market_wait_seconds = 0.0
+                zero_market_retries = 0
+                while True:
+                    tickers = await _load_market_tickers_from_rest(
+                        rest_client=rest_client,
+                        status=status,
+                        series=series,
+                        max_horizon_seconds=args.max_horizon_seconds,
+                        logger=logger,
+                    )
+                    if tickers:
+                        break
+                    zero_market_retries += 1
+                    now_mono = time.monotonic()
+                    if (now_mono - last_no_market_log) >= no_markets_log_every_seconds:
+                        logger.warning(
+                            "kalshi_ws_quotes_no_markets_retrying_publish_only",
+                            extra={
+                                "status": status,
+                                "series": series,
+                                "retry_seconds": no_markets_retry_seconds,
+                                "max_horizon_seconds": args.max_horizon_seconds,
+                            },
+                        )
+                        print(
+                            "WARNING: No markets matched REST filter "
+                            f"status={status} series={series}; retrying in {int(no_markets_retry_seconds)}s"
+                        )
+                        last_no_market_log = now_mono
+                    sleep_for = no_markets_retry_seconds
+                    await asyncio.sleep(sleep_for)
+                    zero_market_wait_seconds += sleep_for
+                    if time.monotonic() >= end_time:
+                        end_time = time.monotonic() + run_window_seconds
+
+                if zero_market_retries > 0:
+                    logger.info(
+                        "kalshi_ws_quotes_zero_market_wait_publish_only",
+                        extra={
+                            "wait_seconds": int(zero_market_wait_seconds),
+                            "retries": zero_market_retries,
+                            "market_count": len(tickers),
+                            "status": status,
+                            "series": series,
+                            "max_horizon_seconds": args.max_horizon_seconds,
+                        },
+                    )
+                    print(
+                        "WS zero-market wait: wait_s={wait_s} retries={retries} markets={markets}".format(
+                            wait_s=int(zero_market_wait_seconds),
+                            retries=zero_market_retries,
+                            markets=len(tickers),
+                        )
+                    )
+                    end_time = time.monotonic() + run_window_seconds
+
+                market_count = len(tickers)
+                subscription_refreshes += 1
+                client = KalshiWsClient(
+                    ws_url=settings.kalshi_ws_url,
+                    api_key_id=settings.kalshi_api_key_id,
+                    private_key_path=(
+                        str(settings.kalshi_private_key_path)
+                        if settings.kalshi_private_key_path
+                        else None
+                    ),
+                    auth_mode=settings.kalshi_ws_auth_mode,
+                    auth_query_key=settings.kalshi_ws_auth_query_key,
+                    auth_query_signature=settings.kalshi_ws_auth_query_signature,
+                    auth_query_timestamp=settings.kalshi_ws_auth_query_timestamp,
+                    market_tickers=tickers,
+                    logger=logger,
+                    channels=["ticker"],
+                )
+                run_seconds = max(int(end_time - time.monotonic()), 1)
+                if reload_markets_align_period_seconds > 0:
+                    aligned_wait = _seconds_until_next_alignment(
+                        now_ts=time.time(),
+                        period_seconds=reload_markets_align_period_seconds,
+                        offset_seconds=reload_markets_align_offset_seconds,
+                    )
+                    run_seconds = max(min(run_seconds, int(aligned_wait)), 1)
+                elif reload_markets_every_seconds > 0:
+                    run_seconds = max(min(run_seconds, reload_markets_every_seconds), 1)
+                logger.info(
+                    "kalshi_ws_quotes_subscription_refresh",
+                    extra={
+                        "refreshes": subscription_refreshes,
+                        "market_count": market_count,
+                        "run_seconds": run_seconds,
+                        "reload_markets_every_seconds": reload_markets_every_seconds,
+                        "reload_markets_align_period_seconds": reload_markets_align_period_seconds,
+                        "reload_markets_align_offset_seconds": reload_markets_align_offset_seconds,
+                        "status": status,
+                        "series": series,
+                        "max_horizon_seconds": args.max_horizon_seconds,
+                    },
+                )
+                print(
+                    "WS quote subscription refresh: refreshes={refreshes} "
+                    "markets={markets} run_seconds={run_seconds}".format(
+                        refreshes=subscription_refreshes,
+                        markets=market_count,
+                        run_seconds=run_seconds,
+                    )
+                )
+                await client.run(
+                    on_ticker,
+                    on_snapshot,
+                    on_delta,
+                    run_seconds=run_seconds,
+                )
+                if (
+                    reload_markets_every_seconds <= 0
+                    and reload_markets_align_period_seconds <= 0
+                ):
+                    break
         finally:
             await event_sink.close()
 
@@ -415,7 +505,8 @@ async def _run() -> int:
             "invalid": invalid,
             "write_errors": write_errors,
             "throttled": throttled,
-            "market_count": len(tickers),
+            "market_count": market_count,
+            "subscription_refreshes": subscription_refreshes,
             "event_publish_failures": event_publish_failures,
             "publish_only": True,
         }
@@ -451,20 +542,20 @@ async def _run() -> int:
         await conn.execute("PRAGMA busy_timeout = 15000;")
         await conn.commit()
 
-        tickers: list[str] = []
+        ws_tickers: list[str] = []
         last_no_market_log = 0.0
         zero_market_wait_seconds = 0.0
         zero_market_retries = 0
         while True:
             now_ts = int(time.time())
-            tickers = await load_market_tickers(
+            ws_tickers = await load_market_tickers(
                 conn,
                 status,
                 series,
                 now_ts=now_ts,
                 max_horizon_seconds=args.max_horizon_seconds,
             )
-            if tickers:
+            if ws_tickers:
                 break
             zero_market_retries += 1
             now_mono = time.monotonic()
@@ -524,7 +615,7 @@ async def _run() -> int:
             auth_query_key=settings.kalshi_ws_auth_query_key,
             auth_query_signature=settings.kalshi_ws_auth_query_signature,
             auth_query_timestamp=settings.kalshi_ws_auth_query_timestamp,
-            market_tickers=tickers,
+                market_tickers=ws_tickers,
             logger=logger,
             channels=["ticker"],
         )
@@ -539,7 +630,7 @@ async def _run() -> int:
         throttled = 0
         last_throttle_log = 0.0
         last_write_error_log = 0.0
-        last_written_ts_by_market: dict[str, int] = {}
+        last_written_ts_by_market_sqlite: dict[str, int] = {}
         bus_url = (
             args.events_bus_url
             if args.events_bus_url
@@ -583,7 +674,7 @@ async def _run() -> int:
 
             ts = int(row.get("ts") or time.time())
             if min_write_seconds > 0:
-                prev_ts = last_written_ts_by_market.get(market_id)
+                prev_ts = last_written_ts_by_market_sqlite.get(market_id)
                 if prev_ts is not None and (ts - prev_ts) < min_write_seconds:
                     throttled += 1
                     now_mono = time.monotonic()
@@ -634,56 +725,58 @@ async def _run() -> int:
             inserted += 1
             if not args.publish_only:
                 rows_since_commit += 1
-            last_written_ts_by_market[market_id] = ts
+            last_written_ts_by_market_sqlite[market_id] = ts
             if event_sink.enabled:
                 try:
                     await event_sink.publish(
                         QuoteUpdateEvent(
                             source="stream_kalshi_quotes_ws",
-                            payload={
-                                "ts": int(quote_row["ts"]),
-                                "market_id": str(quote_row["market_id"]),
-                                "source_msg_id": (
-                                    str(row.get("seq"))
-                                    if row.get("seq") is not None
-                                    else None
-                                ),
-                                "yes_bid": (
-                                    float(quote_row["yes_bid"])
-                                    if quote_row["yes_bid"] is not None
-                                    else None
-                                ),
-                                "yes_ask": (
-                                    float(quote_row["yes_ask"])
-                                    if quote_row["yes_ask"] is not None
-                                    else None
-                                ),
-                                "no_bid": (
-                                    float(quote_row["no_bid"])
-                                    if quote_row["no_bid"] is not None
-                                    else None
-                                ),
-                                "no_ask": (
-                                    float(quote_row["no_ask"])
-                                    if quote_row["no_ask"] is not None
-                                    else None
-                                ),
-                                "yes_mid": (
-                                    float(quote_row["yes_mid"])
-                                    if quote_row["yes_mid"] is not None
-                                    else None
-                                ),
-                                "no_mid": (
-                                    float(quote_row["no_mid"])
-                                    if quote_row["no_mid"] is not None
-                                    else None
-                                ),
-                                "p_mid": (
-                                    float(quote_row["p_mid"])
-                                    if quote_row["p_mid"] is not None
-                                    else None
-                                ),
-                            },
+                            payload=QuoteUpdatePayload.model_validate(
+                                {
+                                    "ts": int(quote_row["ts"]),
+                                    "market_id": str(quote_row["market_id"]),
+                                    "source_msg_id": (
+                                        str(row.get("seq"))
+                                        if row.get("seq") is not None
+                                        else None
+                                    ),
+                                    "yes_bid": (
+                                        float(quote_row["yes_bid"])
+                                        if quote_row["yes_bid"] is not None
+                                        else None
+                                    ),
+                                    "yes_ask": (
+                                        float(quote_row["yes_ask"])
+                                        if quote_row["yes_ask"] is not None
+                                        else None
+                                    ),
+                                    "no_bid": (
+                                        float(quote_row["no_bid"])
+                                        if quote_row["no_bid"] is not None
+                                        else None
+                                    ),
+                                    "no_ask": (
+                                        float(quote_row["no_ask"])
+                                        if quote_row["no_ask"] is not None
+                                        else None
+                                    ),
+                                    "yes_mid": (
+                                        float(quote_row["yes_mid"])
+                                        if quote_row["yes_mid"] is not None
+                                        else None
+                                    ),
+                                    "no_mid": (
+                                        float(quote_row["no_mid"])
+                                        if quote_row["no_mid"] is not None
+                                        else None
+                                    ),
+                                    "p_mid": (
+                                        float(quote_row["p_mid"])
+                                        if quote_row["p_mid"] is not None
+                                        else None
+                                    ),
+                                }
+                            ),
                         )
                     )
                 except Exception:
@@ -715,7 +808,7 @@ async def _run() -> int:
             "invalid": invalid,
             "write_errors": write_errors,
             "throttled": throttled,
-            "market_count": len(tickers),
+            "market_count": len(ws_tickers),
             "event_publish_failures": event_publish_failures,
             "publish_only": bool(args.publish_only),
         }

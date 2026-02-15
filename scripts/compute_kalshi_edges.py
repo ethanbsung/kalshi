@@ -7,7 +7,6 @@ import aiosqlite
 
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
-from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
 from kalshi_bot.strategy.edge_engine import compute_edges
 
@@ -72,7 +71,6 @@ def _parse_args() -> argparse.Namespace:
 async def _run() -> int:
     args = _parse_args()
     settings = load_settings()
-    logger = setup_logger(settings.log_path)
 
     print(f"DB path: {settings.db_path}")
 
@@ -272,8 +270,7 @@ async def _run() -> int:
             if samples:
                 sample_ids = [item["ticker"] for item in samples][:5]
                 placeholders = ",".join("?" for _ in sample_ids)
-                cursor = await conn.execute(
-                    f"""
+                sample_sql = f"""  # nosec B608
                     WITH latest AS (
                         SELECT market_id, MAX(ts) AS max_ts
                         FROM kalshi_quotes
@@ -290,7 +287,9 @@ async def _run() -> int:
                         ON q.market_id = l.market_id AND q.ts = l.max_ts
                     WHERE c.ticker IN ({placeholders})
                     ORDER BY c.ticker
-                    """,
+                    """
+                cursor = await conn.execute(
+                    sample_sql,
                     [*sample_ids, *sample_ids],
                 )
                 rows = await cursor.fetchall()

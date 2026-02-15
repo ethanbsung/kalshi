@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
@@ -19,7 +19,7 @@ class EventBase(BaseModel):
     ts_event: int = Field(default_factory=lambda: int(time.time()))
     source: str
     idempotency_key: str | None = None
-    payload: dict[str, Any]
+    payload: Any
 
     @model_validator(mode="after")
     def _enforce_contract(self) -> "EventBase":
@@ -121,6 +121,19 @@ class EdgeSnapshotPayload(BaseModel):
     spot_price: float
     quote_ts: int | None = None
     spot_ts: int | None = None
+    settlement_ts: int | None = None
+    horizon_seconds: int | None = None
+    strike: str | None = None
+    prob_yes_raw: float | None = None
+    yes_bid: float | None = None
+    yes_ask: float | None = None
+    no_bid: float | None = None
+    no_ask: float | None = None
+    yes_mid: float | None = None
+    no_mid: float | None = None
+    spot_age_seconds: int | None = None
+    quote_age_seconds: int | None = None
+    raw_json: str | None = None
 
 
 class EdgeSnapshotEvent(EventBase):
@@ -139,11 +152,68 @@ class OpportunityDecisionPayload(BaseModel):
     reason_not_eligible: str | None = None
     ev_raw: float | None = None
     ev_net: float | None = None
+    settlement_ts: int | None = None
+    strike: str | None = None
+    spot_price: float | None = None
+    sigma: float | None = None
+    tau: float | None = None
+    p_model: float | None = None
+    p_market: float | None = None
+    best_yes_bid: float | None = None
+    best_yes_ask: float | None = None
+    best_no_bid: float | None = None
+    best_no_ask: float | None = None
+    spread: float | None = None
+    cost_buffer: float | None = None
+    raw_json: str | None = None
+    strategy_version: int | None = None
 
 
 class OpportunityDecisionEvent(EventBase):
     event_type: Literal["opportunity_decision"] = "opportunity_decision"
     payload: OpportunityDecisionPayload
+
+
+class ExecutionOrderPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ts_order: int
+    order_id: str
+    market_id: str
+    side: str
+    action: str = "open"
+    quantity: int = Field(default=1, ge=1)
+    price_cents: float | None = None
+    status: str
+    reason: str | None = None
+    opportunity_idempotency_key: str | None = None
+    paper: bool = True
+
+
+class ExecutionOrderEvent(EventBase):
+    event_type: Literal["execution_order"] = "execution_order"
+    payload: ExecutionOrderPayload
+
+
+class ExecutionFillPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ts_fill: int
+    fill_id: str
+    order_id: str
+    market_id: str
+    side: str
+    action: str = "open"
+    quantity: int = Field(default=1, ge=1)
+    price_cents: float | None = None
+    outcome: int | None = None
+    reason: str | None = None
+    paper: bool = True
+
+
+class ExecutionFillEvent(EventBase):
+    event_type: Literal["execution_fill"] = "execution_fill"
+    payload: ExecutionFillPayload
 
 
 Event = (
@@ -153,6 +223,8 @@ Event = (
     | ContractUpdateEvent
     | EdgeSnapshotEvent
     | OpportunityDecisionEvent
+    | ExecutionOrderEvent
+    | ExecutionFillEvent
 )
 
 EVENT_MODEL_BY_TYPE: dict[str, type[EventBase]] = {
@@ -162,6 +234,8 @@ EVENT_MODEL_BY_TYPE: dict[str, type[EventBase]] = {
     "contract_update": ContractUpdateEvent,
     "edge_snapshot": EdgeSnapshotEvent,
     "opportunity_decision": OpportunityDecisionEvent,
+    "execution_order": ExecutionOrderEvent,
+    "execution_fill": ExecutionFillEvent,
 }
 
 EVENT_ADAPTER = TypeAdapter(Event)
@@ -180,4 +254,4 @@ def parse_event_dict(raw: dict[str, Any]) -> Event:
     model = EVENT_MODEL_BY_TYPE.get(event_type)
     if model is None:
         raise ValueError(f"Unknown event_type: {event_type!r}")
-    return model.model_validate(raw)
+    return cast(Event, model.model_validate(raw))

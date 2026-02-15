@@ -15,6 +15,7 @@ import aiosqlite
 
 from kalshi_bot.config import load_settings
 from kalshi_bot.kalshi.fees import taker_fee_dollars
+from kalshi_bot.persistence import PostgresEventRepository
 
 
 def _parse_args() -> argparse.Namespace:
@@ -38,6 +39,12 @@ def _parse_args() -> argparse.Namespace:
         choices=["auto", "always", "never"],
         default="auto",
         help="Colorize output (default: auto).",
+    )
+    parser.add_argument(
+        "--pg-dsn",
+        type=str,
+        default=None,
+        help="Use Postgres source when provided (defaults to PG_DSN).",
     )
     return parser.parse_args()
 
@@ -144,7 +151,7 @@ async def _load_open_rows(conn: aiosqlite.Connection) -> list[tuple[Any, ...]]:
         ORDER BY o.ts_eval ASC
         """
     )
-    return await cursor.fetchall()
+    return [tuple(row) for row in await cursor.fetchall()]
 
 
 async def _load_settled_rows(conn: aiosqlite.Connection) -> list[tuple[Any, ...]]:
@@ -161,28 +168,122 @@ async def _load_settled_rows(conn: aiosqlite.Connection) -> list[tuple[Any, ...]
         ORDER BY COALESCE(c.settled_ts, o.settlement_ts, o.ts_eval) DESC, o.ts_eval DESC
         """
     )
-    return await cursor.fetchall()
+    return [tuple(row) for row in await cursor.fetchall()]
+
+
+def _load_open_rows_postgres(conn: Any) -> list[tuple[Any, ...]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH latest_fill AS (
+                SELECT DISTINCT ON (f.market_id)
+                    f.market_id,
+                    f.side,
+                    f.ts_fill,
+                    f.price_cents,
+                    f.action
+                FROM event_store.execution_fill_latest f
+                WHERE f.paper = TRUE
+                ORDER BY f.market_id, f.ts_fill DESC
+            )
+            SELECT
+                lf.market_id,
+                lf.side,
+                lf.ts_fill AS ts_eval,
+                COALESCE(c.close_ts, c.expected_expiration_ts, c.expiration_ts, c.settled_ts) AS settlement_ts,
+                CASE WHEN lf.side = 'YES' THEN lf.price_cents ELSE NULL END AS best_yes_ask,
+                CASE WHEN lf.side = 'NO' THEN lf.price_cents ELSE NULL END AS best_no_ask,
+                NULL::TEXT AS raw_json,
+                c.outcome,
+                c.settled_ts,
+                q.ts AS quote_ts,
+                q.yes_bid,
+                q.yes_ask,
+                q.no_bid,
+                q.no_ask,
+                q.yes_mid,
+                q.no_mid
+            FROM latest_fill lf
+            LEFT JOIN event_store.state_contract_latest c
+              ON c.ticker = lf.market_id
+            LEFT JOIN event_store.state_quote_latest q
+              ON q.market_id = lf.market_id
+            WHERE lf.action = 'open'
+              AND c.outcome IS NULL
+            ORDER BY lf.ts_fill ASC
+            """
+        )
+        return cur.fetchall()
+
+
+def _load_settled_rows_postgres(conn: Any) -> list[tuple[Any, ...]]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                f.market_id,
+                f.side,
+                f.ts_fill AS ts_eval,
+                COALESCE(c.close_ts, c.expected_expiration_ts, c.expiration_ts, c.settled_ts) AS settlement_ts,
+                CASE WHEN f.side = 'YES' THEN f.price_cents ELSE NULL END AS best_yes_ask,
+                CASE WHEN f.side = 'NO' THEN f.price_cents ELSE NULL END AS best_no_ask,
+                NULL::TEXT AS raw_json,
+                c.outcome,
+                c.settled_ts
+            FROM event_store.execution_fill_latest f
+            JOIN event_store.state_contract_latest c
+              ON c.ticker = f.market_id
+            WHERE f.paper = TRUE
+              AND f.action = 'open'
+              AND c.outcome IN (0, 1)
+            ORDER BY COALESCE(c.settled_ts, c.expiration_ts, c.close_ts, f.ts_fill) DESC,
+                     f.ts_fill DESC
+            """
+        )
+        return cur.fetchall()
 
 
 async def _run() -> int:
     args = _parse_args()
     settings = load_settings()
     color = _use_color(args.color)
-
-    print(f"DB path: {settings.db_path}")
-    db_path = Path(settings.db_path).resolve()
-    db_uri = f"file:{db_path}?mode=ro"
-
+    rows: list[tuple[Any, ...]]
+    settled_rows: list[tuple[Any, ...]]
+    pg_dsn = args.pg_dsn or settings.pg_dsn
     now_ts = int(time.time())
-    try:
-        async with aiosqlite.connect(db_uri, uri=True) as conn:
-            await conn.execute("PRAGMA foreign_keys = ON;")
-            await conn.execute("PRAGMA busy_timeout = 1000;")
-            rows = await _load_open_rows(conn)
-            settled_rows = await _load_settled_rows(conn)
-    except sqlite3.OperationalError as exc:
-        print(f"ERROR: could not open DB read-only: {exc}")
-        return 1
+    if pg_dsn:
+        print("backend=postgres")
+        try:
+            repo = PostgresEventRepository(pg_dsn)
+            repo.ensure_schema()
+            repo.close()
+            try:
+                import psycopg
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "psycopg is required for Postgres open-position reporting. "
+                    "Install with: pip install psycopg[binary]"
+                ) from exc
+            with psycopg.connect(pg_dsn) as pg_conn:
+                rows = _load_open_rows_postgres(pg_conn)
+                settled_rows = _load_settled_rows_postgres(pg_conn)
+        except Exception as exc:
+            print(f"ERROR: postgres report query failed: {exc}")
+            return 1
+    else:
+        print("backend=sqlite")
+        print(f"DB path: {settings.db_path}")
+        db_path = Path(settings.db_path).resolve()
+        db_uri = f"file:{db_path}?mode=ro"
+        try:
+            async with aiosqlite.connect(db_uri, uri=True) as sqlite_conn:
+                await sqlite_conn.execute("PRAGMA foreign_keys = ON;")
+                await sqlite_conn.execute("PRAGMA busy_timeout = 1000;")
+                rows = await _load_open_rows(sqlite_conn)
+                settled_rows = await _load_settled_rows(sqlite_conn)
+        except sqlite3.OperationalError as exc:
+            print(f"ERROR: could not open DB read-only: {exc}")
+            return 1
 
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for (

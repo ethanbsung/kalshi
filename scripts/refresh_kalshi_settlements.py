@@ -5,6 +5,7 @@ import asyncio
 import fcntl
 import json
 import logging
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,13 +16,14 @@ import aiosqlite
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
+from kalshi_bot.events import ContractUpdateEvent, ContractUpdatePayload, EventPublisher
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi.rest_client import KalshiRestClient, KalshiRestError
 from kalshi_bot.kalshi.contracts import build_contract_row
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
 from kalshi_bot.kalshi.market_filters import normalize_series
 
-LOCK_PATH = Path("/tmp/kalshi_refresh_kalshi_settlements.lock")
+LOCK_PATH = Path(tempfile.gettempdir()) / "kalshi_refresh_kalshi_settlements.lock"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -59,6 +61,29 @@ def _parse_args() -> argparse.Namespace:
         "--force",
         action="store_true",
         help="Overwrite conflicting outcomes already stored in DB.",
+    )
+    parser.add_argument(
+        "--events-jsonl-path",
+        type=str,
+        default=None,
+        help="Optional JSONL file path for publishing contract_update events.",
+    )
+    parser.add_argument(
+        "--events-bus",
+        action="store_true",
+        help="Publish contract_update events to JetStream.",
+    )
+    parser.add_argument(
+        "--events-bus-url",
+        type=str,
+        default=None,
+        help="JetStream bus URL override (default BUS_URL).",
+    )
+    parser.add_argument(
+        "--pg-dsn",
+        type=str,
+        default=None,
+        help="Optional Postgres DSN override (defaults to PG_DSN).",
     )
     return parser.parse_args()
 
@@ -219,6 +244,7 @@ def build_settlement_updates(
             continue
         existing = existing_contracts.get(ticker)
         settled_ts, ts_errors, ts_source = _extract_settled_ts(market, now_ts)
+        existing_settled_ts: int | None
         if settled_ts < since_ts:
             continue
         counters["markets_after_since_filter"] += 1
@@ -237,7 +263,15 @@ def build_settlement_updates(
             counters["contracts_missing_before_create"] += 1
         else:
             existing_outcome = existing.get("outcome")
-            existing_settled_ts = existing.get("settled_ts")
+            raw_existing_settled_ts = existing.get("settled_ts")
+            try:
+                existing_settled_ts = (
+                    int(raw_existing_settled_ts)
+                    if raw_existing_settled_ts is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                existing_settled_ts = None
         if outcome is not None:
             if existing_outcome is None or existing_outcome != outcome:
                 counters["updated_outcomes_count"] += 1
@@ -309,18 +343,325 @@ async def _load_existing_contracts(
     for idx in range(0, len(tickers), chunk_size):
         chunk = tickers[idx : idx + chunk_size]
         placeholders = ",".join("?" for _ in chunk)
+        sql = (
+            f"SELECT ticker, lower, upper, strike_type, close_ts, "
+            f"expected_expiration_ts, expiration_ts, outcome, settled_ts "
+            f"FROM kalshi_contracts "
+            f"WHERE ticker IN ({placeholders})"
+        )
         cursor = await conn.execute(
-            f"SELECT ticker, outcome, settled_ts FROM kalshi_contracts "
-            f"WHERE ticker IN ({placeholders})",
+            sql,
             chunk,
         )
         rows = await cursor.fetchall()
-        for ticker, outcome, settled_ts in rows:
+        for (
+            ticker,
+            lower,
+            upper,
+            strike_type,
+            close_ts,
+            expected_expiration_ts,
+            expiration_ts,
+            outcome,
+            settled_ts,
+        ) in rows:
             existing[ticker] = {
+                "lower": lower,
+                "upper": upper,
+                "strike_type": strike_type,
+                "close_ts": close_ts,
+                "expected_expiration_ts": expected_expiration_ts,
+                "expiration_ts": expiration_ts,
                 "outcome": outcome,
                 "settled_ts": settled_ts,
             }
     return existing
+
+
+async def _load_contract_rows_for_events(
+    conn: aiosqlite.Connection, tickers: list[str]
+) -> dict[str, dict[str, Any]]:
+    rows_by_ticker: dict[str, dict[str, Any]] = {}
+    if not tickers:
+        return rows_by_ticker
+    chunk_size = 500
+    for idx in range(0, len(tickers), chunk_size):
+        chunk = tickers[idx : idx + chunk_size]
+        placeholders = ",".join("?" for _ in chunk)
+        sql = (
+            f"SELECT ticker, lower, upper, strike_type, close_ts, "
+            f"expected_expiration_ts, expiration_ts, settled_ts, outcome "
+            f"FROM kalshi_contracts WHERE ticker IN ({placeholders})"
+        )
+        cursor = await conn.execute(sql, chunk)
+        rows = await cursor.fetchall()
+        for (
+            ticker,
+            lower,
+            upper,
+            strike_type,
+            close_ts,
+            expected_expiration_ts,
+            expiration_ts,
+            settled_ts,
+            outcome,
+        ) in rows:
+            rows_by_ticker[str(ticker)] = {
+                "ticker": ticker,
+                "lower": lower,
+                "upper": upper,
+                "strike_type": strike_type,
+                "close_ts": close_ts,
+                "expected_expiration_ts": expected_expiration_ts,
+                "expiration_ts": expiration_ts,
+                "settled_ts": settled_ts,
+                "outcome": outcome,
+            }
+    return rows_by_ticker
+
+
+def _load_existing_contracts_postgres(
+    conn: Any, tickers: list[str]
+) -> dict[str, dict[str, Any]]:
+    existing: dict[str, dict[str, Any]] = {}
+    if not tickers:
+        return existing
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                ticker,
+                lower,
+                upper,
+                strike_type,
+                close_ts,
+                expected_expiration_ts,
+                expiration_ts,
+                outcome,
+                settled_ts
+            FROM event_store.state_contract_latest
+            WHERE ticker = ANY(%s)
+            """,
+            (tickers,),
+        )
+        for (
+            ticker,
+            lower,
+            upper,
+            strike_type,
+            close_ts,
+            expected_expiration_ts,
+            expiration_ts,
+            outcome,
+            settled_ts,
+        ) in cur.fetchall():
+            existing[str(ticker)] = {
+                "lower": lower,
+                "upper": upper,
+                "strike_type": strike_type,
+                "close_ts": close_ts,
+                "expected_expiration_ts": expected_expiration_ts,
+                "expiration_ts": expiration_ts,
+                "outcome": outcome,
+                "settled_ts": settled_ts,
+            }
+    return existing
+
+
+def _upsert_contract_rows_postgres(conn: Any, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        for row in rows:
+            cur.execute(
+                """
+                INSERT INTO event_store.state_contract_latest (
+                    ticker,
+                    lower,
+                    upper,
+                    strike_type,
+                    close_ts,
+                    expected_expiration_ts,
+                    expiration_ts,
+                    settled_ts,
+                    outcome
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (ticker) DO UPDATE SET
+                    lower = COALESCE(EXCLUDED.lower, event_store.state_contract_latest.lower),
+                    upper = COALESCE(EXCLUDED.upper, event_store.state_contract_latest.upper),
+                    strike_type = COALESCE(EXCLUDED.strike_type, event_store.state_contract_latest.strike_type),
+                    close_ts = COALESCE(EXCLUDED.close_ts, event_store.state_contract_latest.close_ts),
+                    expected_expiration_ts = COALESCE(
+                        EXCLUDED.expected_expiration_ts,
+                        event_store.state_contract_latest.expected_expiration_ts
+                    ),
+                    expiration_ts = COALESCE(EXCLUDED.expiration_ts, event_store.state_contract_latest.expiration_ts),
+                    settled_ts = COALESCE(EXCLUDED.settled_ts, event_store.state_contract_latest.settled_ts),
+                    outcome = COALESCE(EXCLUDED.outcome, event_store.state_contract_latest.outcome),
+                    updated_at = NOW()
+                """,
+                (
+                    row.get("ticker"),
+                    row.get("lower"),
+                    row.get("upper"),
+                    row.get("strike_type"),
+                    row.get("close_ts"),
+                    row.get("expected_expiration_ts"),
+                    row.get("expiration_ts"),
+                    row.get("settled_ts"),
+                    row.get("outcome"),
+                ),
+            )
+
+
+def _apply_updates_postgres(
+    conn: Any,
+    updates: list[dict[str, Any]],
+    *,
+    force: bool,
+) -> int:
+    if not updates:
+        return 0
+    applied = 0
+    with conn.cursor() as cur:
+        for update in updates:
+            cur.execute(
+                """
+                INSERT INTO event_store.state_contract_latest (
+                    ticker, settled_ts, outcome
+                ) VALUES (%s, %s, %s)
+                ON CONFLICT (ticker) DO UPDATE SET
+                    settled_ts = COALESCE(EXCLUDED.settled_ts, event_store.state_contract_latest.settled_ts),
+                    outcome = CASE
+                        WHEN EXCLUDED.outcome IS NULL THEN event_store.state_contract_latest.outcome
+                        WHEN event_store.state_contract_latest.outcome IS NULL THEN EXCLUDED.outcome
+                        WHEN %s THEN EXCLUDED.outcome
+                        ELSE event_store.state_contract_latest.outcome
+                    END,
+                    updated_at = NOW()
+                """,
+                (
+                    update.get("ticker"),
+                    update.get("settled_ts"),
+                    update.get("outcome"),
+                    bool(force),
+                ),
+            )
+            if cur.rowcount > 0:
+                applied += 1
+    return applied
+
+
+def _load_contract_rows_for_events_postgres(
+    conn: Any, tickers: list[str]
+) -> dict[str, dict[str, Any]]:
+    rows_by_ticker: dict[str, dict[str, Any]] = {}
+    if not tickers:
+        return rows_by_ticker
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                ticker,
+                lower,
+                upper,
+                strike_type,
+                close_ts,
+                expected_expiration_ts,
+                expiration_ts,
+                settled_ts,
+                outcome
+            FROM event_store.state_contract_latest
+            WHERE ticker = ANY(%s)
+            """,
+            (tickers,),
+        )
+        for (
+            ticker,
+            lower,
+            upper,
+            strike_type,
+            close_ts,
+            expected_expiration_ts,
+            expiration_ts,
+            settled_ts,
+            outcome,
+        ) in cur.fetchall():
+            rows_by_ticker[str(ticker)] = {
+                "ticker": ticker,
+                "lower": lower,
+                "upper": upper,
+                "strike_type": strike_type,
+                "close_ts": close_ts,
+                "expected_expiration_ts": expected_expiration_ts,
+                "expiration_ts": expiration_ts,
+                "settled_ts": settled_ts,
+                "outcome": outcome,
+            }
+    return rows_by_ticker
+
+
+async def _publish_contract_updates(
+    *,
+    event_sink: EventPublisher,
+    rows_by_ticker: dict[str, dict[str, Any]],
+) -> int:
+    if not event_sink.enabled or not rows_by_ticker:
+        return 0
+    failures = 0
+    for row in rows_by_ticker.values():
+        try:
+            await event_sink.publish(
+                ContractUpdateEvent(
+                    source="refresh_kalshi_settlements",
+                    payload=ContractUpdatePayload(
+                        ticker=str(row["ticker"]),
+                        lower=(
+                            float(row["lower"])
+                            if row.get("lower") is not None
+                            else None
+                        ),
+                        upper=(
+                            float(row["upper"])
+                            if row.get("upper") is not None
+                            else None
+                        ),
+                        strike_type=(
+                            str(row["strike_type"])
+                            if row.get("strike_type") is not None
+                            else None
+                        ),
+                        close_ts=(
+                            int(row["close_ts"])
+                            if row.get("close_ts") is not None
+                            else None
+                        ),
+                        expected_expiration_ts=(
+                            int(row["expected_expiration_ts"])
+                            if row.get("expected_expiration_ts") is not None
+                            else None
+                        ),
+                        expiration_ts=(
+                            int(row["expiration_ts"])
+                            if row.get("expiration_ts") is not None
+                            else None
+                        ),
+                        settled_ts=(
+                            int(row["settled_ts"])
+                            if row.get("settled_ts") is not None
+                            else None
+                        ),
+                        outcome=(
+                            int(row["outcome"])
+                            if row.get("outcome") is not None
+                            else None
+                        ),
+                    ),
+                )
+            )
+        except Exception:
+            failures += 1
+    return failures
 
 
 async def _apply_updates(
@@ -362,9 +703,23 @@ async def _run() -> int:
     args = _parse_args()
     settings = load_settings()
     logger = setup_logger(settings.log_path)
+    bus_url = (
+        args.events_bus_url
+        if args.events_bus_url
+        else (settings.bus_url if args.events_bus else None)
+    )
+    event_sink = await EventPublisher.create(
+        jsonl_path=args.events_jsonl_path,
+        bus_url=bus_url,
+    )
 
-    print(f"DB path: {settings.db_path}")
-    await init_db(settings.db_path)
+    pg_dsn = args.pg_dsn or settings.pg_dsn
+    if pg_dsn:
+        print("backend=postgres")
+    else:
+        print("backend=sqlite")
+        print(f"DB path: {settings.db_path}")
+        await init_db(settings.db_path)
 
     rest_client = KalshiRestClient(
         base_url=settings.kalshi_rest_url,
@@ -467,44 +822,107 @@ async def _run() -> int:
             market
             for market in markets
             if isinstance(market, dict)
-            and isinstance(market.get("ticker") or market.get("market_id"), str)
-            and (market.get("ticker") or market.get("market_id")).startswith(
+            and isinstance((market.get("ticker") or market.get("market_id")), str)
+            and str(market.get("ticker") or market.get("market_id")).startswith(
                 series_prefixes
             )
         ]
 
     tickers = [
-        market.get("ticker") or market.get("market_id")
+        ticker
         for market in markets
         if isinstance(market, dict)
+        for ticker in [market.get("ticker") or market.get("market_id")]
+        if isinstance(ticker, str) and ticker
     ]
     markets_with_ticker = len([t for t in tickers if isinstance(t, str) and t])
 
-    async with aiosqlite.connect(settings.db_path) as conn:
-        await conn.execute("PRAGMA foreign_keys = ON;")
-        await conn.execute("PRAGMA journal_mode = WAL;")
-        await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA busy_timeout = 15000;")
-        await conn.commit()
+    event_publish_failures = 0
+    applied = 0
+    updates: list[dict[str, Any]] = []
+    counters: dict[str, int] = {}
+    try:
+        if pg_dsn:
+            try:
+                import psycopg
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "psycopg is required for Postgres settlements refresh. "
+                    "Install with: pip install psycopg[binary]"
+                ) from exc
 
-        existing = await _load_existing_contracts(conn, tickers)
-        updates, create_rows, counters = build_settlement_updates(
-            markets, existing, now_ts, since_ts, logger, args.force
-        )
+            with psycopg.connect(pg_dsn) as pg_conn:
+                existing = _load_existing_contracts_postgres(pg_conn, tickers)
+                updates, create_rows, counters = build_settlement_updates(
+                    markets, existing, now_ts, since_ts, logger, args.force
+                )
+                if not args.dry_run:
+                    _upsert_contract_rows_postgres(pg_conn, create_rows)
+                    applied = _apply_updates_postgres(
+                        pg_conn, updates, force=args.force
+                    )
+                    pg_conn.commit()
+                    if event_sink.enabled:
+                        changed_tickers = sorted(
+                            {
+                                str(update["ticker"])
+                                for update in updates
+                                if isinstance(update.get("ticker"), str)
+                            }
+                        )
+                        rows_for_events = _load_contract_rows_for_events_postgres(
+                            pg_conn, changed_tickers
+                        )
+                        event_publish_failures = await _publish_contract_updates(
+                            event_sink=event_sink,
+                            rows_by_ticker=rows_for_events,
+                        )
+                else:
+                    applied = 0
+        else:
+            async with aiosqlite.connect(settings.db_path) as conn:
+                await conn.execute("PRAGMA foreign_keys = ON;")
+                await conn.execute("PRAGMA journal_mode = WAL;")
+                await conn.execute("PRAGMA synchronous = NORMAL;")
+                await conn.execute("PRAGMA busy_timeout = 15000;")
+                await conn.commit()
 
-        dao = Dao(conn)
-        if not args.dry_run and create_rows:
-            for idx, row in enumerate(create_rows, start=1):
-                await dao.upsert_kalshi_contract(row)
-                if idx % 100 == 0:
+                existing = await _load_existing_contracts(conn, tickers)
+                updates, create_rows, counters = build_settlement_updates(
+                    markets, existing, now_ts, since_ts, logger, args.force
+                )
+
+                dao = Dao(conn)
+                if not args.dry_run and create_rows:
+                    for idx, row in enumerate(create_rows, start=1):
+                        await dao.upsert_kalshi_contract(row)
+                        if idx % 100 == 0:
+                            await conn.commit()
                     await conn.commit()
-            await conn.commit()
 
-        applied = await _apply_updates(
-            conn, updates, now_ts, args.dry_run, args.force
-        )
-        if not args.dry_run and applied:
-            await conn.commit()
+                applied = await _apply_updates(
+                    conn, updates, now_ts, args.dry_run, args.force
+                )
+                if not args.dry_run and applied:
+                    await conn.commit()
+
+                if not args.dry_run and event_sink.enabled:
+                    changed_tickers = sorted(
+                        {
+                            str(update["ticker"])
+                            for update in updates
+                            if isinstance(update.get("ticker"), str)
+                        }
+                    )
+                    rows_for_events = await _load_contract_rows_for_events(
+                        conn, changed_tickers
+                    )
+                    event_publish_failures = await _publish_contract_updates(
+                        event_sink=event_sink,
+                        rows_by_ticker=rows_for_events,
+                    )
+    finally:
+        await event_sink.close()
 
     if args.dry_run:
         failures = counters["failures"]
@@ -550,6 +968,7 @@ async def _run() -> int:
             applied_total=applied,
         )
     )
+    print(f"Settlement refresh event_publish_failures={event_publish_failures}")
     if args.debug and markets:
         sample = next((m for m in markets if isinstance(m, dict)), None)
         if sample:

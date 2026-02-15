@@ -6,6 +6,8 @@ from typing import Any
 from kalshi_bot.events.models import (
     ContractUpdateEvent,
     EdgeSnapshotEvent,
+    ExecutionFillEvent,
+    ExecutionOrderEvent,
     EventBase,
     MarketLifecycleEvent,
     OpportunityDecisionEvent,
@@ -104,6 +106,51 @@ CREATE TABLE IF NOT EXISTS event_store.strategy_opportunity_latest (
     ev_raw DOUBLE PRECISION,
     ev_net DOUBLE PRECISION,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS event_store.execution_order_latest (
+    order_id TEXT PRIMARY KEY,
+    ts_order BIGINT NOT NULL,
+    market_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    action TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    price_cents DOUBLE PRECISION,
+    status TEXT NOT NULL,
+    reason TEXT,
+    opportunity_idempotency_key TEXT,
+    paper BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS event_store.execution_fill_latest (
+    fill_id TEXT PRIMARY KEY,
+    ts_fill BIGINT NOT NULL,
+    order_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    action TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    price_cents DOUBLE PRECISION,
+    outcome INTEGER,
+    reason TEXT,
+    paper BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS event_store.fact_edge_snapshot_scores (
+    asof_ts BIGINT NOT NULL,
+    market_id TEXT NOT NULL,
+    settled_ts BIGINT,
+    outcome INTEGER NOT NULL,
+    pnl_take_yes DOUBLE PRECISION,
+    pnl_take_no DOUBLE PRECISION,
+    brier DOUBLE PRECISION,
+    logloss DOUBLE PRECISION,
+    error TEXT,
+    created_ts BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (asof_ts, market_id)
 );
 """
 
@@ -271,14 +318,17 @@ class PostgresEventRepository:
                     expected_expiration_ts, expiration_ts, settled_ts, outcome
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (ticker) DO UPDATE SET
-                    lower = EXCLUDED.lower,
-                    upper = EXCLUDED.upper,
-                    strike_type = EXCLUDED.strike_type,
-                    close_ts = EXCLUDED.close_ts,
-                    expected_expiration_ts = EXCLUDED.expected_expiration_ts,
-                    expiration_ts = EXCLUDED.expiration_ts,
-                    settled_ts = EXCLUDED.settled_ts,
-                    outcome = EXCLUDED.outcome,
+                    lower = COALESCE(EXCLUDED.lower, event_store.state_contract_latest.lower),
+                    upper = COALESCE(EXCLUDED.upper, event_store.state_contract_latest.upper),
+                    strike_type = COALESCE(EXCLUDED.strike_type, event_store.state_contract_latest.strike_type),
+                    close_ts = COALESCE(EXCLUDED.close_ts, event_store.state_contract_latest.close_ts),
+                    expected_expiration_ts = COALESCE(
+                        EXCLUDED.expected_expiration_ts,
+                        event_store.state_contract_latest.expected_expiration_ts
+                    ),
+                    expiration_ts = COALESCE(EXCLUDED.expiration_ts, event_store.state_contract_latest.expiration_ts),
+                    settled_ts = COALESCE(EXCLUDED.settled_ts, event_store.state_contract_latest.settled_ts),
+                    outcome = COALESCE(EXCLUDED.outcome, event_store.state_contract_latest.outcome),
                     updated_at = NOW()
                 """,
                 (
@@ -353,6 +403,78 @@ class PostgresEventRepository:
                     payload.get("reason_not_eligible"),
                     payload.get("ev_raw"),
                     payload.get("ev_net"),
+                ),
+            )
+            return
+
+        if isinstance(event, ExecutionOrderEvent):
+            cur.execute(
+                """
+                INSERT INTO event_store.execution_order_latest (
+                    order_id, ts_order, market_id, side, action, quantity,
+                    price_cents, status, reason, opportunity_idempotency_key, paper
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (order_id) DO UPDATE SET
+                    ts_order = EXCLUDED.ts_order,
+                    market_id = EXCLUDED.market_id,
+                    side = EXCLUDED.side,
+                    action = EXCLUDED.action,
+                    quantity = EXCLUDED.quantity,
+                    price_cents = EXCLUDED.price_cents,
+                    status = EXCLUDED.status,
+                    reason = EXCLUDED.reason,
+                    opportunity_idempotency_key = EXCLUDED.opportunity_idempotency_key,
+                    paper = EXCLUDED.paper,
+                    updated_at = NOW()
+                """,
+                (
+                    payload["order_id"],
+                    payload["ts_order"],
+                    payload["market_id"],
+                    payload["side"],
+                    payload.get("action", "open"),
+                    payload.get("quantity", 1),
+                    payload.get("price_cents"),
+                    payload["status"],
+                    payload.get("reason"),
+                    payload.get("opportunity_idempotency_key"),
+                    payload.get("paper", True),
+                ),
+            )
+            return
+
+        if isinstance(event, ExecutionFillEvent):
+            cur.execute(
+                """
+                INSERT INTO event_store.execution_fill_latest (
+                    fill_id, ts_fill, order_id, market_id, side, action, quantity,
+                    price_cents, outcome, reason, paper
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (fill_id) DO UPDATE SET
+                    ts_fill = EXCLUDED.ts_fill,
+                    order_id = EXCLUDED.order_id,
+                    market_id = EXCLUDED.market_id,
+                    side = EXCLUDED.side,
+                    action = EXCLUDED.action,
+                    quantity = EXCLUDED.quantity,
+                    price_cents = EXCLUDED.price_cents,
+                    outcome = EXCLUDED.outcome,
+                    reason = EXCLUDED.reason,
+                    paper = EXCLUDED.paper,
+                    updated_at = NOW()
+                """,
+                (
+                    payload["fill_id"],
+                    payload["ts_fill"],
+                    payload["order_id"],
+                    payload["market_id"],
+                    payload["side"],
+                    payload.get("action", "open"),
+                    payload.get("quantity", 1),
+                    payload.get("price_cents"),
+                    payload.get("outcome"),
+                    payload.get("reason"),
+                    payload.get("paper", True),
                 ),
             )
 

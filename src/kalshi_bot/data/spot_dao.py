@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 import aiosqlite
@@ -33,9 +34,12 @@ def _sort_by_ts(rows: list[tuple[int, float]]) -> list[tuple[int, float]]:
     return sorted(rows, key=lambda item: item[0])
 
 
-def _normalize_rows(rows: list[tuple[Any, Any]]) -> list[tuple[int, float]]:
+def _normalize_rows(rows: Iterable[Any]) -> list[tuple[int, float]]:
     normalized: list[tuple[int, float]] = []
-    for ts, price in rows:
+    for row in rows:
+        if not isinstance(row, tuple) or len(row) < 2:
+            continue
+        ts, price = row[0], row[1]
         ts_val = _parse_int(ts)
         price_val = _parse_float(price)
         if ts_val is None or price_val is None:

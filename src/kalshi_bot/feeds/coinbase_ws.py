@@ -160,7 +160,10 @@ class CoinbaseWsClient:
     async def _consume_source(
         self, on_row: RowHandler, end_time: float | None, start_time: float
     ) -> None:
-        async for message in self._message_source:
+        source = self._message_source
+        if source is None:
+            return
+        async for message in source:
             if end_time is not None and time.monotonic() >= end_time:
                 return
             self._check_no_messages_guard(start_time)

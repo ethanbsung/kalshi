@@ -14,9 +14,9 @@ def _iter_migration_files() -> Iterable[tuple[int, str]]:
     files = resources.files(MIGRATIONS_PACKAGE).iterdir()
     migrations = []
     for path in files:
-        if path.suffix != ".sql":
-            continue
         name = path.name
+        if not name.endswith(".sql"):
+            continue
         version_str = name.split("_", 1)[0]
         try:
             version = int(version_str)

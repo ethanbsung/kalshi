@@ -10,7 +10,7 @@ from typing import Any, Protocol
 import aiosqlite
 
 from kalshi_bot.data.dao import Dao
-from kalshi_bot.events import ContractUpdateEvent
+from kalshi_bot.events import ContractUpdateEvent, ContractUpdatePayload
 from kalshi_bot.kalshi.error_utils import (
     add_failed_sample,
     classify_exception,
@@ -329,28 +329,28 @@ class KalshiContractRefresher:
                     await event_sink.publish(
                         ContractUpdateEvent(
                             source="refresh_kalshi_contracts",
-                            payload={
-                                "ticker": str(row["ticker"]),
-                                "lower": row.get("lower"),
-                                "upper": row.get("upper"),
-                                "strike_type": row.get("strike_type"),
-                                "close_ts": row.get("close_ts"),
-                                "expected_expiration_ts": row.get(
+                            payload=ContractUpdatePayload(
+                                ticker=str(row["ticker"]),
+                                lower=row.get("lower"),
+                                upper=row.get("upper"),
+                                strike_type=row.get("strike_type"),
+                                close_ts=row.get("close_ts"),
+                                expected_expiration_ts=row.get(
                                     "expected_expiration_ts"
                                 ),
-                                "expiration_ts": row.get("expiration_ts"),
-                                "settled_ts": row.get("settled_ts"),
-                                "outcome": row.get("outcome"),
-                            },
+                                expiration_ts=row.get("expiration_ts"),
+                                settled_ts=row.get("settled_ts"),
+                                outcome=row.get("outcome"),
+                            ),
                         )
                     )
                 except Exception:
                     event_publish_failures += 1
             # Release writer lock periodically to reduce SQLite contention.
-            if dao is not None and upserted % 100 == 0:
+            if dao is not None and conn is not None and upserted % 100 == 0:
                 await conn.commit()
 
-        if dao is not None:
+        if dao is not None and conn is not None:
             await conn.commit()
 
         self._logger.info(

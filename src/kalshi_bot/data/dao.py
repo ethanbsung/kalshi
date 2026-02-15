@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 import aiosqlite
@@ -207,7 +208,7 @@ class Dao:
             raise ValueError("row cannot be empty")
         columns = ", ".join(row.keys())
         placeholders = ", ".join("?" for _ in row)
-        sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
+        sql = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"  # nosec B608
         await self._execute_with_retry(sql, tuple(row.values()))
 
     async def insert_spot_tick(self, row: Mapping[str, Any]) -> None:
@@ -224,7 +225,7 @@ class Dao:
             if col != "market_id"
         )
         sql = (
-            f"INSERT INTO kalshi_markets ({columns}) VALUES ({placeholders}) "
+            f"INSERT INTO kalshi_markets ({columns}) VALUES ({placeholders}) "  # nosec B608
             f"ON CONFLICT(market_id) DO UPDATE SET {updates}"
         )
         await self._execute_with_retry(sql, tuple(row.values()))
@@ -258,7 +259,7 @@ class Dao:
                 updates_parts.append(f"{col}=excluded.{col}")
         updates = ", ".join(updates_parts)
         sql = (
-            f"INSERT INTO kalshi_contracts ({columns}) VALUES ({placeholders}) "
+            f"INSERT INTO kalshi_contracts ({columns}) VALUES ({placeholders}) "  # nosec B608
             f"ON CONFLICT(ticker) DO UPDATE SET {updates}"
         )
         await self._execute_with_retry(sql, tuple(row.values()))
@@ -309,7 +310,7 @@ class Dao:
         await self._insert_row("kalshi_edge_snapshots", row)
 
     async def insert_kalshi_edge_snapshots(
-        self, rows: list[Mapping[str, Any]]
+        self, rows: Sequence[Mapping[str, Any]]
     ) -> None:
         if not rows:
             return
@@ -333,7 +334,7 @@ class Dao:
         await self._execute_with_retry(sql, tuple(row.values()))
 
     async def insert_kalshi_edge_snapshot_scores(
-        self, rows: list[Mapping[str, Any]]
+        self, rows: Sequence[Mapping[str, Any]]
     ) -> None:
         if not rows:
             return
@@ -451,7 +452,7 @@ class Dao:
         await self._insert_row("opportunities", row)
 
     async def insert_opportunities(
-        self, rows: list[Mapping[str, Any]]
+        self, rows: Sequence[Mapping[str, Any]]
     ) -> None:
         if not rows:
             return

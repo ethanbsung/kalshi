@@ -278,7 +278,10 @@ class KalshiWsClient:
         on_delta: DeltaHandler,
         end_time: float | None,
     ) -> None:
-        async for message in self._message_source:
+        source = self._message_source
+        if source is None:
+            return
+        async for message in source:
             if end_time is not None and time.monotonic() >= end_time:
                 return
             if not isinstance(message, dict):
@@ -384,7 +387,8 @@ class KalshiWsClient:
         snapshot = parse_orderbook_snapshot(message, received_ts)
         if snapshot is not None:
             self.parsed_snapshot_count += 1
-            msg = message.get("msg") if isinstance(message.get("msg"), dict) else {}
+            msg_obj = message.get("msg")
+            msg: dict[str, Any] = msg_obj if isinstance(msg_obj, dict) else {}
             yes_levels = _normalize_levels(msg.get("yes"))
             no_levels = _normalize_levels(msg.get("no"))
             if not yes_levels and not no_levels:

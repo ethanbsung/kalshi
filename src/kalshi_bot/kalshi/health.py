@@ -21,6 +21,21 @@ def _parse_float(value: Any) -> float | None:
         return None
 
 
+def _row_first_int(row: Any) -> int:
+    if row is None:
+        return 0
+    try:
+        value = row[0]
+    except (TypeError, IndexError, KeyError):
+        return 0
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _market_filters(
     status: str | None, series: list[str] | None, alias: str
 ) -> tuple[str, list[Any]]:
@@ -49,7 +64,7 @@ async def get_quote_freshness(
 ) -> dict[str, Any]:
     where_sql, params = _market_filters(status, series, alias="m")
     sql = (
-        "SELECT MAX(q.ts) FROM kalshi_quotes q "
+        "SELECT MAX(q.ts) FROM kalshi_quotes q "  # nosec B608
         "JOIN kalshi_markets m ON q.market_id = m.market_id"
         f"{where_sql}"
     )
@@ -76,10 +91,10 @@ async def get_quote_coverage(
 ) -> dict[str, Any]:
     where_sql, params = _market_filters(status, series, alias="m")
     cursor = await conn.execute(
-        "SELECT COUNT(*) FROM kalshi_markets m" + where_sql,
+        "SELECT COUNT(*) FROM kalshi_markets m" + where_sql,  # nosec B608
         params,
     )
-    total_markets = int((await cursor.fetchone())[0])
+    total_markets = _row_first_int(await cursor.fetchone())
 
     lookback_ts = int(time.time()) - lookback_seconds
     quote_where = "WHERE q.ts >= ?"
@@ -87,13 +102,13 @@ async def get_quote_coverage(
         quote_where += " AND " + where_sql.replace(" WHERE ", "")
     params_with_ts = [lookback_ts, *params]
     cursor = await conn.execute(
-        "SELECT COUNT(DISTINCT q.market_id) "
+        "SELECT COUNT(DISTINCT q.market_id) "  # nosec B608
         "FROM kalshi_quotes q JOIN kalshi_markets m "
         "ON q.market_id = m.market_id "
         f"{quote_where}",
         params_with_ts,
     )
-    markets_with_quotes = int((await cursor.fetchone())[0])
+    markets_with_quotes = _row_first_int(await cursor.fetchone())
     coverage_pct = (
         (markets_with_quotes / total_markets * 100.0) if total_markets else 0.0
     )
@@ -205,7 +220,7 @@ async def get_relevant_universe(
     cursor = await conn.execute(
         f"SELECT COUNT(*) {base_from}{where_sql}", where_params
     )
-    candidate_count_total = int((await cursor.fetchone())[0])
+    candidate_count_total = _row_first_int(await cursor.fetchone())
 
     where_sql, where_params = _where(
         [allowed_clause, f"NOT {bounds_clause}"]
@@ -213,7 +228,7 @@ async def get_relevant_universe(
     cursor = await conn.execute(
         f"SELECT COUNT(*) {base_from}{where_sql}", where_params
     )
-    excluded_missing_bounds = int((await cursor.fetchone())[0])
+    excluded_missing_bounds = _row_first_int(await cursor.fetchone())
 
     where_sql, where_params = _where(
         [
@@ -225,7 +240,7 @@ async def get_relevant_universe(
     cursor = await conn.execute(
         f"SELECT COUNT(*) {base_from}{where_sql}", where_params
     )
-    excluded_missing_close_ts = int((await cursor.fetchone())[0])
+    excluded_missing_close_ts = _row_first_int(await cursor.fetchone())
 
     cutoff_min = now_ts - 5
     cutoff_max = now_ts + max_horizon_seconds + grace_seconds
@@ -242,7 +257,7 @@ async def get_relevant_universe(
         f"SELECT COUNT(*) {base_from}{where_sql}",
         [*where_params, cutoff_min],
     )
-    excluded_expired = int((await cursor.fetchone())[0])
+    excluded_expired = _row_first_int(await cursor.fetchone())
 
     where_sql, where_params = _where(
         [
@@ -256,7 +271,7 @@ async def get_relevant_universe(
         f"SELECT COUNT(*) {base_from}{where_sql}",
         [*where_params, cutoff_max],
     )
-    excluded_horizon = int((await cursor.fetchone())[0])
+    excluded_horizon = _row_first_int(await cursor.fetchone())
 
     where_sql, where_params = _where(
         [
@@ -313,10 +328,9 @@ async def get_relevant_universe(
         candidate_ids = [item["ticker"] for item in candidates]
         placeholders = ",".join("?" for _ in candidate_ids)
         threshold = now_ts - freshness_seconds
-        quote_rows = []
+        quote_rows: list[tuple[Any, ...]] = []
         if candidate_ids:
-            cursor = await conn.execute(
-                f"""
+            quote_sql = f"""  # nosec B608
                 WITH latest AS (
                     SELECT market_id, MAX(ts) AS max_ts
                     FROM kalshi_quotes
@@ -326,10 +340,12 @@ async def get_relevant_universe(
                 SELECT q.market_id, q.ts, q.yes_bid, q.yes_ask, q.no_bid, q.no_ask
                 FROM kalshi_quotes q
                 JOIN latest l ON q.market_id = l.market_id AND q.ts = l.max_ts
-                """,
+                """
+            cursor = await conn.execute(
+                quote_sql,
                 [threshold, *candidate_ids],
             )
-            quote_rows = await cursor.fetchall()
+            quote_rows = [tuple(row) for row in await cursor.fetchall()]
 
         quote_map: dict[str, dict[str, Any]] = {}
         for market_id, ts, yes_bid, yes_ask, no_bid, no_ask in quote_rows:
@@ -434,7 +450,7 @@ async def get_relevant_quote_coverage(
         }
     placeholders = ",".join("?" for _ in market_ids)
     cursor = await conn.execute(
-        f"SELECT market_id, MAX(ts) FROM kalshi_quotes WHERE market_id IN ({placeholders}) GROUP BY market_id",
+        f"SELECT market_id, MAX(ts) FROM kalshi_quotes WHERE market_id IN ({placeholders}) GROUP BY market_id",  # nosec B608
         market_ids,
     )
     rows = await cursor.fetchall()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from typing import Any
 
 
 def taker_fee_dollars(price_cents: float | None, contracts: int) -> float | None:

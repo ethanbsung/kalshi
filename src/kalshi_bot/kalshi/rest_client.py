@@ -32,12 +32,20 @@ class KalshiRestClient:
         logger: logging.Logger,
         timeout: float = 10.0,
     ) -> None:
-        self._base_url = base_url.rstrip("/")
+        self._base_url = self._validate_base_url(base_url)
         self._api_key_id = api_key_id
         self._private_key_path = private_key_path
         self._logger = logger
         self._timeout = timeout
         self._signer: KalshiSigner | None = None
+
+    @staticmethod
+    def _validate_base_url(base_url: str) -> str:
+        normalized = base_url.rstrip("/")
+        parsed = parse.urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("KALSHI_REST_URL must be an http(s) URL")
+        return normalized
 
     @staticmethod
     def _normalize_markets_status(status: str | None) -> str | None:
@@ -68,7 +76,7 @@ class KalshiRestClient:
         headers, _, _ = self._ensure_signer().build_headers(method, path)
         req = request.Request(url, headers=headers, method=method)
         try:
-            with request.urlopen(req, timeout=self._timeout) as resp:
+            with request.urlopen(req, timeout=self._timeout) as resp:  # nosec B310
                 payload = resp.read().decode("utf-8")
         except error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -132,7 +140,7 @@ class KalshiRestClient:
                         },
                     )
                 else:
-                    jitter = random.uniform(0.0, backoff * 0.25)
+                    jitter = random.uniform(0.0, backoff * 0.25)  # nosec B311
                     delay = backoff + jitter
                     self._logger.warning(
                         "kalshi_rest_retry",

@@ -10,7 +10,8 @@ Scope: Redesign runtime and data architecture for continuous live operation whil
 As of 2026-02-13:
 
 - Phase A status: `validated_complete`
-- Phase B status: `in_progress`
+- Phase B status: `validated_complete`
+- Phase C status: `in_progress`
 - Completed in code:
   - Versioned event contracts and idempotency key helpers in `src/kalshi_bot/events/`.
   - JetStream helpers and stream provisioning scripts:
@@ -44,6 +45,11 @@ As of 2026-02-13:
     - `stream_kalshi_quotes_ws.py` supports `--publish-only`
     - `run_live_stack.py` supports component disable flags for ingest-only soaks
     - `docs/PHASE_B_VALIDATION.md`
+  - Phase C state/edge cutover foundations:
+    - in-memory market state model: `src/kalshi_bot/state/live_market_state.py`
+    - bus-driven edge compute path: `src/kalshi_bot/strategy/edge_state_engine.py`
+    - `run_live_edges.py` supports `--state-source events` with JetStream consumer state feed
+    - `run_live_stack.py` supports `--edge-state-source events` and `--disable-health`
 - Phase A validation completed:
   - JetStream stream provisioning validated against local NATS (`MARKET_EVENTS`, `STRATEGY_EVENTS`, `EXECUTION_EVENTS`, `DEAD_LETTER`).
   - Persistence consumer validated against local Postgres with no parse/persist errors.

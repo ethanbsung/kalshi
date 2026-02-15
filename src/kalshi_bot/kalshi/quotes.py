@@ -324,6 +324,10 @@ class KalshiQuotePoller:
                 error_counts[error_bucket] += 1
                 add_failed_sample(failed_samples, failed_set, ticker)
                 continue
+            if market is None:
+                error_counts["invalid_payload"] += 1
+                add_failed_sample(failed_samples, failed_set, ticker)
+                continue
             try:
                 row = build_quote_row(market, ts_now)
             except ValueError as exc:

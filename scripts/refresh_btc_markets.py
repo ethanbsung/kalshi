@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import fcntl
 import json
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,11 @@ import sqlite3
 from kalshi_bot.config import load_settings
 from kalshi_bot.data.dao import Dao
 from kalshi_bot.data.db import init_db
-from kalshi_bot.events import EventPublisher, MarketLifecycleEvent
+from kalshi_bot.events import (
+    EventPublisher,
+    MarketLifecycleEvent,
+    MarketLifecyclePayload,
+)
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi.btc_markets import (
     BTC_SERIES_TICKERS,
@@ -33,7 +38,7 @@ from kalshi_bot.kalshi.market_filters import normalize_db_status
 
 RETRY_DELAYS_SECONDS = [5.0, 10.0, 20.0, 30.0]
 DB_LOCK_RETRY_DELAYS_SECONDS = [5.0, 10.0, 20.0, 30.0]
-LOCK_PATH = Path("/tmp/kalshi_refresh_btc_markets.lock")
+LOCK_PATH = Path(tempfile.gettempdir()) / "kalshi_refresh_btc_markets.lock"
 
 
 def _parse_args() -> argparse.Namespace:
@@ -82,13 +87,14 @@ async def _load_existing_market_rows(
     for idx in range(0, len(market_ids), chunk_size):
         chunk = market_ids[idx : idx + chunk_size]
         placeholders = ", ".join("?" for _ in chunk)
-        cursor = await conn.execute(
-            f"""
+        sql = f"""  # nosec B608
             SELECT market_id, title, strike, settlement_ts, close_ts,
                    expected_expiration_ts, expiration_ts, status
             FROM kalshi_markets
             WHERE market_id IN ({placeholders})
-            """,
+            """
+        cursor = await conn.execute(
+            sql,
             chunk,
         )
         for (
@@ -144,12 +150,12 @@ async def _demote_missing_active_markets(
 
     series_where, series_params = _series_market_clause(series_tickers)
     cursor = await conn.execute(
-        "SELECT market_id, close_ts, expected_expiration_ts, settlement_ts "
+        "SELECT market_id, close_ts, expected_expiration_ts, settlement_ts "  # nosec B608
         "FROM kalshi_markets "
         f"WHERE status = 'active' AND ({series_where})",
         series_params,
     )
-    rows = await cursor.fetchall()
+    rows = list(await cursor.fetchall())
 
     updates: list[tuple[str, int, str]] = []
     demoted_expired = 0
@@ -301,7 +307,10 @@ async def _refresh_btc_markets(args: argparse.Namespace) -> int:
             await asyncio.sleep(delay)
 
     sample_tickers = [
-        market.get("ticker") for market in markets if market.get("ticker")
+        ticker
+        for market in markets
+        for ticker in [market.get("ticker")]
+        if isinstance(ticker, str) and ticker
     ][:10]
 
     print(
@@ -339,20 +348,18 @@ async def _refresh_btc_markets(args: argparse.Namespace) -> int:
                         await event_sink.publish(
                             MarketLifecycleEvent(
                                 source="refresh_btc_markets",
-                                payload={
-                                    "market_id": market_id,
-                                    "status": status,
-                                    "close_ts": close_ts,
-                                    "expected_expiration_ts": (
-                                        extract_expected_expiration_ts(
-                                            market, logger=logger
-                                        )
-                                    ),
-                                    "expiration_ts": extract_expiration_ts(
+                                payload=MarketLifecyclePayload(
+                                    market_id=market_id,
+                                    status=status,
+                                    close_ts=close_ts,
+                                    expected_expiration_ts=extract_expected_expiration_ts(
                                         market, logger=logger
                                     ),
-                                    "settlement_ts": close_ts,
-                                },
+                                    expiration_ts=extract_expiration_ts(
+                                        market, logger=logger
+                                    ),
+                                    settlement_ts=close_ts,
+                                ),
                             )
                         )
                     except Exception:
@@ -392,11 +399,11 @@ async def _refresh_btc_markets(args: argparse.Namespace) -> int:
             unchanged = 0
             changed_rows: list[dict[str, Any]] = []
             market_ids = [
-                market.get("ticker") or market.get("market_id")
+                market_id
                 for market in markets
                 if isinstance(market, dict)
-                and isinstance((market.get("ticker") or market.get("market_id")), str)
-                and (market.get("ticker") or market.get("market_id"))
+                for market_id in [market.get("ticker") or market.get("market_id")]
+                if isinstance(market_id, str) and market_id
             ]
             existing_rows = await _load_existing_market_rows(conn, market_ids)
 
@@ -507,16 +514,16 @@ async def _refresh_btc_markets(args: argparse.Namespace) -> int:
                     await event_sink.publish(
                         MarketLifecycleEvent(
                             source="refresh_btc_markets",
-                            payload={
-                                "market_id": market_id,
-                                "status": status,
-                                "close_ts": row.get("close_ts"),
-                                "expected_expiration_ts": row.get(
+                            payload=MarketLifecyclePayload(
+                                market_id=market_id,
+                                status=status,
+                                close_ts=row.get("close_ts"),
+                                expected_expiration_ts=row.get(
                                     "expected_expiration_ts"
                                 ),
-                                "expiration_ts": row.get("expiration_ts"),
-                                "settlement_ts": row.get("settlement_ts"),
-                            },
+                                expiration_ts=row.get("expiration_ts"),
+                                settlement_ts=row.get("settlement_ts"),
+                            ),
                         )
                     )
                 except Exception:
@@ -535,16 +542,16 @@ async def _refresh_btc_markets(args: argparse.Namespace) -> int:
                     await event_sink.publish(
                         MarketLifecycleEvent(
                             source="refresh_btc_markets",
-                            payload={
-                                "market_id": market_id,
-                                "status": status,
-                                "close_ts": demoted.get("close_ts"),
-                                "expected_expiration_ts": demoted.get(
+                            payload=MarketLifecyclePayload(
+                                market_id=market_id,
+                                status=status,
+                                close_ts=demoted.get("close_ts"),
+                                expected_expiration_ts=demoted.get(
                                     "expected_expiration_ts"
                                 ),
-                                "expiration_ts": None,
-                                "settlement_ts": demoted.get("settlement_ts"),
-                            },
+                                expiration_ts=None,
+                                settlement_ts=demoted.get("settlement_ts"),
+                            ),
                         )
                     )
                 except Exception:

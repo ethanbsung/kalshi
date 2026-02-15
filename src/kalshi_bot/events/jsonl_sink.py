@@ -41,7 +41,9 @@ class JsonlEventSink:
             await asyncio.to_thread(self._append_line_sync, line)
 
     def _append_line_sync(self, line: str) -> None:
-        assert self._path is not None
-        with self._path.open("a", encoding="utf-8") as handle:
+        path = self._path
+        if path is None:
+            raise RuntimeError("JSONL sink path is not configured")
+        with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
             handle.write("\n")

@@ -12,7 +12,7 @@ import aiosqlite
 
 from kalshi_bot.config import Settings, load_settings
 from kalshi_bot.data import Dao, init_db
-from kalshi_bot.events import EventPublisher, SpotTickEvent
+from kalshi_bot.events import EventPublisher, SpotTickEvent, SpotTickPayload
 from kalshi_bot.feeds.coinbase_ws import CoinbaseWsClient
 from kalshi_bot.kalshi import KalshiRestClient, KalshiWsClient
 from kalshi_bot.infra import setup_logger
@@ -104,7 +104,8 @@ async def _run_coinbase(
                 await event_sink.publish(
                     SpotTickEvent(
                         source="collector.coinbase",
-                        payload={
+                        payload=SpotTickPayload.model_validate(
+                            {
                             "ts": int(row["ts"]),
                             "product_id": str(row["product_id"]),
                             "price": float(row["price"]),
@@ -133,7 +134,8 @@ async def _run_coinbase(
                                 if row["sequence_num"] is not None
                                 else None
                             ),
-                        },
+                            }
+                        ),
                     )
                 )
             except Exception:
@@ -205,7 +207,8 @@ async def _run_coinbase(
             return False
 
         async def handle_row(row: dict[str, Any]) -> None:
-            nonlocal rows_since_commit, total_rows, lock_insert_retries, dropped_rows_lock, last_lock_log_ts
+            nonlocal rows_since_commit, total_rows, event_publish_failures
+            nonlocal lock_insert_retries, dropped_rows_lock, last_lock_log_ts
             inserted = False
             backoffs = (0.05, 0.1, 0.2, 0.5, 1.0)
             for attempt in range(len(backoffs) + 1):
@@ -243,36 +246,38 @@ async def _run_coinbase(
                     await event_sink.publish(
                         SpotTickEvent(
                             source="collector.coinbase",
-                            payload={
-                                "ts": int(row["ts"]),
-                                "product_id": str(row["product_id"]),
-                                "price": float(row["price"]),
-                                "best_bid": (
-                                    float(row["best_bid"])
-                                    if row["best_bid"] is not None
-                                    else None
-                                ),
-                                "best_ask": (
-                                    float(row["best_ask"])
-                                    if row["best_ask"] is not None
-                                    else None
-                                ),
-                                "bid_qty": (
-                                    float(row["bid_qty"])
-                                    if row["bid_qty"] is not None
-                                    else None
-                                ),
-                                "ask_qty": (
-                                    float(row["ask_qty"])
-                                    if row["ask_qty"] is not None
-                                    else None
-                                ),
-                                "sequence_num": (
-                                    int(row["sequence_num"])
-                                    if row["sequence_num"] is not None
-                                    else None
-                                ),
-                            },
+                            payload=SpotTickPayload.model_validate(
+                                {
+                                    "ts": int(row["ts"]),
+                                    "product_id": str(row["product_id"]),
+                                    "price": float(row["price"]),
+                                    "best_bid": (
+                                        float(row["best_bid"])
+                                        if row["best_bid"] is not None
+                                        else None
+                                    ),
+                                    "best_ask": (
+                                        float(row["best_ask"])
+                                        if row["best_ask"] is not None
+                                        else None
+                                    ),
+                                    "bid_qty": (
+                                        float(row["bid_qty"])
+                                        if row["bid_qty"] is not None
+                                        else None
+                                    ),
+                                    "ask_qty": (
+                                        float(row["ask_qty"])
+                                        if row["ask_qty"] is not None
+                                        else None
+                                    ),
+                                    "sequence_num": (
+                                        int(row["sequence_num"])
+                                        if row["sequence_num"] is not None
+                                        else None
+                                    ),
+                                }
+                            ),
                         )
                     )
                 except Exception:
@@ -373,9 +378,10 @@ async def _run_kalshi(
         )
         if not market_tickers:
             market_tickers = [
-                market.get("ticker")
+                ticker
                 for market in markets
-                if isinstance(market, dict) and market.get("ticker")
+                for ticker in [market.get("ticker") if isinstance(market, dict) else None]
+                if isinstance(ticker, str) and ticker
             ]
 
     if not market_tickers:

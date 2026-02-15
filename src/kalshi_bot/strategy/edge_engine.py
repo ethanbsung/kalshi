@@ -354,9 +354,12 @@ async def _load_contracts(
     if not market_ids:
         return {}
     placeholders = ",".join("?" for _ in market_ids)
-    cursor = await conn.execute(
+    sql = (
         f"SELECT ticker, lower, upper, strike_type, settlement_ts, close_ts, expected_expiration_ts, expiration_ts "
-        f"FROM kalshi_contracts WHERE ticker IN ({placeholders})",
+        f"FROM kalshi_contracts WHERE ticker IN ({placeholders})"
+    )
+    cursor = await conn.execute(
+        sql,
         market_ids,
     )
     rows = await cursor.fetchall()
@@ -394,8 +397,7 @@ async def _load_latest_quotes(
         return {}
     placeholders = ",".join("?" for _ in market_ids)
     threshold = now_ts - freshness_seconds
-    cursor = await conn.execute(
-        f"""
+    sql = f"""  # nosec B608
         WITH latest AS (
             SELECT market_id, MAX(ts) AS max_ts
             FROM kalshi_quotes
@@ -405,7 +407,9 @@ async def _load_latest_quotes(
         SELECT q.market_id, q.ts, q.yes_bid, q.yes_ask, q.no_bid, q.no_ask
         FROM kalshi_quotes q
         JOIN latest l ON q.market_id = l.market_id AND q.ts = l.max_ts
-        """,
+        """
+    cursor = await conn.execute(
+        sql,
         [threshold, *market_ids],
     )
     rows = await cursor.fetchall()
@@ -429,7 +433,7 @@ async def _latest_quote_ts(
         return None
     placeholders = ",".join("?" for _ in market_ids)
     cursor = await conn.execute(
-        f"SELECT MAX(ts) FROM kalshi_quotes WHERE market_id IN ({placeholders})",
+        f"SELECT MAX(ts) FROM kalshi_quotes WHERE market_id IN ({placeholders})",  # nosec B608
         market_ids,
     )
     row = await cursor.fetchone()
@@ -445,7 +449,7 @@ async def _count_recent_quote_markets(
         return 0
     placeholders = ",".join("?" for _ in market_ids)
     cursor = await conn.execute(
-        f"SELECT COUNT(DISTINCT market_id) FROM kalshi_quotes "
+        f"SELECT COUNT(DISTINCT market_id) FROM kalshi_quotes "  # nosec B608
         f"WHERE ts >= ? AND market_id IN ({placeholders})",
         [threshold, *market_ids],
     )
@@ -460,7 +464,7 @@ async def _load_market_titles(
         return {}
     placeholders = ",".join("?" for _ in market_ids)
     cursor = await conn.execute(
-        f"SELECT market_id, title FROM kalshi_markets WHERE market_id IN ({placeholders})",
+        f"SELECT market_id, title FROM kalshi_markets WHERE market_id IN ({placeholders})",  # nosec B608
         market_ids,
     )
     rows = await cursor.fetchall()
@@ -850,26 +854,26 @@ async def compute_edges(
         max_ask_cents=max_ask_cents,
     )
     if not relevant_ids:
-        skip_reasons: dict[str, int] = {}
+        no_relevant_skip_reasons: dict[str, int] = {}
         if selection:
             expired = selection.get("excluded_expired")
             if expired:
-                skip_reasons["expired_contract"] = int(expired)
+                no_relevant_skip_reasons["expired_contract"] = int(expired)
             horizon = selection.get("excluded_horizon_out_of_range")
             if horizon:
-                skip_reasons["horizon_out_of_range"] = int(horizon)
+                no_relevant_skip_reasons["horizon_out_of_range"] = int(horizon)
             missing_bounds = selection.get("excluded_missing_bounds")
             if missing_bounds:
-                skip_reasons["missing_bounds"] = int(missing_bounds)
+                no_relevant_skip_reasons["missing_bounds"] = int(missing_bounds)
             missing_close = selection.get("excluded_missing_close_ts")
             if missing_close:
-                skip_reasons["missing_settlement_ts"] = int(missing_close)
+                no_relevant_skip_reasons["missing_settlement_ts"] = int(missing_close)
             missing_quote = selection.get("excluded_missing_recent_quote")
             if missing_quote:
-                skip_reasons["missing_quote"] = int(missing_quote)
+                no_relevant_skip_reasons["missing_quote"] = int(missing_quote)
             untradable = selection.get("excluded_untradable")
             if untradable:
-                skip_reasons["missing_both_sides"] = int(untradable)
+                no_relevant_skip_reasons["missing_both_sides"] = int(untradable)
         # Ensure we do not leave a pending transaction from sigma persistence
         # when returning early on an empty universe.
         try:
@@ -884,7 +888,7 @@ async def compute_edges(
             "edges_inserted": 0,
             "relevant_total": 0,
             "selection": selection,
-            "skip_reasons": skip_reasons,
+            "skip_reasons": no_relevant_skip_reasons,
         }
 
     contract_map = await _load_contracts(conn, relevant_ids)
@@ -1073,7 +1077,7 @@ async def compute_edges(
             return value in (0.0, 100.0)
 
         def _tradable_ask(value: float | None) -> bool:
-            if not _valid_ask(value):
+            if value is None or not _valid_ask(value):
                 return False
             if _is_boundary(value):
                 return True
@@ -1084,11 +1088,12 @@ async def compute_edges(
         yes_missing = not yes_tradable
         no_missing = not no_tradable
 
-        crossed_market = (
-            _valid_ask(yes_ask)
-            and _valid_ask(no_ask)
-            and (yes_ask + no_ask) < 100.0
-        )
+        crossed_market = False
+        if _valid_ask(yes_ask) and _valid_ask(no_ask):
+            yes_ask_val = yes_ask
+            no_ask_val = no_ask
+            if yes_ask_val is not None and no_ask_val is not None:
+                crossed_market = (yes_ask_val + no_ask_val) < 100.0
         if crossed_market:
             skip_reasons["crossed_market"] = skip_reasons.get(
                 "crossed_market", 0

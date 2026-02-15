@@ -12,6 +12,8 @@ EVENT_SCHEMA_VERSIONS: dict[str, int] = {
     "contract_update": 1,
     "edge_snapshot": 1,
     "opportunity_decision": 1,
+    "execution_order": 1,
+    "execution_fill": 1,
 }
 
 EVENT_SUBJECTS: dict[str, str] = {
@@ -21,6 +23,8 @@ EVENT_SUBJECTS: dict[str, str] = {
     "contract_update": "market.contract_updates",
     "edge_snapshot": "strategy.edge_snapshots",
     "opportunity_decision": "strategy.opportunity_decisions",
+    "execution_order": "execution.orders",
+    "execution_fill": "execution.fills",
 }
 
 DLQ_SUBJECT_PREFIX = "dlq"
@@ -128,6 +132,19 @@ def _parts_for_idempotency(event_type: str, payload: dict[str, Any]) -> list[str
         ]
         if parts[0] is not None and parts[1] is not None and parts[2] is not None:
             return [part for part in parts if part is not None]
+        return [_stable_json(payload)]
+    if event_type == "execution_order":
+        parts = [
+            _coerce_part(payload.get("order_id")),
+            _coerce_part(payload.get("status")),
+        ]
+        if parts[0] is not None and parts[1] is not None:
+            return [part for part in parts if part is not None]
+        return [_stable_json(payload)]
+    if event_type == "execution_fill":
+        parts = [_coerce_part(payload.get("fill_id"))]
+        if parts[0] is not None:
+            return [parts[0]]
         return [_stable_json(payload)]
     return [_stable_json(payload)]
 

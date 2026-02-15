@@ -41,6 +41,14 @@ def _spread(
     return ask - bid
 
 
+def _mid(
+    bid: float | None, ask: float | None
+) -> float | None:
+    if bid is None or ask is None:
+        return None
+    return (bid + ask) / 2.0
+
+
 def _safe_int(value: Any) -> int | None:
     try:
         if value is None:
@@ -73,12 +81,12 @@ def _snapshot_meta(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def _add_reason(
-    reasons: list[str], counters: dict[str, int], reason: str
+    reasons: list[str], counters: dict[str, int | float], reason: str
 ) -> None:
     if reason in reasons:
         return
     reasons.append(reason)
-    counters[reason] = counters.get(reason, 0) + 1
+    counters[reason] = int(counters.get(reason, 0)) + 1
 
 
 def build_opportunities_from_snapshots(
@@ -86,7 +94,7 @@ def build_opportunities_from_snapshots(
     config: OpportunityConfig,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    counters = {
+    counters: dict[str, int | float] = {
         "snapshots_total": len(snapshots),
         "takes": 0,
         "passes": 0,
@@ -190,13 +198,29 @@ def build_opportunities_from_snapshots(
             strike = snap.get("strike")
             settlement_ts = snap.get("settlement_ts")
             tau_minutes = None
-            if snap.get("horizon_seconds") is not None:
-                tau_minutes = snap.get("horizon_seconds") / 60.0
+            horizon_seconds = _safe_float(snap.get("horizon_seconds"))
+            if horizon_seconds is not None:
+                tau_minutes = horizon_seconds / 60.0
             p_market = None
-            if snap.get("yes_mid") is not None:
-                p_market = snap.get("yes_mid") / 100.0
-            elif snap.get("no_mid") is not None:
-                p_market = 1.0 - (snap.get("no_mid") / 100.0)
+            yes_mid = _safe_float(snap.get("yes_mid"))
+            no_mid = _safe_float(snap.get("no_mid"))
+            if yes_mid is not None:
+                p_market = yes_mid / 100.0
+            elif no_mid is not None:
+                p_market = 1.0 - (no_mid / 100.0)
+            else:
+                yes_mid_fallback = _mid(
+                    _safe_float(snap.get("yes_bid")),
+                    _safe_float(snap.get("yes_ask")),
+                )
+                no_mid_fallback = _mid(
+                    _safe_float(snap.get("no_bid")),
+                    _safe_float(snap.get("no_ask")),
+                )
+                if yes_mid_fallback is not None:
+                    p_market = yes_mid_fallback / 100.0
+                elif no_mid_fallback is not None:
+                    p_market = 1.0 - (no_mid_fallback / 100.0)
             spread = None
             if side == "YES":
                 spread = _spread(snap.get("yes_bid"), snap.get("yes_ask"))

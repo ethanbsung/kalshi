@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import logging
 import sqlite3
+import time
 from typing import Any
 
 import aiosqlite
@@ -12,11 +12,22 @@ import aiosqlite
 from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.data.dao import Dao
-from kalshi_bot.events import EdgeSnapshotEvent, EventPublisher
+from kalshi_bot.events import (
+    EdgeSnapshotEvent,
+    EdgeSnapshotPayload,
+    EventPublisher,
+    connect_jetstream,
+    parse_event_dict,
+)
 from kalshi_bot.infra.logging import setup_logger
 from kalshi_bot.kalshi.btc_markets import BTC_SERIES_TICKERS
 from kalshi_bot.kalshi.market_filters import normalize_db_status, normalize_series
 from kalshi_bot.strategy.edge_engine import compute_edges
+from kalshi_bot.strategy.edge_state_engine import (
+    SigmaMemory,
+    compute_edges_from_live_state,
+)
+from kalshi_bot.state import LiveMarketState
 
 EDGE_SUMMARY_HEARTBEAT_SECONDS = 60
 NO_RELEVANT_HEARTBEAT_SECONDS = 15 * 60
@@ -64,6 +75,45 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="JetStream bus URL override (default BUS_URL).",
+    )
+    parser.add_argument(
+        "--state-source",
+        choices=["sqlite", "events"],
+        default="sqlite",
+        help="Use SQLite tables (legacy) or market events stream (Phase C).",
+    )
+    parser.add_argument(
+        "--events-stream",
+        type=str,
+        default="MARKET_EVENTS",
+        help="JetStream stream name for market events (events mode only).",
+    )
+    parser.add_argument(
+        "--events-subject",
+        type=str,
+        default="market.>",
+        help="JetStream subject filter for market events (events mode only).",
+    )
+    parser.add_argument(
+        "--events-consumer-durable",
+        type=str,
+        default=None,
+        help=(
+            "Optional durable consumer name for market-event feed. "
+            "Unset by default so startup replays stream state."
+        ),
+    )
+    parser.add_argument(
+        "--events-fetch-batch",
+        type=int,
+        default=500,
+        help="Max messages fetched per pull in events mode.",
+    )
+    parser.add_argument(
+        "--events-fetch-timeout-seconds",
+        type=float,
+        default=0.25,
+        help="Pull timeout for each market-event fetch in events mode.",
     )
     parser.add_argument(
         "--show-titles",
@@ -126,8 +176,7 @@ async def _load_latest_quotes(
     if not market_ids:
         return {}
     placeholders = ",".join("?" for _ in market_ids)
-    cursor = await conn.execute(
-        f"""
+    sql = f"""  # nosec B608
         WITH latest AS (
             SELECT market_id, MAX(ts) AS max_ts
             FROM kalshi_quotes
@@ -138,7 +187,9 @@ async def _load_latest_quotes(
                q.yes_mid, q.no_mid
         FROM kalshi_quotes q
         JOIN latest l ON q.market_id = l.market_id AND q.ts = l.max_ts
-        """,
+        """
+    cursor = await conn.execute(
+        sql,
         [asof_ts, *market_ids],
     )
     rows = await cursor.fetchall()
@@ -181,6 +232,179 @@ def _parse_edge_metadata(raw_json: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return {}
+
+
+_MARKET_EVENT_TYPES = {
+    "spot_tick",
+    "quote_update",
+    "market_lifecycle",
+    "contract_update",
+}
+
+
+def _build_edge_event_payload(row: dict[str, Any]) -> dict[str, Any] | None:
+    if (
+        row.get("asof_ts") is None
+        or row.get("market_id") is None
+        or row.get("prob_yes") is None
+        or row.get("ev_take_yes") is None
+        or row.get("ev_take_no") is None
+        or row.get("sigma_annualized") is None
+        or row.get("spot_price") is None
+    ):
+        return None
+    return {
+        "asof_ts": int(row["asof_ts"]),
+        "market_id": str(row["market_id"]),
+        "prob_yes": float(row["prob_yes"]),
+        "ev_take_yes": float(row["ev_take_yes"]),
+        "ev_take_no": float(row["ev_take_no"]),
+        "sigma_annualized": float(row["sigma_annualized"]),
+        "spot_price": float(row["spot_price"]),
+        "quote_ts": int(row["quote_ts"]) if row.get("quote_ts") is not None else None,
+        "spot_ts": int(row["spot_ts"]) if row.get("spot_ts") is not None else None,
+        "settlement_ts": (
+            int(row["settlement_ts"]) if row.get("settlement_ts") is not None else None
+        ),
+        "horizon_seconds": (
+            int(row["horizon_seconds"]) if row.get("horizon_seconds") is not None else None
+        ),
+        "strike": str(row["strike"]) if row.get("strike") is not None else None,
+        "prob_yes_raw": (
+            float(row["prob_yes_raw"]) if row.get("prob_yes_raw") is not None else None
+        ),
+        "yes_bid": float(row["yes_bid"]) if row.get("yes_bid") is not None else None,
+        "yes_ask": float(row["yes_ask"]) if row.get("yes_ask") is not None else None,
+        "no_bid": float(row["no_bid"]) if row.get("no_bid") is not None else None,
+        "no_ask": float(row["no_ask"]) if row.get("no_ask") is not None else None,
+        "yes_mid": float(row["yes_mid"]) if row.get("yes_mid") is not None else None,
+        "no_mid": float(row["no_mid"]) if row.get("no_mid") is not None else None,
+        "spot_age_seconds": (
+            int(row["spot_age_seconds"])
+            if row.get("spot_age_seconds") is not None
+            else None
+        ),
+        "quote_age_seconds": (
+            int(row["quote_age_seconds"])
+            if row.get("quote_age_seconds") is not None
+            else None
+        ),
+        "raw_json": str(row["raw_json"]) if row.get("raw_json") is not None else None,
+    }
+
+
+async def _publish_edge_events(
+    *,
+    rows: list[dict[str, Any]],
+    event_sink: EventPublisher | None,
+) -> int:
+    if event_sink is None or not event_sink.enabled:
+        return 0
+    failures = 0
+    for row in rows:
+        payload = _build_edge_event_payload(row)
+        if payload is None:
+            continue
+        try:
+            await event_sink.publish(
+                EdgeSnapshotEvent(
+                    source="run_live_edges",
+                    payload=EdgeSnapshotPayload.model_validate(payload),
+                )
+            )
+        except Exception:
+            failures += 1
+    return failures
+
+
+async def _consume_market_events(
+    *,
+    subscription: Any,
+    state: LiveMarketState,
+    max_batch: int,
+    timeout_seconds: float,
+    max_rounds: int = 8,
+) -> tuple[int, int]:
+    applied = 0
+    parse_errors = 0
+    batch_size = max(max_batch, 1)
+    fetch_timeout = max(timeout_seconds, 0.01)
+    rounds = 0
+    while rounds < max(max_rounds, 1):
+        try:
+            msgs = await subscription.fetch(batch=batch_size, timeout=fetch_timeout)
+        except TimeoutError:
+            break
+        except Exception:
+            raise
+        rounds += 1
+
+        if not msgs:
+            break
+        for msg in msgs:
+            try:
+                raw = json.loads(msg.data.decode("utf-8"))
+                event = parse_event_dict(raw)
+                if event.event_type in _MARKET_EVENT_TYPES:
+                    state.apply_event(event)
+                    applied += 1
+            except Exception:
+                parse_errors += 1
+            finally:
+                try:
+                    await msg.ack()
+                except Exception as ack_exc:
+                    print(
+                        "market_event_ack_error type={type_name} err={err}".format(
+                            type_name=type(ack_exc).__name__,
+                            err=ack_exc,
+                        )
+                    )
+        if len(msgs) < batch_size:
+            break
+    return applied, parse_errors
+
+
+async def _subscribe_market_events(js: Any, args: argparse.Namespace) -> Any:
+    subscribe_kwargs: dict[str, Any] = {
+        "subject": args.events_subject,
+        "stream": args.events_stream,
+    }
+    durable = (
+        args.events_consumer_durable.strip()
+        if isinstance(args.events_consumer_durable, str)
+        else None
+    )
+    if durable:
+        subscribe_kwargs["durable"] = durable
+        print(f"events_consumer_durable={durable}")
+    else:
+        print("events_consumer_durable=ephemeral (startup replay enabled)")
+    return await js.pull_subscribe(**subscribe_kwargs)
+
+
+def _consume_market_events_from_queue(
+    *,
+    queue: asyncio.Queue[bytes],
+    state: LiveMarketState,
+    max_batch: int,
+) -> tuple[int, int]:
+    applied = 0
+    parse_errors = 0
+    for _ in range(max(max_batch, 1)):
+        try:
+            data = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        try:
+            raw = json.loads(data.decode("utf-8"))
+            event = parse_event_dict(raw)
+            if event.event_type in _MARKET_EVENT_TYPES:
+                state.apply_event(event)
+                applied += 1
+        except Exception:
+            parse_errors += 1
+    return applied, parse_errors
 
 
 async def run_tick(
@@ -229,8 +453,8 @@ async def run_tick(
             quotes = await _load_latest_quotes(conn, market_ids, asof_ts)
             dao = Dao(conn)
             snapshot_rows: list[dict[str, Any]] = []
-            max_spot_age = None
-            max_quote_age = None
+            max_spot_age: int | None = None
+            max_quote_age: int | None = None
             for edge in edges:
                 market_id = edge["market_id"]
                 quote = quotes.get(market_id, {})
@@ -321,46 +545,10 @@ async def run_tick(
                 )
             await dao.insert_kalshi_edge_snapshots(snapshot_rows)
             await conn.commit()
-            event_publish_failures = 0
-            if event_sink is not None and event_sink.enabled:
-                for row in snapshot_rows:
-                    if (
-                        row.get("prob_yes") is None
-                        or row.get("ev_take_yes") is None
-                        or row.get("ev_take_no") is None
-                        or row.get("sigma_annualized") is None
-                        or row.get("spot_price") is None
-                    ):
-                        continue
-                    try:
-                        await event_sink.publish(
-                            EdgeSnapshotEvent(
-                                source="run_live_edges",
-                                payload={
-                                    "asof_ts": int(row["asof_ts"]),
-                                    "market_id": str(row["market_id"]),
-                                    "prob_yes": float(row["prob_yes"]),
-                                    "ev_take_yes": float(row["ev_take_yes"]),
-                                    "ev_take_no": float(row["ev_take_no"]),
-                                    "sigma_annualized": float(
-                                        row["sigma_annualized"]
-                                    ),
-                                    "spot_price": float(row["spot_price"]),
-                                    "quote_ts": (
-                                        int(row["quote_ts"])
-                                        if row["quote_ts"] is not None
-                                        else None
-                                    ),
-                                    "spot_ts": (
-                                        int(row["spot_ts"])
-                                        if row["spot_ts"] is not None
-                                        else None
-                                    ),
-                                },
-                            )
-                        )
-                    except Exception:
-                        event_publish_failures += 1
+            event_publish_failures = await _publish_edge_events(
+                rows=snapshot_rows,
+                event_sink=event_sink,
+            )
 
             summary["snapshots_inserted"] = len(snapshot_rows)
             summary["snapshots_total"] = len(snapshot_rows)
@@ -416,6 +604,256 @@ def _print_debug(summary: dict[str, Any], show_titles: bool) -> None:
         print(f"selection_summary={selection_counts}")
 
 
+def _log_tick_summary(
+    *,
+    summary: dict[str, Any],
+    args: argparse.Namespace,
+    last_edge_log_ts: int | None,
+    last_no_relevant_log_ts: int | None,
+    last_no_relevant_signature: tuple[tuple[str, int], ...] | None,
+) -> tuple[int | None, int | None, tuple[tuple[str, int], ...] | None]:
+    if "error" in summary:
+        error = str(summary.get("error") or "unknown")
+        now_ts = int(
+            summary.get("now_ts")
+            or (summary.get("selection") or {}).get("now_ts")
+            or 0
+        )
+        if error == "no_relevant_markets":
+            skip_reasons = summary.get("skip_reasons") or {}
+            signature = tuple(sorted(skip_reasons.items()))
+            should_log = False
+            if last_no_relevant_log_ts is None:
+                should_log = True
+            elif signature != last_no_relevant_signature:
+                should_log = True
+            elif now_ts > 0 and (
+                now_ts - last_no_relevant_log_ts
+            ) >= NO_RELEVANT_HEARTBEAT_SECONDS:
+                should_log = True
+            if should_log:
+                print(f"ERROR: {error}")
+                selection = summary.get("selection", {})
+                if selection:
+                    print(f"selection_summary={selection}")
+                if skip_reasons:
+                    print(f"skip_reasons={skip_reasons}")
+                last_no_relevant_log_ts = now_ts if now_ts > 0 else 0
+                last_no_relevant_signature = signature
+        else:
+            print(f"ERROR: {error}")
+            selection = summary.get("selection", {})
+            if selection:
+                print(f"selection_summary={selection}")
+            if summary.get("skip_reasons"):
+                print(f"skip_reasons={summary['skip_reasons']}")
+        return (
+            last_edge_log_ts,
+            last_no_relevant_log_ts,
+            last_no_relevant_signature,
+        )
+
+    now_ts = int(summary.get("now_ts") or 0)
+    should_log_summary = (
+        last_edge_log_ts is None
+        or now_ts <= 0
+        or (now_ts - last_edge_log_ts) >= EDGE_SUMMARY_HEARTBEAT_SECONDS
+    )
+    if should_log_summary:
+        print(
+            "asof_ts={now_ts} edges_inserted={edges_inserted} "
+            "snapshots_inserted={snapshots_inserted} "
+            "max_spot_age_seconds={max_spot_age_seconds} "
+            "max_quote_age_seconds={max_quote_age_seconds} "
+            "event_publish_failures={event_publish_failures}".format(**summary)
+        )
+        if summary.get("consumer_lag_pending") is not None:
+            print(
+                "consumer_lag_pending={consumer_lag_pending} "
+                "events_applied_total={events_applied_total} "
+                "event_parse_errors_total={event_parse_errors_total}".format(
+                    **summary
+                )
+            )
+        if now_ts > 0:
+            last_edge_log_ts = now_ts
+    if args.debug:
+        _print_debug(summary, args.show_titles)
+    return (
+        last_edge_log_ts,
+        last_no_relevant_log_ts,
+        last_no_relevant_signature,
+    )
+
+
+async def _run_sqlite_mode(
+    *,
+    args: argparse.Namespace,
+    settings: Any,
+    event_sink: EventPublisher,
+) -> int:
+    print(f"DB path: {settings.db_path}")
+    await init_db(settings.db_path)
+    async with aiosqlite.connect(settings.db_path) as conn:
+        await conn.execute("PRAGMA foreign_keys = ON;")
+        await conn.execute("PRAGMA journal_mode = WAL;")
+        await conn.execute("PRAGMA synchronous = NORMAL;")
+        await conn.execute("PRAGMA busy_timeout = 15000;")
+        await conn.commit()
+
+        last_edge_log_ts: int | None = None
+        last_no_relevant_log_ts: int | None = None
+        last_no_relevant_signature: tuple[tuple[str, int], ...] | None = None
+        while True:
+            summary = await run_tick(conn, args, event_sink=event_sink)
+            if "error" in summary:
+                try:
+                    await conn.rollback()
+                except sqlite3.OperationalError:
+                    pass
+            (
+                last_edge_log_ts,
+                last_no_relevant_log_ts,
+                last_no_relevant_signature,
+            ) = _log_tick_summary(
+                summary=summary,
+                args=args,
+                last_edge_log_ts=last_edge_log_ts,
+                last_no_relevant_log_ts=last_no_relevant_log_ts,
+                last_no_relevant_signature=last_no_relevant_signature,
+            )
+            if args.once:
+                return 0
+            await asyncio.sleep(args.interval_seconds)
+
+
+async def _run_events_mode(
+    *,
+    args: argparse.Namespace,
+    event_sink: EventPublisher,
+    bus_url: str,
+) -> int:
+    print("state_source=events")
+    print(f"event_bus={bus_url}")
+    nc, js = await connect_jetstream(bus_url)
+    state = LiveMarketState(max_spot_points=args.max_spot_points)
+    sigma_memory = SigmaMemory()
+    subscription = await _subscribe_market_events(js, args)
+    print("events_consumer_mode=jetstream_pull")
+
+    total_applied = 0
+    total_parse_errors = 0
+    total_fetch_errors = 0
+    last_fetch_error_log_mono: float | None = None
+    last_edge_log_ts: int | None = None
+    last_no_relevant_log_ts: int | None = None
+    last_no_relevant_signature: tuple[tuple[str, int], ...] | None = None
+    compute_interval = max(int(args.interval_seconds), 1)
+    next_compute_at = time.monotonic()
+    try:
+        while True:
+            applied = 0
+            parse_errors = 0
+            try:
+                for _ in range(8):
+                    batch_applied, batch_parse_errors = await _consume_market_events(
+                        subscription=subscription,
+                        state=state,
+                        max_batch=args.events_fetch_batch,
+                        timeout_seconds=args.events_fetch_timeout_seconds,
+                    )
+                    applied += batch_applied
+                    parse_errors += batch_parse_errors
+                    if batch_applied == 0 and batch_parse_errors == 0:
+                        break
+            except Exception as exc:
+                total_fetch_errors += 1
+                now_mono = time.monotonic()
+                if (
+                    last_fetch_error_log_mono is None
+                    or (now_mono - last_fetch_error_log_mono) >= 30.0
+                ):
+                    print(
+                        "market_event_fetch_error type={type_name} err={err}".format(
+                            type_name=type(exc).__name__,
+                            err=exc,
+                        )
+                    )
+                    last_fetch_error_log_mono = now_mono
+                await asyncio.sleep(0.2)
+            total_applied += applied
+            total_parse_errors += parse_errors
+            if time.monotonic() < next_compute_at and not args.once:
+                await asyncio.sleep(0.2)
+                continue
+
+            summary, snapshot_rows = compute_edges_from_live_state(
+                state=state,
+                sigma_memory=sigma_memory,
+                product_id=args.product_id,
+                lookback_seconds=args.lookback_seconds,
+                max_spot_points=args.max_spot_points,
+                ewma_lambda=args.ewma_lambda,
+                min_points=args.min_points,
+                min_sigma_lookback_seconds=args.min_sigma_lookback_seconds,
+                resample_seconds=args.sigma_resample_seconds,
+                sigma_default=args.sigma_default,
+                sigma_max=args.sigma_max,
+                status=args.status,
+                series=args.series,
+                pct_band=args.pct_band,
+                top_n=args.top_n,
+                freshness_seconds=args.freshness_seconds,
+                max_horizon_seconds=args.max_horizon_seconds,
+                contracts=args.contracts,
+                now_ts=getattr(args, "now_ts", None) or int(time.time()),
+                min_ask_cents=args.min_ask_cents,
+                max_ask_cents=args.max_ask_cents,
+            )
+
+            summary["event_publish_failures"] = await _publish_edge_events(
+                rows=snapshot_rows,
+                event_sink=event_sink,
+            )
+            summary["events_applied"] = applied
+            summary["events_applied_total"] = total_applied
+            summary["event_parse_errors_total"] = total_parse_errors
+            summary["market_event_fetch_errors_total"] = total_fetch_errors
+            pending = None
+            try:
+                consumer_info = await subscription.consumer_info()
+                pending = int(getattr(consumer_info, "num_pending", 0))
+            except Exception:
+                pending = None
+            summary["consumer_lag_pending"] = pending
+
+            (
+                last_edge_log_ts,
+                last_no_relevant_log_ts,
+                last_no_relevant_signature,
+            ) = _log_tick_summary(
+                summary=summary,
+                args=args,
+                last_edge_log_ts=last_edge_log_ts,
+                last_no_relevant_log_ts=last_no_relevant_log_ts,
+                last_no_relevant_signature=last_no_relevant_signature,
+            )
+            next_compute_at = time.monotonic() + compute_interval
+            if args.once:
+                return 0
+    finally:
+        try:
+            await subscription.unsubscribe()
+        except Exception as unsub_exc:
+            print(
+                "events_unsubscribe_error type={type_name} err={err}".format(
+                    type_name=type(unsub_exc).__name__,
+                    err=unsub_exc,
+                )
+            )
+        await nc.drain()
+
+
 async def _run() -> int:
     args = _parse_args()
     args.status = normalize_db_status(args.status)
@@ -425,97 +863,39 @@ async def _run() -> int:
         else list(BTC_SERIES_TICKERS)
     )
     settings = load_settings()
-    logger = setup_logger(settings.log_path)
-
-    print(f"DB path: {settings.db_path}")
-    await init_db(settings.db_path)
-
-    async with aiosqlite.connect(settings.db_path) as conn:
-        await conn.execute("PRAGMA foreign_keys = ON;")
-        await conn.execute("PRAGMA journal_mode = WAL;")
-        await conn.execute("PRAGMA synchronous = NORMAL;")
-        await conn.execute("PRAGMA busy_timeout = 15000;")
-        await conn.commit()
-        bus_url = (
-            args.events_bus_url
-            if args.events_bus_url
-            else (settings.bus_url if args.events_bus else None)
+    setup_logger(settings.log_path)
+    consumer_bus_url = (
+        args.events_bus_url
+        if args.events_bus_url
+        else (
+            settings.bus_url
+            if (args.events_bus or args.state_source == "events")
+            else None
         )
-        event_sink = await EventPublisher.create(
-            jsonl_path=args.events_jsonl_path,
-            bus_url=bus_url,
-        )
-
-        last_edge_log_ts: int | None = None
-        last_no_relevant_log_ts: int | None = None
-        last_no_relevant_signature: tuple[tuple[str, int], ...] | None = None
-        try:
-            while True:
-                summary = await run_tick(conn, args, event_sink=event_sink)
-                if "error" in summary:
-                    try:
-                        await conn.rollback()
-                    except sqlite3.OperationalError:
-                        pass
-                    error = str(summary.get("error") or "unknown")
-                    now_ts = int(
-                        summary.get("now_ts")
-                        or (summary.get("selection") or {}).get("now_ts")
-                        or 0
-                    )
-                    if error == "no_relevant_markets":
-                        skip_reasons = summary.get("skip_reasons") or {}
-                        signature = tuple(sorted(skip_reasons.items()))
-                        should_log = False
-                        if last_no_relevant_log_ts is None:
-                            should_log = True
-                        elif signature != last_no_relevant_signature:
-                            should_log = True
-                        elif now_ts > 0 and (
-                            now_ts - last_no_relevant_log_ts
-                        ) >= NO_RELEVANT_HEARTBEAT_SECONDS:
-                            should_log = True
-                        if should_log:
-                            print(f"ERROR: {error}")
-                            selection = summary.get("selection", {})
-                            if selection:
-                                print(f"selection_summary={selection}")
-                            if skip_reasons:
-                                print(f"skip_reasons={skip_reasons}")
-                            last_no_relevant_log_ts = now_ts if now_ts > 0 else 0
-                            last_no_relevant_signature = signature
-                    else:
-                        print(f"ERROR: {error}")
-                        selection = summary.get("selection", {})
-                        if selection:
-                            print(f"selection_summary={selection}")
-                        if summary.get("skip_reasons"):
-                            print(f"skip_reasons={summary['skip_reasons']}")
-                else:
-                    now_ts = int(summary.get("now_ts") or 0)
-                    should_log_summary = (
-                        last_edge_log_ts is None
-                        or now_ts <= 0
-                        or (now_ts - last_edge_log_ts) >= EDGE_SUMMARY_HEARTBEAT_SECONDS
-                    )
-                    if should_log_summary:
-                        print(
-                            "asof_ts={now_ts} edges_inserted={edges_inserted} "
-                            "snapshots_inserted={snapshots_inserted} "
-                            "max_spot_age_seconds={max_spot_age_seconds} "
-                            "max_quote_age_seconds={max_quote_age_seconds}".format(
-                                **summary
-                            )
-                        )
-                        if now_ts > 0:
-                            last_edge_log_ts = now_ts
-                    if args.debug:
-                        _print_debug(summary, args.show_titles)
-                if args.once:
-                    return 0
-                await asyncio.sleep(args.interval_seconds)
-        finally:
-            await event_sink.close()
+    )
+    publisher_bus_url = (
+        (args.events_bus_url if args.events_bus_url else settings.bus_url)
+        if args.events_bus
+        else None
+    )
+    event_sink = await EventPublisher.create(
+        jsonl_path=args.events_jsonl_path,
+        bus_url=publisher_bus_url,
+    )
+    try:
+        if args.state_source == "events":
+            if not consumer_bus_url:
+                raise RuntimeError(
+                    "--state-source events requires BUS_URL or --events-bus-url"
+                )
+            return await _run_events_mode(
+                args=args,
+                event_sink=event_sink,
+                bus_url=consumer_bus_url,
+            )
+        return await _run_sqlite_mode(args=args, settings=settings, event_sink=event_sink)
+    finally:
+        await event_sink.close()
 
 
 def main() -> int:

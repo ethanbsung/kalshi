@@ -198,13 +198,16 @@ async def backfill_market_times(
         for idx in range(0, len(updated_market_ids), chunk_size):
             chunk = updated_market_ids[idx : idx + chunk_size]
             placeholders = ", ".join("?" for _ in chunk)
-            await conn.execute(
+            sql = (
                 "UPDATE kalshi_contracts "
                 "SET settlement_ts = (SELECT settlement_ts FROM kalshi_markets WHERE market_id = ticker), "
                 "close_ts = (SELECT close_ts FROM kalshi_markets WHERE market_id = ticker), "
                 "expected_expiration_ts = (SELECT expected_expiration_ts FROM kalshi_markets WHERE market_id = ticker), "
                 "expiration_ts = (SELECT expiration_ts FROM kalshi_markets WHERE market_id = ticker) "
-                f"WHERE ticker IN ({placeholders})",
+                f"WHERE ticker IN ({placeholders})"
+            )
+            await conn.execute(
+                sql,
                 chunk,
             )
     return updated

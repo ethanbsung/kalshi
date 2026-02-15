@@ -14,6 +14,7 @@ from kalshi_bot.config import load_settings
 from kalshi_bot.data import init_db
 from kalshi_bot.kalshi.fees import taker_fee_dollars
 from kalshi_bot.models.probability import EPS
+from kalshi_bot.persistence import PostgresEventRepository
 
 
 def _parse_args() -> argparse.Namespace:
@@ -21,6 +22,12 @@ def _parse_args() -> argparse.Namespace:
         description="Report model performance on settled opportunities."
     )
     parser.add_argument("--since-seconds", type=int, default=7 * 24 * 3600)
+    parser.add_argument(
+        "--pg-dsn",
+        type=str,
+        default=None,
+        help="Use Postgres source when provided (defaults to PG_DSN).",
+    )
     return parser.parse_args()
 
 
@@ -56,9 +63,7 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
-def _realized_pnl(
-    outcome: int, side: str, price_cents: float
-) -> float:
+def _realized_pnl(outcome: int, side: str, price_cents: float) -> float:
     fee = taker_fee_dollars(price_cents, 1)
     fee_value = fee if fee is not None else 0.0
     price = price_cents / 100.0
@@ -72,35 +77,11 @@ def _score_prob(prob: float | None, outcome: int) -> tuple[float | None, float |
         return None, None
     p = max(EPS, min(1.0 - EPS, float(prob)))
     brier = (p - outcome) ** 2
-    logloss = -(
-        outcome * math.log(p)
-        + (1 - outcome) * math.log(1.0 - p)
-    )
+    logloss = -(outcome * math.log(p) + (1 - outcome) * math.log(1.0 - p))
     return brier, logloss
 
 
-async def compute_report(
-    conn: aiosqlite.Connection, since_ts: int
-) -> dict[str, Any]:
-    cursor = await conn.execute(
-        """
-        SELECT o.ts_eval, o.market_id, o.side, o.p_model, o.p_market,
-               o.best_yes_ask, o.best_no_ask, o.raw_json,
-               c.outcome AS outcome,
-               COALESCE(c.settled_ts, o.settlement_ts) AS settled_ts,
-               CASE WHEN s.market_id IS NULL THEN 0 ELSE 1 END AS has_snapshot_score
-        FROM opportunities o
-        LEFT JOIN kalshi_contracts c
-          ON c.ticker = o.market_id
-        LEFT JOIN kalshi_edge_snapshot_scores s
-          ON s.market_id = o.market_id AND s.asof_ts = o.ts_eval
-        WHERE o.would_trade = 1 AND o.ts_eval >= ?
-        ORDER BY o.ts_eval ASC
-        """,
-        (since_ts,),
-    )
-    rows = await cursor.fetchall()
-
+def _compute_report_from_rows(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
     total = len(rows)
     settled = 0
     pnl_total = 0.0
@@ -118,7 +99,7 @@ async def compute_report(
 
     for (
         ts_eval,
-        market_id,
+        _market_id,
         side,
         p_model,
         p_market,
@@ -186,34 +167,25 @@ async def compute_report(
 
         ts = settled_ts if settled_ts is not None else ts_eval
         day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
-        bucket = None
         if p_model is not None:
             try:
                 model_prob_yes = float(p_model)
-                prob_val = model_prob_yes
-                if side == "NO":
-                    prob_val = 1.0 - model_prob_yes
+                prob_val = model_prob_yes if side == "YES" else 1.0 - model_prob_yes
                 bucket = _bucket(prob_val)
-                info = buckets.setdefault(
-                    bucket, {"count": 0, "prob_sum": 0.0, "wins": 0}
-                )
+                info = buckets.setdefault(bucket, {"count": 0, "prob_sum": 0.0, "wins": 0})
                 info["count"] += 1
                 info["prob_sum"] += prob_val
                 info["wins"] += int(trade_win or 0)
             except (TypeError, ValueError):
-                bucket = None
+                pass
 
-        day_info = by_day.setdefault(
-            day, {"count": 0, "pnl": 0.0, "wins": 0}
-        )
+        day_info = by_day.setdefault(day, {"count": 0, "pnl": 0.0, "wins": 0})
         day_info["count"] += 1
         day_info["pnl"] += _realized_pnl(outcome_val, side, price_used or 0.0)
         day_info["wins"] += int(trade_win or 0)
 
     unsettled = total - settled
-    avg_model_brier = (
-        model_brier_total / model_score_count if model_score_count else None
-    )
+    avg_model_brier = model_brier_total / model_score_count if model_score_count else None
     avg_model_logloss = (
         model_logloss_total / model_score_count if model_score_count else None
     )
@@ -265,20 +237,62 @@ async def compute_report(
     }
 
 
-async def _run() -> int:
-    args = _parse_args()
-    settings = load_settings()
+async def compute_report(conn: aiosqlite.Connection, since_ts: int) -> dict[str, Any]:
+    cursor = await conn.execute(
+        """
+        SELECT o.ts_eval, o.market_id, o.side, o.p_model, o.p_market,
+               o.best_yes_ask, o.best_no_ask, o.raw_json,
+               c.outcome AS outcome,
+               COALESCE(c.settled_ts, o.settlement_ts) AS settled_ts,
+               CASE WHEN s.market_id IS NULL THEN 0 ELSE 1 END AS has_snapshot_score
+        FROM opportunities o
+        LEFT JOIN kalshi_contracts c
+          ON c.ticker = o.market_id
+        LEFT JOIN kalshi_edge_snapshot_scores s
+          ON s.market_id = o.market_id AND s.asof_ts = o.ts_eval
+        WHERE o.would_trade = 1 AND o.ts_eval >= ?
+        ORDER BY o.ts_eval ASC
+        """,
+        (since_ts,),
+    )
+    rows = await cursor.fetchall()
+    return _compute_report_from_rows([tuple(row) for row in rows])
 
-    print(f"DB path: {settings.db_path}")
-    await init_db(settings.db_path)
 
-    since_ts = int(time.time()) - max(args.since_seconds, 0)
+def compute_report_postgres(conn: Any, since_ts: int) -> dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                (o.payload_json->>'ts_eval')::BIGINT AS ts_eval,
+                o.payload_json->>'market_id' AS market_id,
+                o.payload_json->>'side' AS side,
+                NULLIF(o.payload_json->>'p_model', '')::DOUBLE PRECISION AS p_model,
+                NULLIF(o.payload_json->>'p_market', '')::DOUBLE PRECISION AS p_market,
+                NULLIF(o.payload_json->>'best_yes_ask', '')::DOUBLE PRECISION AS best_yes_ask,
+                NULLIF(o.payload_json->>'best_no_ask', '')::DOUBLE PRECISION AS best_no_ask,
+                o.payload_json->>'raw_json' AS raw_json,
+                c.outcome AS outcome,
+                COALESCE(c.settled_ts, c.expiration_ts, c.close_ts) AS settled_ts,
+                CASE WHEN s.market_id IS NULL THEN 0 ELSE 1 END AS has_snapshot_score
+            FROM event_store.events_raw o
+            LEFT JOIN event_store.state_contract_latest c
+              ON c.ticker = o.payload_json->>'market_id'
+            LEFT JOIN event_store.fact_edge_snapshot_scores s
+              ON s.market_id = o.payload_json->>'market_id'
+             AND s.asof_ts = (o.payload_json->>'ts_eval')::BIGINT
+            WHERE o.event_type = 'opportunity_decision'
+              AND (o.payload_json->>'ts_eval')::BIGINT >= %s
+              AND COALESCE((o.payload_json->>'would_trade')::BOOLEAN, FALSE) = TRUE
+            ORDER BY (o.payload_json->>'ts_eval')::BIGINT ASC
+            """,
+            (int(since_ts),),
+        )
+        rows = cur.fetchall()
+    return _compute_report_from_rows(rows)
 
-    async with aiosqlite.connect(settings.db_path) as conn:
-        await conn.execute("PRAGMA foreign_keys = ON;")
-        await conn.execute("PRAGMA busy_timeout = 5000;")
-        report = await compute_report(conn, since_ts)
 
+def _print_report(report: dict[str, Any]) -> None:
     print(
         "opportunities_total={total} settled={settled} unsettled={unsettled}".format(
             total=report["total"],
@@ -299,9 +313,7 @@ async def _run() -> int:
         "realized_pnl={pnl}".format(
             brier=f"{avg_brier:.6f}" if avg_brier is not None else "NA",
             logloss=f"{avg_logloss:.6f}" if avg_logloss is not None else "NA",
-            mbrier=(
-                f"{avg_market_brier:.6f}" if avg_market_brier is not None else "NA"
-            ),
+            mbrier=f"{avg_market_brier:.6f}" if avg_market_brier is not None else "NA",
             mlogloss=(
                 f"{avg_market_logloss:.6f}" if avg_market_logloss is not None else "NA"
             ),
@@ -329,7 +341,6 @@ async def _run() -> int:
             ),
         )
     )
-
     if report["by_day"]:
         print("by_day:")
         for day, info in sorted(report["by_day"].items()):
@@ -337,7 +348,6 @@ async def _run() -> int:
                 f"  {day} count={int(info['count'])} "
                 f"pnl={info['pnl']:.4f} wins={int(info['wins'])}"
             )
-
     if report["buckets"]:
         print("calibration:")
         for bucket, info in sorted(report["buckets"].items()):
@@ -349,7 +359,44 @@ async def _run() -> int:
                 f"win_rate={win_rate:.3f}"
             )
 
+
+async def _run_sqlite(*, settings: Any, since_ts: int) -> int:
+    print(f"backend=sqlite db_path={settings.db_path}")
+    await init_db(settings.db_path)
+    async with aiosqlite.connect(settings.db_path) as conn:
+        await conn.execute("PRAGMA foreign_keys = ON;")
+        await conn.execute("PRAGMA busy_timeout = 5000;")
+        report = await compute_report(conn, since_ts)
+    _print_report(report)
     return 0
+
+
+async def _run_postgres(*, pg_dsn: str, since_ts: int) -> int:
+    print("backend=postgres")
+    repo = PostgresEventRepository(pg_dsn)
+    repo.ensure_schema()
+    repo.close()
+    try:
+        import psycopg
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "psycopg is required for Postgres reporting. "
+            "Install with: pip install psycopg[binary]"
+        ) from exc
+    with psycopg.connect(pg_dsn) as conn:
+        report = compute_report_postgres(conn, since_ts)
+    _print_report(report)
+    return 0
+
+
+async def _run() -> int:
+    args = _parse_args()
+    settings = load_settings()
+    since_ts = int(time.time()) - max(args.since_seconds, 0)
+    pg_dsn = args.pg_dsn or settings.pg_dsn
+    if pg_dsn:
+        return await _run_postgres(pg_dsn=pg_dsn, since_ts=since_ts)
+    return await _run_sqlite(settings=settings, since_ts=since_ts)
 
 
 def main() -> int:

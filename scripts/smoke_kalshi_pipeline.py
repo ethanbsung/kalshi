@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Smoke test for Kalshi BTC pipeline.
 
 Usage:
@@ -9,6 +7,8 @@ Requires Kalshi REST credentials in env (see Settings).
 Global coverage is informational only; pass/fail uses relevant near-spot coverage.
 The --status flag applies to DB filtering; REST listing uses KALSHI_MARKET_STATUS.
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
