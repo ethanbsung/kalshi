@@ -108,3 +108,18 @@ def test_paper_execution_state_max_open_positions() -> None:
         kill_switch_active=False,
     )
     assert reason == "max_open_positions"
+
+
+def test_entry_price_band_guardrails() -> None:
+    module = _load_paper_execution_module()
+
+    assert (
+        module._is_price_out_of_band(14.99, min_cents=15.0, max_cents=85.0) is True
+    )
+    assert module._is_price_out_of_band(15.0, min_cents=15.0, max_cents=85.0) is False
+    assert module._is_price_out_of_band(50.0, min_cents=15.0, max_cents=85.0) is False
+    assert module._is_price_out_of_band(85.0, min_cents=15.0, max_cents=85.0) is False
+    assert (
+        module._is_price_out_of_band(85.01, min_cents=15.0, max_cents=85.0) is True
+    )
+    assert module._is_price_out_of_band(None, min_cents=15.0, max_cents=85.0) is False

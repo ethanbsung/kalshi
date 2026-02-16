@@ -35,6 +35,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-open-positions", type=int, default=None)
     parser.add_argument("--take-cooldown-seconds", type=int, default=None)
     parser.add_argument(
+        "--min-entry-price-cents",
+        type=float,
+        default=15.0,
+        help="Reject entries with price below this cents threshold.",
+    )
+    parser.add_argument(
+        "--max-entry-price-cents",
+        type=float,
+        default=85.0,
+        help="Reject entries with price above this cents threshold.",
+    )
+    parser.add_argument(
         "--kill-switch-path",
         type=str,
         default="data/kill_switch",
@@ -134,6 +146,14 @@ def _price_from_decision_payload(payload: Any) -> float | None:
     if not isinstance(metadata, dict):
         return None
     return _safe_float(metadata.get("price_used_cents"))
+
+
+def _is_price_out_of_band(
+    price_cents: float | None, *, min_cents: float, max_cents: float
+) -> bool:
+    if price_cents is None:
+        return False
+    return float(price_cents) < min_cents or float(price_cents) > max_cents
 
 
 @dataclass(slots=True)
@@ -339,6 +359,12 @@ async def _run() -> int:
         if args.max_open_positions is not None
         else max(int(settings.max_open_positions), 0)
     )
+    min_entry_price_cents = float(args.min_entry_price_cents)
+    max_entry_price_cents = float(args.max_entry_price_cents)
+    if min_entry_price_cents > max_entry_price_cents:
+        raise RuntimeError(
+            "Invalid entry price band: min-entry-price-cents must be <= max-entry-price-cents"
+        )
     take_cooldown_seconds = (
         max(int(args.take_cooldown_seconds), 0)
         if args.take_cooldown_seconds is not None
@@ -355,6 +381,12 @@ async def _run() -> int:
             max_open=max_open_positions,
             cooldown=take_cooldown_seconds,
             path=kill_switch_path,
+        )
+    )
+    print(
+        "entry_price_band_cents=min:{min_price:.2f} max:{max_price:.2f}".format(
+            min_price=min_entry_price_cents,
+            max_price=max_entry_price_cents,
         )
     )
 
@@ -476,6 +508,14 @@ async def _run() -> int:
                     max_open_positions=max_open_positions,
                     kill_switch_active=kill_switch_path.exists(),
                 )
+                if reject_reason is None:
+                    entry_price_cents = _price_from_decision_payload(opportunity_payload)
+                    if _is_price_out_of_band(
+                        entry_price_cents,
+                        min_cents=min_entry_price_cents,
+                        max_cents=max_entry_price_cents,
+                    ):
+                        reject_reason = "entry_price_out_of_band"
                 order_id = f"paper:{decision_key}"
                 if reject_reason is not None:
                     try:
