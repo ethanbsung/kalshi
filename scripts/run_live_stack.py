@@ -169,6 +169,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--quote-interval", type=float, default=5.0)
     parser.add_argument("--quote-concurrency", type=int, default=5)
     parser.add_argument("--edge-interval-seconds", type=int, default=10)
+    parser.add_argument(
+        "--edge-max-spot-points",
+        type=int,
+        default=60000,
+        help=(
+            "Spot points retained in edge runner state. "
+            "Higher values preserve longer sigma history under high tick rates."
+        ),
+    )
     parser.add_argument("--max-horizon-seconds", type=int, default=6 * 3600)
     parser.add_argument("--opportunity-interval-seconds", type=int, default=10)
     parser.add_argument(
@@ -837,6 +846,8 @@ async def _run() -> int:
         str(repo_root / "scripts" / "run_live_edges.py"),
         "--interval-seconds",
         str(args.edge_interval_seconds),
+        "--max-spot-points",
+        str(args.edge_max_spot_points),
         "--product-id",
         product_id,
         "--max-horizon-seconds",

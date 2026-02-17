@@ -24,6 +24,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--since-seconds", type=int, default=7 * 24 * 3600)
     parser.add_argument(
+        "--scope",
+        choices=["policy", "all"],
+        default="policy",
+        help="Evaluation scope: policy=would_trade only (default), all=all scored opportunities.",
+    )
+    parser.add_argument(
         "--fill-quality-limit",
         type=int,
         default=10,
@@ -35,6 +41,14 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Print extended analytics sections "
             "(worst markets/hour buckets, entry bands, fill quality, risk counters)."
+        ),
+    )
+    parser.add_argument(
+        "--edge-decay",
+        action="store_true",
+        help=(
+            "Print compact edge decay diagnostics for filled trades "
+            "(entry vs +1m/+5m)."
         ),
     )
     parser.add_argument(
@@ -110,7 +124,8 @@ def _compute_report_from_rows(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
     snapshot_score_matches_settled = 0
 
     by_day: dict[str, dict[str, float]] = {}
-    buckets: dict[str, dict[str, float]] = {}
+    buckets_model: dict[str, dict[str, float]] = {}
+    buckets_market: dict[str, dict[str, float]] = {}
     pnl_by_market_side: dict[tuple[str, str], dict[str, float]] = defaultdict(
         lambda: {"count": 0.0, "pnl": 0.0}
     )
@@ -198,7 +213,22 @@ def _compute_report_from_rows(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
                 model_prob_yes = float(p_model)
                 prob_val = model_prob_yes if side == "YES" else 1.0 - model_prob_yes
                 bucket = _bucket(prob_val)
-                info = buckets.setdefault(bucket, {"count": 0, "prob_sum": 0.0, "wins": 0})
+                info = buckets_model.setdefault(
+                    bucket, {"count": 0, "prob_sum": 0.0, "wins": 0}
+                )
+                info["count"] += 1
+                info["prob_sum"] += prob_val
+                info["wins"] += int(trade_win or 0)
+            except (TypeError, ValueError):
+                pass
+        if market_prob is not None:
+            try:
+                market_prob_yes = float(market_prob)
+                prob_val = market_prob_yes if side == "YES" else 1.0 - market_prob_yes
+                bucket = _bucket(prob_val)
+                info = buckets_market.setdefault(
+                    bucket, {"count": 0, "prob_sum": 0.0, "wins": 0}
+                )
                 info["count"] += 1
                 info["prob_sum"] += prob_val
                 info["wins"] += int(trade_win or 0)
@@ -257,6 +287,10 @@ def _compute_report_from_rows(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
     snapshot_score_coverage_settled = (
         snapshot_score_matches_settled / settled if settled > 0 else None
     )
+    model_metric_coverage_settled = model_score_count / settled if settled > 0 else None
+    market_metric_coverage_settled = (
+        market_score_count / settled if settled > 0 else None
+    )
 
     return {
         "total": total,
@@ -270,6 +304,8 @@ def _compute_report_from_rows(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
         "delta_logloss": delta_logloss,
         "model_scored": model_score_count,
         "market_scored": market_score_count,
+        "model_metric_coverage_settled": model_metric_coverage_settled,
+        "market_metric_coverage_settled": market_metric_coverage_settled,
         "snapshot_score_matches_total": snapshot_score_matches_total,
         "snapshot_score_matches_settled": snapshot_score_matches_settled,
         "snapshot_score_coverage_total": snapshot_score_coverage_total,
@@ -279,7 +315,8 @@ def _compute_report_from_rows(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
         "avg_logloss": avg_model_logloss,
         "pnl_total": pnl_total,
         "by_day": by_day,
-        "buckets": buckets,
+        "buckets": buckets_model,
+        "buckets_market": buckets_market,
         "worst_markets": sorted(
             [
                 {
@@ -325,9 +362,14 @@ def _compute_report_from_rows(rows: list[tuple[Any, ...]]) -> dict[str, Any]:
     }
 
 
-async def compute_report(conn: aiosqlite.Connection, since_ts: int) -> dict[str, Any]:
-    cursor = await conn.execute(
-        """
+async def compute_report(
+    conn: aiosqlite.Connection, since_ts: int, scope: str
+) -> dict[str, Any]:
+    if scope == "policy":
+        where_scope = "AND o.would_trade = 1"
+    else:
+        where_scope = ""
+    query = f"""
         SELECT o.ts_eval, o.market_id, o.side, o.p_model, o.p_market,
                o.best_yes_ask, o.best_no_ask, o.raw_json,
                c.outcome AS outcome,
@@ -338,19 +380,22 @@ async def compute_report(conn: aiosqlite.Connection, since_ts: int) -> dict[str,
           ON c.ticker = o.market_id
         LEFT JOIN kalshi_edge_snapshot_scores s
           ON s.market_id = o.market_id AND s.asof_ts = o.ts_eval
-        WHERE o.would_trade = 1 AND o.ts_eval >= ?
+        WHERE o.ts_eval >= ?
+          {where_scope}
         ORDER BY o.ts_eval ASC
-        """,
-        (since_ts,),
-    )
+    """
+    cursor = await conn.execute(query, (since_ts,))
     rows = await cursor.fetchall()
     return _compute_report_from_rows([tuple(row) for row in rows])
 
 
-def compute_report_postgres(conn: Any, since_ts: int) -> dict[str, Any]:
+def compute_report_postgres(conn: Any, since_ts: int, scope: str) -> dict[str, Any]:
+    if scope == "policy":
+        where_scope = "AND COALESCE((o.payload_json->>'would_trade')::BOOLEAN, FALSE) = TRUE"
+    else:
+        where_scope = ""
     with conn.cursor() as cur:
-        cur.execute(
-            """
+        query = f"""
             SELECT
                 (o.payload_json->>'ts_eval')::BIGINT AS ts_eval,
                 o.payload_json->>'market_id' AS market_id,
@@ -371,13 +416,244 @@ def compute_report_postgres(conn: Any, since_ts: int) -> dict[str, Any]:
              AND s.asof_ts = (o.payload_json->>'ts_eval')::BIGINT
             WHERE o.event_type = 'opportunity_decision'
               AND (o.payload_json->>'ts_eval')::BIGINT >= %s
-              AND COALESCE((o.payload_json->>'would_trade')::BOOLEAN, FALSE) = TRUE
+              {where_scope}
             ORDER BY (o.payload_json->>'ts_eval')::BIGINT ASC
-            """,
-            (int(since_ts),),
-        )
+        """
+        cur.execute(query, (int(since_ts),))
         rows = cur.fetchall()
     return _compute_report_from_rows(rows)
+
+
+def _edge_value_cents(
+    *, prob_yes: float | None, side: str | None, yes_bid: float | None, no_bid: float | None
+) -> float | None:
+    if prob_yes is None or side is None:
+        return None
+    side_u = side.upper()
+    if side_u == "YES":
+        if yes_bid is None:
+            return None
+        return (float(prob_yes) * 100.0) - float(yes_bid)
+    if side_u == "NO":
+        if no_bid is None:
+            return None
+        return ((1.0 - float(prob_yes)) * 100.0) - float(no_bid)
+    return None
+
+
+def compute_edge_decay_postgres(
+    conn: Any,
+    *,
+    since_ts: int,
+    scope: str,
+    tolerance_seconds: int = 20,
+) -> dict[str, Any]:
+    if scope == "policy":
+        where_scope = (
+            "AND COALESCE((d.payload_json->>'would_trade')::BOOLEAN, FALSE) = TRUE"
+        )
+    else:
+        where_scope = ""
+    quote_tolerance_seconds = 5
+    with conn.cursor() as cur:
+        query = f"""
+            WITH decisions AS (
+                SELECT
+                    d.idempotency_key,
+                    (d.payload_json->>'ts_eval')::BIGINT AS ts_eval,
+                    d.payload_json->>'market_id' AS market_id,
+                    d.payload_json->>'side' AS side
+                FROM event_store.events_raw d
+                WHERE d.event_type = 'opportunity_decision'
+                  AND (d.payload_json->>'ts_eval')::BIGINT >= %s
+                  {where_scope}
+            ),
+            filled_orders AS (
+                SELECT DISTINCT ON (eo.order_id)
+                    eo.order_id,
+                    eo.opportunity_idempotency_key
+                FROM event_store.execution_order_latest eo
+                JOIN event_store.execution_fill_latest f
+                  ON f.order_id = eo.order_id
+                WHERE eo.paper = TRUE
+                  AND f.paper = TRUE
+                  AND f.action = 'open'
+                ORDER BY eo.order_id, f.ts_fill ASC
+            ),
+            filled AS (
+                SELECT
+                    d.market_id,
+                    d.side,
+                    d.ts_eval
+                FROM decisions d
+                JOIN filled_orders fo
+                  ON fo.opportunity_idempotency_key = d.idempotency_key
+            )
+            SELECT
+                f.market_id,
+                f.side,
+                f.ts_eval,
+                entry.prob_yes AS entry_prob_yes,
+                q_entry.yes_bid AS entry_yes_bid,
+                q_entry.no_bid AS entry_no_bid,
+                m1.prob_yes AS m1_prob_yes,
+                q_m1.yes_bid AS m1_yes_bid,
+                q_m1.no_bid AS m1_no_bid,
+                m5.prob_yes AS m5_prob_yes,
+                q_m5.yes_bid AS m5_yes_bid,
+                q_m5.no_bid AS m5_no_bid
+            FROM filled f
+            LEFT JOIN LATERAL (
+                SELECT
+                    (e.payload_json->>'asof_ts')::BIGINT AS asof_ts,
+                    (e.payload_json->>'quote_ts')::BIGINT AS quote_ts,
+                    NULLIF(e.payload_json->>'prob_yes', '')::DOUBLE PRECISION AS prob_yes
+                FROM event_store.events_raw e
+                WHERE e.event_type = 'edge_snapshot'
+                  AND e.payload_json->>'market_id' = f.market_id
+                  AND (e.payload_json->>'asof_ts')::BIGINT BETWEEN f.ts_eval - %s AND f.ts_eval + %s
+                ORDER BY ABS((e.payload_json->>'asof_ts')::BIGINT - f.ts_eval), (e.payload_json->>'asof_ts')::BIGINT DESC
+                LIMIT 1
+            ) entry ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    NULLIF(q.payload_json->>'yes_bid', '')::DOUBLE PRECISION AS yes_bid,
+                    NULLIF(q.payload_json->>'no_bid', '')::DOUBLE PRECISION AS no_bid
+                FROM event_store.events_raw q
+                WHERE q.event_type = 'quote_update'
+                  AND q.payload_json->>'market_id' = f.market_id
+                  AND entry.quote_ts IS NOT NULL
+                  AND (q.payload_json->>'ts')::BIGINT BETWEEN entry.quote_ts - %s AND entry.quote_ts + %s
+                ORDER BY ABS((q.payload_json->>'ts')::BIGINT - entry.quote_ts), (q.payload_json->>'ts')::BIGINT DESC
+                LIMIT 1
+            ) q_entry ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    (e.payload_json->>'asof_ts')::BIGINT AS asof_ts,
+                    (e.payload_json->>'quote_ts')::BIGINT AS quote_ts,
+                    NULLIF(e.payload_json->>'prob_yes', '')::DOUBLE PRECISION AS prob_yes
+                FROM event_store.events_raw e
+                WHERE e.event_type = 'edge_snapshot'
+                  AND e.payload_json->>'market_id' = f.market_id
+                  AND (e.payload_json->>'asof_ts')::BIGINT BETWEEN (f.ts_eval + 60) - %s AND (f.ts_eval + 60) + %s
+                ORDER BY ABS((e.payload_json->>'asof_ts')::BIGINT - (f.ts_eval + 60)), (e.payload_json->>'asof_ts')::BIGINT DESC
+                LIMIT 1
+            ) m1 ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    NULLIF(q.payload_json->>'yes_bid', '')::DOUBLE PRECISION AS yes_bid,
+                    NULLIF(q.payload_json->>'no_bid', '')::DOUBLE PRECISION AS no_bid
+                FROM event_store.events_raw q
+                WHERE q.event_type = 'quote_update'
+                  AND q.payload_json->>'market_id' = f.market_id
+                  AND m1.quote_ts IS NOT NULL
+                  AND (q.payload_json->>'ts')::BIGINT BETWEEN m1.quote_ts - %s AND m1.quote_ts + %s
+                ORDER BY ABS((q.payload_json->>'ts')::BIGINT - m1.quote_ts), (q.payload_json->>'ts')::BIGINT DESC
+                LIMIT 1
+            ) q_m1 ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    (e.payload_json->>'asof_ts')::BIGINT AS asof_ts,
+                    (e.payload_json->>'quote_ts')::BIGINT AS quote_ts,
+                    NULLIF(e.payload_json->>'prob_yes', '')::DOUBLE PRECISION AS prob_yes
+                FROM event_store.events_raw e
+                WHERE e.event_type = 'edge_snapshot'
+                  AND e.payload_json->>'market_id' = f.market_id
+                  AND (e.payload_json->>'asof_ts')::BIGINT BETWEEN (f.ts_eval + 300) - %s AND (f.ts_eval + 300) + %s
+                ORDER BY ABS((e.payload_json->>'asof_ts')::BIGINT - (f.ts_eval + 300)), (e.payload_json->>'asof_ts')::BIGINT DESC
+                LIMIT 1
+            ) m5 ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    NULLIF(q.payload_json->>'yes_bid', '')::DOUBLE PRECISION AS yes_bid,
+                    NULLIF(q.payload_json->>'no_bid', '')::DOUBLE PRECISION AS no_bid
+                FROM event_store.events_raw q
+                WHERE q.event_type = 'quote_update'
+                  AND q.payload_json->>'market_id' = f.market_id
+                  AND m5.quote_ts IS NOT NULL
+                  AND (q.payload_json->>'ts')::BIGINT BETWEEN m5.quote_ts - %s AND m5.quote_ts + %s
+                ORDER BY ABS((q.payload_json->>'ts')::BIGINT - m5.quote_ts), (q.payload_json->>'ts')::BIGINT DESC
+                LIMIT 1
+            ) q_m5 ON TRUE
+        """
+        params = (
+            int(since_ts),
+            int(tolerance_seconds),
+            int(tolerance_seconds),
+            int(quote_tolerance_seconds),
+            int(quote_tolerance_seconds),
+            int(tolerance_seconds),
+            int(tolerance_seconds),
+            int(quote_tolerance_seconds),
+            int(quote_tolerance_seconds),
+            int(tolerance_seconds),
+            int(tolerance_seconds),
+            int(quote_tolerance_seconds),
+            int(quote_tolerance_seconds),
+        )
+        cur.execute(query, params)
+        rows = cur.fetchall()
+    filled_total = len(rows)
+    if filled_total == 0:
+        return {"status": "no_filled_trades", "reason": "no_filled_trades_in_scope"}
+
+    entry_edges: list[float] = []
+    edge_1m_vals: list[float] = []
+    edge_5m_vals: list[float] = []
+    decay_1m_total = 0
+    decay_1m_count = 0
+    decay_5m_total = 0
+    decay_5m_count = 0
+    for row in rows:
+        side = row[1]
+        edge_entry = _edge_value_cents(
+            prob_yes=_safe_float(row[3]),
+            side=side,
+            yes_bid=_safe_float(row[4]),
+            no_bid=_safe_float(row[5]),
+        )
+        edge_1m = _edge_value_cents(
+            prob_yes=_safe_float(row[6]),
+            side=side,
+            yes_bid=_safe_float(row[7]),
+            no_bid=_safe_float(row[8]),
+        )
+        edge_5m = _edge_value_cents(
+            prob_yes=_safe_float(row[9]),
+            side=side,
+            yes_bid=_safe_float(row[10]),
+            no_bid=_safe_float(row[11]),
+        )
+        if edge_entry is not None:
+            entry_edges.append(edge_entry)
+        if edge_1m is not None:
+            edge_1m_vals.append(edge_1m)
+        if edge_5m is not None:
+            edge_5m_vals.append(edge_5m)
+        if edge_entry is not None and edge_1m is not None:
+            decay_1m_count += 1
+            if edge_1m < edge_entry:
+                decay_1m_total += 1
+        if edge_entry is not None and edge_5m is not None:
+            decay_5m_count += 1
+            if edge_5m < edge_entry:
+                decay_5m_total += 1
+
+    def _avg(values: list[float]) -> float | None:
+        return (sum(values) / len(values)) if values else None
+
+    return {
+        "status": "ok",
+        "filled_trades": filled_total,
+        "entry_coverage": (len(entry_edges) / filled_total) if filled_total > 0 else None,
+        "coverage_1m": (len(edge_1m_vals) / filled_total) if filled_total > 0 else None,
+        "coverage_5m": (len(edge_5m_vals) / filled_total) if filled_total > 0 else None,
+        "avg_edge_entry_cents": _avg(entry_edges),
+        "avg_edge_1m_cents": _avg(edge_1m_vals),
+        "avg_edge_5m_cents": _avg(edge_5m_vals),
+        "frac_decayed_1m": (decay_1m_total / decay_1m_count) if decay_1m_count > 0 else None,
+        "frac_decayed_5m": (decay_5m_total / decay_5m_count) if decay_5m_count > 0 else None,
+    }
 
 
 def compute_fill_quality_postgres(
@@ -575,6 +851,7 @@ def _print_report(
     analytics_details: bool = False,
     fill_quality: dict[str, Any] | None = None,
     risk_counters: dict[str, Any] | None = None,
+    edge_decay: dict[str, Any] | None = None,
 ) -> None:
     print(
         "opportunities_total={total} settled={settled} unsettled={unsettled}".format(
@@ -624,6 +901,20 @@ def _print_report(
             ),
         )
     )
+    print(
+        "metric_coverage_settled model={model_cov} market={market_cov}".format(
+            model_cov=(
+                f"{report['model_metric_coverage_settled']:.3f}"
+                if report["model_metric_coverage_settled"] is not None
+                else "NA"
+            ),
+            market_cov=(
+                f"{report['market_metric_coverage_settled']:.3f}"
+                if report["market_metric_coverage_settled"] is not None
+                else "NA"
+            ),
+        )
+    )
     if report["by_day"]:
         print("by_day:")
         for day, info in sorted(report["by_day"].items()):
@@ -641,6 +932,44 @@ def _print_report(
                 f"  {bucket} count={count} avg_prob={avg_prob:.3f} "
                 f"win_rate={win_rate:.3f}"
             )
+    market_buckets = report.get("buckets_market") or {}
+    if market_buckets:
+        print("calibration_market:")
+        for bucket, info in sorted(market_buckets.items()):
+            count = info["count"]
+            avg_prob = info["prob_sum"] / count if count else 0.0
+            win_rate = info["wins"] / count if count else 0.0
+            print(
+                f"  {bucket} count={count} avg_prob={avg_prob:.3f} "
+                f"win_rate={win_rate:.3f}"
+            )
+    extreme_bins = ["0.0-0.1", "0.1-0.2", "0.8-0.9", "0.9-1.0"]
+    print("extreme_bins_model:")
+    for bucket in extreme_bins:
+        info = (report.get("buckets") or {}).get(bucket, {})
+        count = int(info.get("count", 0))
+        if count > 0:
+            avg_prob = float(info["prob_sum"]) / count
+            win_rate = float(info["wins"]) / count
+            print(
+                f"  {bucket} count={count} avg_prob={avg_prob:.3f} "
+                f"win_rate={win_rate:.3f}"
+            )
+        else:
+            print(f"  {bucket} count=0 avg_prob=NA win_rate=NA")
+    print("extreme_bins_market:")
+    for bucket in extreme_bins:
+        info = market_buckets.get(bucket, {})
+        count = int(info.get("count", 0))
+        if count > 0:
+            avg_prob = float(info["prob_sum"]) / count
+            win_rate = float(info["wins"]) / count
+            print(
+                f"  {bucket} count={count} avg_prob={avg_prob:.3f} "
+                f"win_rate={win_rate:.3f}"
+            )
+        else:
+            print(f"  {bucket} count=0 avg_prob=NA win_rate=NA")
     if analytics_details:
         worst_markets = report.get("worst_markets") or []
         if worst_markets:
@@ -766,16 +1095,88 @@ def _print_report(
                             rate=row["reject_rate"],
                         )
                     )
+    if edge_decay is not None:
+        if edge_decay.get("status") != "ok":
+            print(
+                "edge_decay status={status} reason={reason}".format(
+                    status=edge_decay.get("status", "NA"),
+                    reason=edge_decay.get("reason", "unavailable"),
+                )
+            )
+        else:
+            print(
+                "edge_decay filled_trades={filled} entry_coverage={entry_cov} "
+                "coverage_1m={cov1} coverage_5m={cov5}".format(
+                    filled=edge_decay.get("filled_trades", 0),
+                    entry_cov=(
+                        f"{edge_decay['entry_coverage']:.3f}"
+                        if edge_decay.get("entry_coverage") is not None
+                        else "NA"
+                    ),
+                    cov1=(
+                        f"{edge_decay['coverage_1m']:.3f}"
+                        if edge_decay.get("coverage_1m") is not None
+                        else "NA"
+                    ),
+                    cov5=(
+                        f"{edge_decay['coverage_5m']:.3f}"
+                        if edge_decay.get("coverage_5m") is not None
+                        else "NA"
+                    ),
+                )
+            )
+            print(
+                "edge_decay avg_edge_entry_cents={entry} avg_edge_1m_cents={m1} "
+                "avg_edge_5m_cents={m5}".format(
+                    entry=(
+                        f"{edge_decay['avg_edge_entry_cents']:.4f}"
+                        if edge_decay.get("avg_edge_entry_cents") is not None
+                        else "NA"
+                    ),
+                    m1=(
+                        f"{edge_decay['avg_edge_1m_cents']:.4f}"
+                        if edge_decay.get("avg_edge_1m_cents") is not None
+                        else "NA"
+                    ),
+                    m5=(
+                        f"{edge_decay['avg_edge_5m_cents']:.4f}"
+                        if edge_decay.get("avg_edge_5m_cents") is not None
+                        else "NA"
+                    ),
+                )
+            )
+            print(
+                "edge_decay frac_decayed_1m={d1} frac_decayed_5m={d5}".format(
+                    d1=(
+                        f"{edge_decay['frac_decayed_1m']:.3f}"
+                        if edge_decay.get("frac_decayed_1m") is not None
+                        else "NA"
+                    ),
+                    d5=(
+                        f"{edge_decay['frac_decayed_5m']:.3f}"
+                        if edge_decay.get("frac_decayed_5m") is not None
+                        else "NA"
+                    ),
+                )
+            )
 
 
-async def _run_sqlite(*, settings: Any, since_ts: int) -> int:
+async def _run_sqlite(
+    *, settings: Any, since_ts: int, scope: str, edge_decay_enabled: bool
+) -> int:
     print(f"backend=sqlite db_path={settings.db_path}")
     await init_db(settings.db_path)
     async with aiosqlite.connect(settings.db_path) as conn:
         await conn.execute("PRAGMA foreign_keys = ON;")
         await conn.execute("PRAGMA busy_timeout = 5000;")
-        report = await compute_report(conn, since_ts)
-    _print_report(report)
+        report = await compute_report(conn, since_ts, scope)
+    edge_decay = None
+    if edge_decay_enabled:
+        edge_decay = {
+            "status": "unsupported_backend",
+            "reason": "edge_decay_requires_postgres_events_raw",
+        }
+    _print_report(report, edge_decay=edge_decay)
     return 0
 
 
@@ -785,6 +1186,8 @@ async def _run_postgres(
     since_ts: int,
     fill_quality_limit: int,
     analytics_details: bool,
+    scope: str,
+    edge_decay_enabled: bool,
 ) -> int:
     print("backend=postgres")
     repo = PostgresEventRepository(pg_dsn)
@@ -798,19 +1201,31 @@ async def _run_postgres(
             "Install with: pip install psycopg[binary]"
         ) from exc
     with psycopg.connect(pg_dsn) as conn:
-        report = compute_report_postgres(conn, since_ts)
+        report = compute_report_postgres(conn, since_ts, scope)
         fill_quality = None
         risk_counters = None
+        edge_decay = None
         if analytics_details:
             fill_quality = compute_fill_quality_postgres(
                 conn, since_ts=since_ts, limit=max(fill_quality_limit, 0)
             )
             risk_counters = compute_risk_counters_postgres(conn, since_ts=since_ts)
+        if edge_decay_enabled:
+            try:
+                edge_decay = compute_edge_decay_postgres(
+                    conn, since_ts=since_ts, scope=scope
+                )
+            except Exception as exc:  # pragma: no cover - optional diagnostics
+                edge_decay = {
+                    "status": "unavailable",
+                    "reason": f"edge_decay_query_error:{exc.__class__.__name__}",
+                }
     _print_report(
         report,
         analytics_details=analytics_details,
         fill_quality=fill_quality,
         risk_counters=risk_counters,
+        edge_decay=edge_decay,
     )
     return 0
 
@@ -826,8 +1241,15 @@ async def _run() -> int:
             since_ts=since_ts,
             fill_quality_limit=args.fill_quality_limit,
             analytics_details=args.analytics_details,
+            scope=args.scope,
+            edge_decay_enabled=args.edge_decay,
         )
-    return await _run_sqlite(settings=settings, since_ts=since_ts)
+    return await _run_sqlite(
+        settings=settings,
+        since_ts=since_ts,
+        scope=args.scope,
+        edge_decay_enabled=args.edge_decay,
+    )
 
 
 def main() -> int:
